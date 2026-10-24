@@ -1,0 +1,23 @@
+{
+  "_comment": "Per-weight defaults the desk may override on a ticket. TTLs are the clock's.",
+  "weights": {
+    "light": { "maxStrikes": 2, "wallClockMinutes": 45, "suiteMinutesMax": 10 },
+    "heavy": { "maxStrikes": 3, "wallClockMinutes": 120 }
+  },
+  "claim": {
+    "heartbeatMinutes": 60,
+    "staleAfterHours": 24,
+    "unpushedBranchReleaseAfterHours": 48,
+    "unclaimedBranchDeleteAfterDays": 7
+  },
+  "node": {
+    "staleAfterHours": 24,
+    "retireAfterDays": 7
+  },
+  "governor": {
+    "quotaCapDefault": 0.4,
+    "haltSleepMinutes": 30,
+    "nothingClaimableSleepMinutes": 10,
+    "reviewUnavailableSleepMinutes": 30
+  }
+}

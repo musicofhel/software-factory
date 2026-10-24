@@ -1,0 +1,13 @@
+# Two human approvals on everything that defines the factory's quality settings.
+# Lowering prosecution depth is a visible PR, never a config tweak.
+# Second owner: add the second org owner here before the queue opens (PROJECT.md "Who").
+factory/**   @musicofhel
+.adlc/**     @musicofhel
+.github/**   @musicofhel
+.claude/**   @musicofhel
+CODEOWNERS   @musicofhel
+
+# Kill switch: zero approvals to ADD factory/HALT (any write-access member, one-line PR),
+# two approvals to REMOVE it. Branch protection expresses this as a required-reviewers
+# rule keyed on deletion (factory/policy/branch-protection.json).
+factory/HALT @musicofhel

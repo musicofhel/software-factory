@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/musicofhel/software-factory/factory/nodes/manifest.schema.json",
+  "title": "Factory node manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["handle", "owner", "os", "cpu", "ram_gb", "slots", "heavy_gates", "adapters",
+               "quota_tier", "quota_cap", "quiet_hours", "accounts", "factory_version",
+               "last_seen", "status"],
+  "properties": {
+    "handle":          { "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$" },
+    "owner":           { "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$" },
+    "os":              { "enum": ["linux", "macos", "wsl2"] },
+    "cpu":             { "type": "integer", "minimum": 1 },
+    "ram_gb":          { "type": "number", "minimum": 8 },
+    "slots":           { "type": "integer", "minimum": 1, "maximum": 8 },
+    "heavy_gates":     { "type": "boolean" },
+    "adapters": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "enum": ["claude-code", "codex", "agy", "opencode"] },
+      "additionalProperties": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" }
+    },
+    "quota_tier":      { "enum": ["free", "pro", "max", "team", "unknown"] },
+    "quota_cap":       { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.4 },
+    "quiet_hours": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tz", "start", "end"],
+      "properties": {
+        "tz":    { "type": "string" },
+        "start": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" },
+        "end":   { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" }
+      }
+    },
+    "accounts":        { "type": "integer", "minimum": 1 },
+    "factory_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "last_seen":       { "type": "string", "format": "date-time" },
+    "status":          { "enum": ["joining", "active", "paused", "stale", "retired"] }
+  }
+}

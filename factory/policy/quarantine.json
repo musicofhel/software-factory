@@ -1,0 +1,4 @@
+{
+  "_comment": "Flaky tests quarantined by the desk. Each entry: {\"test\": \"<id>\", \"issue\": <n>, \"expires\": \"YYYY-MM-DD\"}. An expired entry fails the flaky gate.",
+  "quarantined": []
+}

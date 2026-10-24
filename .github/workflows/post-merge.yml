@@ -1,0 +1,24 @@
+# Ticket completion happens here, never on a node: .adlc is only written from main.
+name: post-merge
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: post-merge
+  cancel-in-progress: false
+permissions:
+  contents: write
+  issues: write
+jobs:
+  complete:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: adlc ticket complete --write for every ticket the merged PRs carried; append ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./factory/bin/post-merge.sh

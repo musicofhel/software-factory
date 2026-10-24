@@ -1,0 +1,17 @@
+{
+  "body": "weight: light\ntier: 0\ncharter: C3\n\nBuild `factory/bin/janitor.sh` per SPEC-v0.2 'Clock and janitor': one hourly Action with a concurrency group that owns every time-driven transition. Dry-run form for a week after any change (DRY_RUN repo variable, flipped by PR). Must not touch `main` outside the PR path, release a lock with a pushed branch newer than the TTL, run on a node, or overlap itself or the mirror job. TTLs come from factory/policy/budget.json.\n\nAcceptance criteria (verified by `make test`, offline, against a fixture repo built by tests/fixtures/make-repo.sh: a local bare origin with `main`, `nodes`, `flaky-history`, lock refs of chosen ages, ticket/** branches of chosen ages, and the fake gh):\n1. Claims: deletes lock refs whose commit is older than 24 h AND whose ticket/<id>/* branch has no commit newer than the TTL; deletes locks of `stale` nodes; deletes a node's newest locks beyond its `slots`; comments on the Issue each time; a stale lock with a branch newer than the TTL is left alone; a lock without a PR after 48 h is released and its branch kept; verified by tests/test_janitor.sh cases 'stale-lock', 'stale-node', 'over-slots', 'fresh-branch-kept', 'no-pr-48h'.\n2. Branches: deletes ticket/** branches whose Issue is closed, or unclaimed for 7 days with no open PR; verified by case 'branch-sweep'.\n3. Nodes: marks a manifest `stale` after 24 h silent and `retired` after 7 days (token revocation call + claims released + manifest archived on the nodes branch); verified by case 'node-lifecycle'.\n4. Previews: tears down a deploy record past its TTL (calls a hook script, stubbed in tests); verified by case 'preview-ttl'.\n5. Ready queue: re-runs `adlc merge-forecast` when the open set changed and recomputes `ready` labels through the mirror; verified by case 'ready-recompute' (merge-forecast faked).\n6. `--dry-run` (the default) changes nothing and prints every action it would take as one JSON line each; verified by case 'dry-run-inert' (fixture repo byte-identical before and after).\n7. `version-check.sh` exits 2 when the local factory/VERSION or an adapter pin is behind origin/main; verified by tests/test_version_check.sh.\n8. shellcheck -S warning clean (`make lint`).\n\nOut of scope: the monthly drill ticket (opened by the janitor once the desk exists; build order 4).",
+  "category": "feature",
+  "duration": 3,
+  "id": "T3",
+  "scope": [
+    "factory/bin/janitor.sh",
+    "factory/bin/version-check.sh",
+    "factory/bin/lib/**",
+    "tests/test_janitor*.sh",
+    "tests/test_version_check.sh",
+    "tests/fixtures/**",
+    "tests/fakes/**",
+    ".github/workflows/janitor.yml"
+  ],
+  "title": "Implement the clock and janitor: every TTL, heartbeat, stale and scheduled transition"
+}

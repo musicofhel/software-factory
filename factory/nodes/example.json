@@ -1,0 +1,17 @@
+{
+  "handle": "example-node",
+  "owner": "example",
+  "os": "wsl2",
+  "cpu": 8,
+  "ram_gb": 16,
+  "slots": 3,
+  "heavy_gates": false,
+  "adapters": { "claude-code": "2.1.280" },
+  "quota_tier": "pro",
+  "quota_cap": 0.4,
+  "quiet_hours": { "tz": "America/New_York", "start": "09:00", "end": "17:00" },
+  "accounts": 1,
+  "factory_version": "0.1.0",
+  "last_seen": "2026-10-24T18:00:00Z",
+  "status": "joining"
+}

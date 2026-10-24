@@ -1,0 +1,7 @@
+{
+  "name": "factory",
+  "version": "0.1.0",
+  "description": "Distributed Software Factory node skills: /factory:join, /factory:run, /factory:release",
+  "author": { "name": "Distributed Software Factory contributors" },
+  "license": "MIT"
+}

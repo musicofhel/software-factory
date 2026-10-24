@@ -1,0 +1,29 @@
+# Mirror: .adlc ticket store (source of truth, written only from main) → GitHub Issues
+# for display and human interaction. Labels are set only here (write access), so nothing
+# a stranger files becomes claimable without the desk.
+name: mirror
+on:
+  push:
+    branches: [main]
+    paths: [".adlc/**", "factory/policy/**"]
+  schedule:
+    - cron: "47 */6 * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+permissions:
+  contents: read
+  issues: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: tickets → issues (labels ready, w:<weight>, tier:<n>, needs-desk)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./factory/bin/mirror.sh

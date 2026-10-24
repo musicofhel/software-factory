@@ -1,0 +1,34 @@
+# Clock and janitor: owns every time-driven transition. Hourly, one at a time.
+# Dry-run form for a week after any change to this job (gemini-cli pattern): the
+# DRY_RUN variable is flipped by a PR, never by hand.
+name: janitor
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "print what would change, change nothing"
+        type: boolean
+        default: true
+concurrency:
+  group: janitor
+  cancel-in-progress: false
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+jobs:
+  janitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: halt check
+        run: ./factory/bin/halt-check.sh
+      - name: janitor sweep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run != false && vars.JANITOR_DRY_RUN != 'false' }}
+        run: ./factory/bin/janitor.sh ${{ env.DRY_RUN == 'true' && '--dry-run' || '' }}

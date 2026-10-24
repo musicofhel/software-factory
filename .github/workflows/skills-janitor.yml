@@ -1,0 +1,17 @@
+# Skills are untrusted input: every change under factory/skills/ is scanned before merge.
+name: skills-janitor
+on:
+  pull_request:
+    paths: ["factory/skills/**", ".claude/**"]
+concurrency:
+  group: skills-janitor-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: skills-janitor /janitor-security (a RISK verdict blocks the merge)
+        run: ./factory/bin/skills-scan.sh factory/skills

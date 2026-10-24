@@ -1,0 +1,11 @@
+{
+  "name": "software-factory",
+  "owner": { "name": "musicofhel" },
+  "plugins": [
+    {
+      "name": "factory",
+      "source": "./factory",
+      "description": "Node skills for the Distributed Software Factory (join, run, release)"
+    }
+  ]
+}

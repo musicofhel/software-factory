@@ -1,0 +1,71 @@
+# Build gates. CI reruns every deterministic gate because a laptop is not a trust boundary.
+# Hosted runners only on pull_request (fork safety). w:heavy jobs run on factory-node
+# runners from `push` events on ticket/** branches, never on pull_request from a fork.
+name: gates
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+concurrency:
+  group: gates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: factory test suite (offline)
+        run: make test
+      - name: shellcheck
+        run: make lint
+  rails-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: rails diff empty (build order 3 fills the rail paths from the ticket)
+        run: ./factory/bin/rails-proof.sh --base origin/main
+  scope:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: diff ⊆ ticket scope
+        run: ./factory/bin/scope-check.sh --base origin/main
+  tamper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: tamperguard (exit 2 fails the gate)
+        run: pipx run tamperguard==0.2.0 --base origin/main
+  dependencies:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+  commit-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Signed-off-by + Assisted-by trailers on every commit of a ticket branch
+        run: ./factory/bin/commit-check.sh --base origin/main
+  attest-verify:
+    runs-on: ubuntu-latest
+    needs: [build-test, rails-proof, scope, tamper, commit-check]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: gate manifest (attest verify is a required check; build order 3)
+        run: ./factory/bin/attest-verify.sh

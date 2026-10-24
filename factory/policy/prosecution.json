@@ -1,0 +1,8 @@
+{
+  "_comment": "Prosecution depth. Lowering any value is a two-approval PR (CODEOWNERS).",
+  "prosecuteFailOn": "medium",
+  "quorum": 2,
+  "loopMax": 3,
+  "providersPreferred": "an adapter the builder did not use, when the manifest lists one",
+  "reprosecuteSampleOneIn": 5
+}

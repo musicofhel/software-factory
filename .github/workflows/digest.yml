@@ -1,0 +1,24 @@
+# Daily digest: everything that is not a gate ask or a halt notice. Silent when empty.
+name: digest
+on:
+  schedule:
+    - cron: "30 13 * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: digest
+  cancel-in-progress: false
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: compose and post (Discord webhook secret, or email)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISCORD_WEBHOOK: ${{ secrets.DIGEST_WEBHOOK }}
+        run: ./factory/bin/digest.sh
