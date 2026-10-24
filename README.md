@@ -84,5 +84,5 @@ Nothing is safe without TTLs and a stop, so step 1 comes first.
 
 ```sh
 make test     # every tests/*.sh, offline, no keys
-make lint     # shellcheck + actionlint if installed
+make lint     # shellcheck -S warning on every factory/tests shell file (required) + actionlint (best-effort)
 ```

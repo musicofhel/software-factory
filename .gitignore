@@ -20,4 +20,5 @@
 node_modules/
 specs/**/.spec-loop/
 specs/**/HANDOFF.md
+specs/**/TB_PROMPT.md
 *.log

@@ -6,5 +6,5 @@
   "scope": [
     "docs/adr/0003-chassis.md"
   ],
-  "title": "Decide the chassis: read the four candidates and amend ADR-0003"
+  "title": "Decide the chassis: read the five candidates (four alternatives plus the fleet default) and amend ADR-0003"
 }
