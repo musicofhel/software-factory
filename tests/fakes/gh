@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# Fake `gh` for offline tests. Put tests/fakes on PATH; tests/fakes/lib.sh sets it up.
+#
+# It records every call and emulates the slice of the GitHub API the factory scripts rely on.
+# Refs and commits live in a real bare git repo, so the ref compare-and-swap is git's own atomic
+# update-ref, not a re-implementation. Issues live in a JSON file guarded by flock.
+#
+#   FAKE_GH_GIT        bare repo backing repos/<FAKE_GH_REPO>/git/*            (required for api)
+#   FAKE_GH_ISSUES     {"labels": [names], "issues": [...]} backing `issue`   (required for issue)
+#   FAKE_GH_REPO       the one repo this fake serves (default test/repo); anything else is 404
+#   FAKE_GH_LOG        every call appended as one JSON array of its argv
+#   FAKE_GH_USER       who @me is (default fake-user)
+#   FAKE_GH_NOW        server clock in epoch seconds, stamped on created commits and comments
+#   FAKE_GH_FAIL       ERE; a call whose joined argv matches fails with HTTP 500
+#   FAKE_GH_RACE_REFS  space-separated refs; when a POST git/refs for one arrives, another node
+#                      ("racer") creates it first, so the POST gets the real 422
+#
+# api:   GET  git/matching-refs/<prefix>, git/ref/<ref>, git/commits/<sha>
+#        POST git/commits (message, tree, parents[]), git/refs (ref, sha; 422 if the ref exists)
+#        PATCH git/refs/<ref> (sha, force; 422 if missing or not a fast-forward without force)
+#        DELETE git/refs/<ref> (422 if missing)
+#        Like gh: -f/-F fields (key[]=v arrays, -F typed), POST by default when fields are given,
+#        --jq on success, error body on stdout + "gh: <msg> (HTTP <code>)" on stderr, exit 1.
+# issue: list (--label repeatable = AND, --state, --limit default 30, --json fields, newest first),
+#        edit (--add/--remove-assignee, --add/--remove-label; unknown repo labels fail),
+#        comment (--body | --body-file). --repo is required: a test never falls back to a remote.
+set -euo pipefail
+
+REPO="${FAKE_GH_REPO:-test/repo}"
+ME="${FAKE_GH_USER:-fake-user}"
+
+if [ -n "${FAKE_GH_LOG:-}" ]; then
+  entry="$(for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc .)"
+  printf '%s\n' "$entry" >>"$FAKE_GH_LOG"
+fi
+
+http_err() {  # http_err <code> <message>
+  jq -cn --arg m "$2" --arg c "$1" '{message: $m, status: $c}'
+  printf 'gh: %s (HTTP %s)\n' "$2" "$1" >&2
+  exit 1
+}
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+
+if [ -n "${FAKE_GH_FAIL:-}" ] && [[ "$*" =~ $FAKE_GH_FAIL ]]; then http_err 500 "Server Error (injected)"; fi
+
+server_date() { if [ -n "${FAKE_GH_NOW:-}" ]; then printf '%s +0000\n' "$FAKE_GH_NOW"; else printf '%s +0000\n' "$(date -u +%s)"; fi; }
+
+# ---------------------------------------------------------------- api
+g() { git -C "$FAKE_GH_GIT" "$@"; }
+
+commit_json() {  # commit_json <sha>
+  local s="$1"
+  g cat-file -e "$s^{commit}" 2>/dev/null || http_err 404 "Not Found"
+  jq -n --arg sha "$s" --arg tree "$(g rev-parse "$s^{tree}")" \
+        --arg parents "$(g show -s --format=%P "$s")" \
+        --arg date "$(TZ=UTC g show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ "$s")" \
+        --arg name "$(g show -s --format=%cn "$s")" \
+        --rawfile msg <(g cat-file commit "$s" | sed '1,/^$/d') \
+    '{sha: $sha, tree: {sha: $tree}, parents: [$parents | splits(" ") | select(. != "") | {sha: .}],
+      message: ($msg | rtrimstr("\n")),
+      author: {name: $name, date: $date}, committer: {name: $name, date: $date}}'
+}
+
+ref_json() { jq -n --arg r "$1" --arg s "$2" '{ref: $r, object: {sha: $s, type: "commit"}}'; }
+ref_sha() { g show-ref --verify -s "$1" 2>/dev/null || true; }
+
+api() {
+  local method="" path="" jqx="" fields='{}' k v explicit=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -X|--method) method="$2"; explicit=1; shift ;;
+      -f|--raw-field|-F|--field)
+        k="${2%%=*}"; v="${2#*=}"
+        if [ "$1" = -F ] || [ "$1" = --field ]; then
+          case "$v" in true|false|null) v="$v" ;; *) [[ "$v" =~ ^-?[0-9]+$ ]] || v="$(jq -n --arg v "$v" '$v')" ;; esac
+        else v="$(jq -n --arg v "$v" '$v')"; fi
+        if [[ "$k" == *"[]" ]]; then fields="$(jq -c --arg k "${k%[]}" --argjson v "$v" '.[$k] += [$v]' <<<"$fields")"
+        else fields="$(jq -c --arg k "$k" --argjson v "$v" '.[$k] = $v' <<<"$fields")"; fi
+        shift ;;
+      --jq|-q) jqx="$2"; shift ;;
+      -H|--header) shift ;;
+      --paginate|--silent) ;;
+      -*) fail "fake gh api: unsupported flag $1" ;;
+      *) [ -z "$path" ] || fail "fake gh api: two paths"; path="${1#/}" ;;
+    esac
+    shift
+  done
+  [ "$explicit" = 1 ] || { if [ "$fields" != '{}' ]; then method=POST; else method=GET; fi; }
+  : "${FAKE_GH_GIT:?fake gh api needs FAKE_GH_GIT}"
+  case "$path" in "repos/$REPO/"*) path="${path#"repos/$REPO/"}" ;; *) http_err 404 "Not Found" ;; esac
+  f() { jq -r --arg k "$1" '.[$k] // empty' <<<"$fields"; }
+
+  local out="" ref sha old tree p
+  case "$method $path" in
+    "GET git/matching-refs/"*)
+      out="$(g for-each-ref --format='%(refname) %(objectname)' |
+             jq -R --arg p "refs/${path#git/matching-refs/}" \
+               'split(" ") | select(.[0] | startswith($p)) | {ref: .[0], object: {sha: .[1], type: "commit"}}' |
+             jq -s .)" ;;
+    "GET git/ref/"*)
+      ref="refs/${path#git/ref/}"; sha="$(ref_sha "$ref")"
+      [ -n "$sha" ] || http_err 404 "Not Found"
+      out="$(ref_json "$ref" "$sha")" ;;
+    "GET git/commits/"*)
+      sha="${path#git/commits/}"
+      g cat-file -e "$sha^{commit}" 2>/dev/null || http_err 404 "Not Found"
+      out="$(commit_json "$sha")" ;;
+    "POST git/commits")
+      tree="$(f tree)"
+      [ -n "$tree" ] && g cat-file -e "$tree^{tree}" 2>/dev/null || http_err 422 "Tree SHA does not exist"
+      local -a pargs=()
+      while read -r p; do
+        [ -n "$p" ] || continue
+        g cat-file -e "$p^{commit}" 2>/dev/null || http_err 422 "Parent SHA does not exist or is not a commit object"
+        pargs+=(-p "$p")
+      done < <(jq -r '.parents // [] | .[]' <<<"$fields")
+      sha="$(f message | GIT_AUTHOR_NAME="$ME" GIT_AUTHOR_EMAIL="$ME@fake" GIT_COMMITTER_NAME="$ME" \
+             GIT_COMMITTER_EMAIL="$ME@fake" GIT_AUTHOR_DATE="$(server_date)" GIT_COMMITTER_DATE="$(server_date)" \
+             g commit-tree "$tree" "${pargs[@]}")"
+      out="$(commit_json "$sha")" ;;
+    "POST git/refs")
+      ref="$(f ref)"; sha="$(f sha)"
+      [[ "$ref" =~ ^refs/[^/]+/.+ ]] || http_err 422 "Reference name is invalid"
+      [ -n "$sha" ] && g cat-file -e "$sha" 2>/dev/null || http_err 422 "Object does not exist"
+      if [[ " ${FAKE_GH_RACE_REFS:-} " == *" $ref "* ]]; then
+        local racer
+        racer="$(printf 'lock %s: racer\n\n{"handle":"racer","run_id":"racer-1","slots":1,"claimed_at":"1970-01-01T00:00:00Z"}' "${ref#refs/locks/}" |
+                 GIT_AUTHOR_NAME=racer GIT_AUTHOR_EMAIL=racer@fake GIT_COMMITTER_NAME=racer \
+                 GIT_COMMITTER_EMAIL=racer@fake GIT_AUTHOR_DATE="$(server_date)" GIT_COMMITTER_DATE="$(server_date)" \
+                 g commit-tree "$(g rev-parse "$sha^{tree}")")"
+        g update-ref "$ref" "$racer" "" 2>/dev/null || true
+      fi
+      g update-ref "$ref" "$sha" "" 2>/dev/null || http_err 422 "Reference already exists"
+      out="$(ref_json "$ref" "$sha")" ;;
+    "PATCH git/refs/"*)
+      ref="refs/${path#git/refs/}"; sha="$(f sha)"; old="$(ref_sha "$ref")"
+      [ -n "$old" ] || http_err 422 "Reference does not exist"
+      [ -n "$sha" ] && g cat-file -e "$sha" 2>/dev/null || http_err 422 "Object does not exist"
+      if [ "$(jq -r '.force // false' <<<"$fields")" != true ]; then
+        g merge-base --is-ancestor "$old" "$sha" 2>/dev/null || http_err 422 "Update is not a fast forward"
+      fi
+      g update-ref "$ref" "$sha" "$old" 2>/dev/null || http_err 422 "Reference cannot be updated"
+      out="$(ref_json "$ref" "$sha")" ;;
+    "DELETE git/refs/"*)
+      ref="refs/${path#git/refs/}"; old="$(ref_sha "$ref")"
+      [ -n "$old" ] || http_err 422 "Reference does not exist"
+      g update-ref -d "$ref" "$old" 2>/dev/null || http_err 422 "Reference cannot be deleted"
+      return 0 ;;
+    *) http_err 404 "Not Found" ;;
+  esac
+  if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+}
+
+# ---------------------------------------------------------------- issue
+mutate() {  # mutate <jq program> [jq args...]: atomic read-modify-write of the issue store
+  local prog="$1"; shift
+  (
+    flock 9
+    local tmp; tmp="$(mktemp "$FAKE_GH_ISSUES.XXXXXX")"
+    jq "$@" "$prog" "$FAKE_GH_ISSUES" >"$tmp" && mv "$tmp" "$FAKE_GH_ISSUES"
+  ) 9>"$FAKE_GH_ISSUES.lock"
+}
+
+issue() {
+  : "${FAKE_GH_ISSUES:?fake gh issue needs FAKE_GH_ISSUES}"
+  local sub="${1:-}"; shift || true
+  local repo="" n="" labels='[]' state=open limit=30 fields="" body="" have_body=0
+  local add_a='[]' rm_a='[]' add_l='[]' rm_l='[]'
+  csv() { jq -c --arg v "$2" --arg me "$ME" '. + ($v | split(",") | map(if . == "@me" then $me else . end))' <<<"$1"; }
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -R|--repo) repo="$2"; shift ;;
+      -l|--label) labels="$(csv "$labels" "$2")"; shift ;;
+      -s|--state) state="$2"; shift ;;
+      -L|--limit) limit="$2"; shift ;;
+      --json) fields="$2"; shift ;;
+      --add-assignee) add_a="$(csv "$add_a" "$2")"; shift ;;
+      --remove-assignee) rm_a="$(csv "$rm_a" "$2")"; shift ;;
+      --add-label) add_l="$(csv "$add_l" "$2")"; shift ;;
+      --remove-label) rm_l="$(csv "$rm_l" "$2")"; shift ;;
+      -b|--body) body="$2"; have_body=1; shift ;;
+      -F|--body-file) if [ "$2" = - ]; then body="$(command cat)"; else body="$(command cat "$2")"; fi; have_body=1; shift ;;
+      -*) fail "fake gh issue $sub: unsupported flag $1" ;;
+      *) [ -z "$n" ] || fail "fake gh issue $sub: two positionals"; n="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$repo" ] || fail "fake gh issue: --repo is required (tests never infer the repo from a remote)"
+  [ "$repo" = "$REPO" ] || fail "GraphQL: Could not resolve to a Repository with the name '$repo'."
+  case "$sub" in
+    list)
+      [ -n "$fields" ] || fail "fake gh issue list: needs --json"
+      jq -c --argjson want "$labels" --arg state "$state" --argjson limit "$limit" \
+            --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" '
+        [ .issues[]
+          | select($state == "all" or .state == $state)
+          | select([.labels[].name] as $have | all($want[]; IN($have[]))) ]
+        | sort_by(.createdAt) | reverse | .[:$limit]
+        | map(with_entries(select(.key | IN($f[]))))' "$FAKE_GH_ISSUES" ;;
+    edit|comment)
+      [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any(.issues[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
+        fail "GraphQL: Could not resolve to an issue or pull request with the number of $n."
+      if [ "$sub" = edit ]; then
+        local missing
+        missing="$(jq -r --argjson l "$add_l" '.labels as $known | $l[] | select(IN($known[]) | not)' "$FAKE_GH_ISSUES")"
+        [ -z "$missing" ] || fail "could not add label: '$(head -n1 <<<"$missing")' not found"
+        mutate '(.issues[] | select(.number == $n)) |= (
+                  .assignees = ([.assignees[].login] + $aa | unique | map(select(IN($ra[]) | not)) | map({login: .}))
+                | .labels = ([.labels[].name] + $al | unique | map(select(IN($rl[]) | not)) | map({name: .})))' \
+          --argjson n "$n" --argjson aa "$add_a" --argjson ra "$rm_a" --argjson al "$add_l" --argjson rl "$rm_l"
+        printf 'https://github.com/%s/issues/%s\n' "$REPO" "$n"
+      else
+        [ "$have_body" = 1 ] || fail "fake gh issue comment: needs --body or --body-file"
+        mutate '(.issues[] | select(.number == $n)).comments += [{author: {login: $me}, body: $b, createdAt: ($at | todate)}]' \
+          --argjson n "$n" --arg me "$ME" --arg b "$body" --argjson at "${FAKE_GH_NOW:-$(date -u +%s)}"
+        printf 'https://github.com/%s/issues/%s#issuecomment-%s\n' "$REPO" "$n" "$(jq --argjson n "$n" '.issues[] | select(.number == $n) | .comments | length' "$FAKE_GH_ISSUES")"
+      fi ;;
+    *) fail "fake gh issue: unsupported subcommand '$sub'" ;;
+  esac
+}
+
+case "${1:-}" in
+  api) shift; api "$@" ;;
+  issue) shift; issue "$@" ;;
+  *) fail "fake gh: unsupported command '${1:-}'" ;;
+esac
