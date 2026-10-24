@@ -26,15 +26,16 @@ registers a runner: those are Aaron's, prepped to one click in the close-out row
 | workflows | gates, janitor (hourly, concurrency `janitor`, DRY_RUN default true), mirror, digest, summoner, post-merge, skills-janitor | bodies call the stubs; they are red by construction until the rows below land |
 | policy | `prosecution.json` (fail-on medium, quorum 2, loop 3), `budget.json` (TTLs: heartbeat 60 min, stale 24 h, no-PR release 48 h, branch delete 7 d; node stale 24 h, retire 7 d; cap 0.4), `quarantine.json` (empty), `branch-protection.json` (rules as code) | vetto/ralon/dcg configs deliberately absent (step 2, written against the pinned versions' docs) |
 | tool shelf verified 2026-10-24 | adlc, adversarial-review, ACFS, action-lock (archived; pattern only), attest, dcg, cux, agent-permissions, agent-role-contracts, flaky-test-detective, ubs, aislop, bomdrift, Sauron, edgeverdict, autorebase, adrs, slb, ru, skills-janitor, cass; crates vetto 0.6.5 / ralon 0.1.7 / vallum 0.8.16 / momus-diff 0.9.3; PyPI tamperguard 0.2.0 / tampercheck 0.1.1 / qikly / unasked / cauterule / stalebrain / agentslint / perla / notari; **dsr = `Dicklesworthstone/doodlestein_self_releaser`** (the spec's short name does not resolve) | `bwrap` is MISSING on this box, `unshare` present; fleet's Linux backend needs one of them, so TB0 proves which |
-| box | 28 CPU, 47 GB RAM, WSL2, Node 22.22.0 via nvm, `gh` 2.45 authenticated as musicofhel, no remote on the repo | `codex`/`gemini`/`opencode` absent: claude-code is the only adapter here |
+| box | 28 CPU, 47 GB RAM, WSL2, Node 22.22.0 via nvm, `gh` 2.45 authenticated as musicofhel; `origin` public since 19:50Z | `codex`/`gemini`/`opencode` absent: claude-code is the only adapter here |
 
 ---
 
 ## 1. Invariants (hard; a row that breaks one is red)
 
-- **I1 No remote, ever, from this loop.** No `git remote add`, no `git push`, no `gh repo create`, no runner
-  registration, no secret creation. Read-only `gh api` calls against public repos are allowed for
-  documentation lookups. The first push is Aaron's (TB5 preps it).
+- **I1 This loop never pushes.** Aaron made the repo public and pushed `main` himself on 2026-10-24 19:50Z
+  (`origin` = https://github.com/musicofhel/software-factory). The loop commits locally only: no `git push`, no
+  runner registration, no secret or variable creation, no branch protection apply, no Issue or label writes on
+  the real repo. Read-only `gh api` calls are allowed. Aaron pushes on his own word.
 - **I2 Factory code is bash 4+ with `jq`, `git`, `gh`, and Node 18+ only through `npx -y @adlc/cli@1.12.0`.**
   No Python on the node path (tests may use `python3` only when present, guarded). Every script:
   `set -euo pipefail`, `--dry-run` default on writers, `--json` on readers, exit 0/1/2, shellcheck `-S warning`
@@ -110,8 +111,7 @@ DoD part B (close-out): full `make test` + `make lint` green; `adlc coldstart --
 empty for T1–T5 (or each remaining gap named with its reason); `adlc fleet run --dry-run` exit 0; README
 build-order table row 1 → "built locally, awaiting first push"; `records/TB5.md`. HANDOFF.md ends with
 **"Aaron's kit"**: the exact commands, in order, for the first push, each one line, none run here:
-`gh repo create musicofhel/software-factory --public --source . --push`; `./factory/bin/apply-branch-protection.sh
---apply`; the two secrets (`SUMMONER_WEBHOOK`, `DIGEST_WEBHOOK`) and one variable (`JANITOR_DRY_RUN=true`);
+`git push origin main`; `./factory/bin/apply-branch-protection.sh --apply`; the two secrets (`SUMMONER_WEBHOOK`, `DIGEST_WEBHOOK`) and one variable (`JANITOR_DRY_RUN=true`);
 the `nodes` and `flaky-history` branch creation; the self-hosted runner registration (label `factory-node`,
 repo-scoped runner group); and the live proofs due **at first push**: the real `POST git/refs` 422 CAS, the
 janitor's first dry run, the mirror's first Issue. Any Q for Aaron in the TB_PROMPT's `### Q<n>` shape
