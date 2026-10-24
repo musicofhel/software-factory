@@ -1,6 +1,6 @@
 # TB0 — Register: measure the scaffold, prove the toolchain, fix what the scaffold got wrong
 
-Session date 2026-10-24. Box: WSL2, Linux 6.18.33.2-microsoft-standard-WSL2. Base commit `6b7c9fb` (LAUNCH) on top of the scaffold `f81c1c7`.
+Session date 2026-10-24. Box: WSL2, Linux 6.18.33.2-microsoft-standard-WSL2. Measured at `6b7c9fb` (LAUNCH, on the scaffold `f81c1c7`; the fleet dry-run `baseSha` shows it). Aaron's `fd2878e` (SPEC I1 only: `origin` is public, the loop still never pushes) landed mid-session; the TB0 commit sits on top of it and nothing was pushed.
 Every block below is `$ <command>` followed by its verbatim output and `exit=<code>`. `a` = `npx -y @adlc/cli@1.12.0` (a bash function; never a floating version).
 
 ## 1. Measured before any fix (the scaffold as committed)
