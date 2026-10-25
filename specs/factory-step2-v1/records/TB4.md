@@ -1,6 +1,7 @@
 # TB4 — Run loop and /factory:run (ticket T9)
 
-Sessions 7–8, 2026-10-25 (local). Box: WSL2, Linux 6.18.33.2-microsoft-standard-WSL2, jq-1.7, GNU
+Sessions 7–8, 2026-10-25 (local); landed as `45950bd` + `4b76353`.
+Box: WSL2, Linux 6.18.33.2-microsoft-standard-WSL2, jq-1.7, GNU
 coreutils, claude-code 2.1.280. Session 7 wrote the loop, the fakes and 20 cases and stopped at the soft
 gate in WIP commit `45950bd` (`Ticket: T9`) with 4 cases red on test-side bugs. Session 8 fixed those
 in a new commit (no amend, I11), finished SKILL.md and the ADR-0005 amendment, and wrote this file.
