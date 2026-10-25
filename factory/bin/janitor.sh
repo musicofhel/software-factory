@@ -7,15 +7,19 @@
 # One fetch reads the remote's nodes branch, refs/locks/issue-* and refs/heads/ticket/**; gh reads
 # the Issues and the open PRs. Then, for every duty:
 #
-#   ready    the open ticket set (`adlc ticket list --json`) differs from janitor/state.json on the
-#            nodes branch: `adlc merge-forecast --json`, then `mirror.sh --apply --forecast FILE`
-#            recomputes the ready labels. The set is saved only after the mirror succeeds.
+#   ready    the open ticket set differs from janitor/state.json on the nodes branch: `adlc
+#            merge-forecast --json`, then `mirror.sh --apply --forecast FILE` recomputes the ready
+#            labels. The set is saved only after the mirror succeeds. Open = not completed: `adlc
+#            ticket list --json` lists completed tickets too, so each id's `ticket show --json` is
+#            read (as the mirror does) and a completed one is left out; a completion is a change.
 #   previews a deploy record previews/<name>.json on the nodes branch past its expires_at, or whose
 #            pr is no longer open, is torn down ($JANITOR_PREVIEW_HOOK teardown <name> <record-file>)
 #            and the record removed.
 #   nodes    nodes/<h>.json whose last_seen is older than node.staleAfterHours becomes "stale";
 #            older than node.retireAfterDays becomes "retired": the token is revoked
-#            ($JANITOR_REVOKE_HOOK <handle> <owner>), the claims released, a halt notice sent if it
+#            ($JANITOR_REVOKE_HOOK <handle> <owner>; the hook is a command line split on blanks, so
+#            janitor.yml sets `./factory/bin/revoke-collaborator.sh --apply`), the claims released,
+#            a halt notice sent if it
 #            held any (summon.sh --kind halt), and the manifest moved to archive/nodes/<h>.json.
 #   claims   a lock is released (ref deleted, a comment on the Issue, in-progress removed) when its
 #            commit is older than claim.staleAfterHours, when its node is stale or retired, or when
@@ -246,10 +250,21 @@ NODES_EDITS="$WORK/edits"           # fixed nodes-branch edits, "put|rm <TAB> pa
 
 # ------------------------------------------------------------------------------------- ready
 ready_pass() {
-  local line tickets open prev ffile="$WORK/forecast.json" rc=0
+  local line tickets ids id done_ open prev ffile="$WORK/forecast.json" rc=0
   line='{"action": "ready-recompute"}'
   tickets="$("${ADLC[@]}" ticket list --json)" || { fail_line "$line" "adlc ticket list failed"; return 0; }
-  open="$(jq -c '[.[].id] | sort' <<<"$tickets" 2>/dev/null)" || { fail_line "$line" "adlc ticket list is not a JSON list"; return 0; }
+  ids="$(jq -r 'if type == "array" then .[].id else error("not a list") end' <<<"$tickets" 2>/dev/null)" ||
+    { fail_line "$line" "adlc ticket list is not a JSON list"; return 0; }
+  open='[]'
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    valid_ticket_id "$id" || { fail_line "$line" "adlc ticket list: bad ticket id"; return 0; }
+    done_="$("${ADLC[@]}" ticket show "$id" --json | jq -r --arg id "$id" 'select(.ticket.id == $id) | .ticket.completed == true' 2>/dev/null)" ||
+      done_=""
+    [ -n "$done_" ] || { fail_line "$line" "adlc ticket show $id failed"; return 0; }
+    [ "$done_" = true ] || open="$(jq -c --arg id "$id" '. + [$id]' <<<"$open")"
+  done <<<"$ids"
+  open="$(jq -c sort <<<"$open")"
   prev="$(jq -c '.open_set // null' <<<"$STATE")"
   [ "$open" != "$prev" ] || return 0
   "${ADLC[@]}" merge-forecast --json >"$ffile" || rc=$?
@@ -413,7 +428,7 @@ claims_pass() {
 }
 
 retire_pass() {  # token revocation and the halt notice for each node retired in this run
-  local n handle owner held line ids first plan
+  local n handle owner held line ids first plan hook
   plan="$(jq -c '.[] | select(.after == "retired" and .before != "retired")' <<<"$NODES")"
   while IFS= read -r n; do
     [ -n "$n" ] || continue
@@ -422,7 +437,7 @@ retire_pass() {  # token revocation and the halt notice for each node retired in
     if [ "$apply" = 0 ]; then emit "$line" planned
     elif [ -z "${JANITOR_REVOKE_HOOK:-}" ]; then
       FAILED=1; emit "$(jq -c '. + {detail: "JANITOR_REVOKE_HOOK is not set; revoke the node token by hand"}' <<<"$line")" unconfigured
-    elif "$JANITOR_REVOKE_HOOK" "$handle" "$owner" >&2; then emit "$line" "done"
+    elif read -r -a hook <<<"$JANITOR_REVOKE_HOOK" && "${hook[@]}" "$handle" "$owner" >&2; then emit "$line" "done"
     else fail_line "$line" "the revoke hook failed; revoke the node token by hand"; fi
 
     held="$(jq -c --arg h "$handle" '[.[] | select(.holder == $h)] | sort_by(.issue)' <<<"$LOCKS")"

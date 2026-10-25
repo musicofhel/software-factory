@@ -13,7 +13,8 @@
 #             (its PR, numbered from "Merge pull request #N"); any other commit brings itself.
 #   tickets   every id named by a `Ticket:` trailer (git's own trailer parser) in those commits, in
 #             merge order. An id the store does not hold (`Ticket: scaffold`) and a ticket already
-#             complete are reported and skipped.
+#             complete are reported and skipped. `Ticket: post-merge` names this job's own
+#             commit, not a ticket: it is passed over without a line.
 #   complete  `adlc ticket complete <id> --write --authorize` for each.
 #   ledger    one line per verified finding of that ticket appended to factory/ledger/findings.jsonl:
 #             its p5-finding-verified gate records (`adlc gate-manifest show --ticket <id>`), less
@@ -21,7 +22,10 @@
 #             severity, confidence and the file/line locator; never the claim, evidence or
 #             recommendation text (factory/ledger/README.md).
 #   land      factory/ledger/post-merge.json becomes {"through": HEAD} and .adlc/ plus
-#             factory/ledger/ are committed once and pushed to <remote> main as a fast-forward. With
+#             factory/ledger/ are committed once and pushed to <remote> main as a fast-forward. The
+#             commit's one trailer paragraph is `Through: <head>`, `Assisted-by: none`, `Ticket:
+#             post-merge`, `Node: github-actions` (no Signed-off-by: no human wrote it; step 3's
+#             commit-check exempts this identity, factory/RULES.md). With
 #             nothing completed there is no commit; the next run rescans the same range, which is
 #             safe because a completed ticket is skipped. After a failed completion the commit keeps
 #             the old marker, so the next run retries the rest.
@@ -106,7 +110,7 @@ while IFS= read -r c; do
   git log --reverse --format='%(trailers:key=Ticket,valueonly,unfold,separator=%x1f)' "${brought[@]}" |
     tr '\037' '\n' | while IFS= read -r t; do
       t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
-      [ -z "$t" ] || printf '%s\t%s\t%s\n' "$t" "$c" "$pr"
+      [ -z "$t" ] || [ "$t" = post-merge ] || printf '%s\t%s\t%s\n' "$t" "$c" "$pr"
     done >>"$WORK/named"
 done <<<"$merged"
 
@@ -190,7 +194,8 @@ else
   line="$(jq -c --arg t "${through:-}" '.through = (if $t == "" then null else $t end)' <<<"$line")"
 fi
 git add -A -- .adlc factory/ledger
-git commit -q --no-verify -m "post-merge: complete ${completed_ids[*]}" -m "Through: $HEAD_SHA" ||
+trailers="$(printf 'Through: %s\nAssisted-by: none\nTicket: post-merge\nNode: github-actions' "$HEAD_SHA")"
+git commit -q --no-verify -m "post-merge: complete ${completed_ids[*]}" -m "$trailers" ||
   die "git commit failed"
 line="$(jq -c --arg c "$(git rev-parse HEAD)" '. + {commit: $c}' <<<"$line")"
 if git push --quiet --no-verify "$remote" "HEAD:refs/heads/main" 2>"$WORK/push.err"; then

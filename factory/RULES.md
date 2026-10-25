@@ -16,3 +16,13 @@
 The kill switch is `factory/HALT` on `main`. Present means every loop sleeps 30 minutes
 and checks again. Anyone with write access adds it with a one-line PR that needs no
 review; removing it needs two approvals.
+
+## Commit-check exemption (for build order step 3)
+
+One commit on `main` is written by no human and no node: post-merge's completion commit
+(`factory/bin/post-merge.sh`, the `post-merge` workflow). It carries one trailer paragraph,
+`Through: <sha>`, `Assisted-by: none`, `Ticket: post-merge`, `Node: github-actions`, and no
+`Signed-off-by:` (there is no DCO to sign). Step 3's `gates / commit-check` must exempt exactly
+that shape: those four trailers, the post-merge identity (the factory App, or `github-actions[bot]`
+on the fallback), and a diff that touches only `.adlc/` and `factory/ledger/`. Anything else
+claiming `Ticket: post-merge` fails the check like any unsigned commit.

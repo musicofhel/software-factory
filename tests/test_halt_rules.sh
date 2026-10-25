@@ -158,8 +158,59 @@ case_read_errors_fail() {
     eq "$RC:$(jq -c '[.results[].result]' <<<"$OUT")" '1:["ok","failed"]'
 }
 
+# T10 acceptance 2 (ruling Q6): FACTORY_APP_ID puts the App on every policy ruleset's bypass list.
+case_app_bypass_actor() {
+  fakegh_setup
+  local plain json
+  abp; plain="$OUT"
+  abp --json; json="$OUT"
+  FACTORY_APP_ID='' abp
+  check "FACTORY_APP_ID empty: the plain output is byte-identical to unset" eq "$OUT" "$plain"
+  FACTORY_APP_ID='' abp --json
+  check "... and the --json output" eq "$OUT" "$json"
+  check "unset: no bypass actor in any planned body" eq "$(jq -c '[.calls[].body.bypass_actors // empty | length] | add' <<<"$json")" 0
+
+  FACTORY_APP_ID=987654 abp
+  check "dry run with the App: exit 0, no write sent" eq "$RC:$(fakegh_calls "$WRITES")" "0:0"
+  check "prints the App as a bypass actor" \
+    eval 'grep -qx "# bypass actor: GitHub App 987654 (Integration, always) on ruleset(s) main-merge-queue (FACTORY_APP_ID)" <<<"$OUT"'
+  check "the printed POST body carries it" \
+    eq "$(grep '^gh api -X POST repos/test/repo/rulesets' <<<"$OUT" | sed "s/.*<<< '//; s/'\$//" | jq -c .bypass_actors)" \
+       '[{"actor_id":987654,"actor_type":"Integration","bypass_mode":"always"}]'
+  check "prints the NOTE: classic protection is not lifted by a ruleset bypass" \
+    eval 'grep -q "^# NOTE: not covered by the bypass: classic branch protection on main" <<<"$OUT"'
+  check "the classic protection call is the same as without the App" \
+    eq "$(grep '^gh api -X PUT' <<<"$OUT")" "$(grep '^gh api -X PUT' <<<"$plain")"
+  FACTORY_APP_ID=987654 abp --json
+  check "--json: app_bypass names the actor and the rulesets" \
+    eq "$(jq -c '.app_bypass | [.actor_id, .actor_type, .bypass_mode, .rulesets]' <<<"$OUT")" '[987654,"Integration","always",["main-merge-queue"]]'
+
+  FACTORY_APP_ID=987654 abp --apply --json
+  check "--apply sends it: GitHub's ruleset holds the App" \
+    eq "$RC:$(jq -c '.rulesets[0].bypass_actors' "$FAKE_GH_SETTINGS")" '0:[{"actor_id":987654,"actor_type":"Integration","bypass_mode":"always"}]'
+  : >"$FAKE_GH_LOG"
+  FACTORY_APP_ID=987654 abp --apply --json
+  check "idempotent with the App: a second --apply sends nothing" eq "$RC:$(fakegh_calls "$WRITES")" "0:0"
+  abp --json
+  check "the App on GitHub but FACTORY_APP_ID unset: drift, planned as an update (the policy has no bypass)" \
+    eq "$(jq -c '[.calls[] | select(.what == "ruleset main-merge-queue") | [.action, .body.bypass_actors]]' <<<"$OUT")" '[["update",[]]]'
+  FACTORY_APP_ID=111 abp --json
+  check "another App ID: the body is the policy's actors plus that App only (the old App would be dropped)" \
+    eq "$(jq -c '[.calls[] | select(.what == "ruleset main-merge-queue") | [.action, (.body.bypass_actors | map(.actor_id))]]' <<<"$OUT")" '[["update",[111]]]'
+
+  FACTORY_APP_ID=12x abp
+  check "a non-numeric FACTORY_APP_ID: exit 2 before any call" eq "$RC:$(fakegh_calls "$WRITES")" "2:0"
+  FACTORY_APP_ID=0 abp
+  check "App ID 0: exit 2" eq "$RC" 2
+  local bad="$WORLD/bypass.json"
+  jq '.rulesets[0].bypass_actors = [{actor_id: 5, actor_type: "Integration", bypass_mode: "always"}]' "$POLICY" >"$bad"
+  FACTORY_APP_ID=5 abp --policy "$bad" --json
+  check "the App already in the policy is not listed twice" eq "$(jq -c '[.calls[1].body.bypass_actors[].actor_id]' <<<"$OUT")" '[5]'
+}
+
 echo "test_halt_rules"
-for c in fake-gh-settings dry-run-prints-calls drift-is-corrected unmanaged-left-alone refuses-made-up-fields read-errors-fail; do
+for c in fake-gh-settings dry-run-prints-calls drift-is-corrected unmanaged-left-alone refuses-made-up-fields read-errors-fail \
+         app-bypass-actor; do
   run_case "$c"
 done
 exit "$FAILED"

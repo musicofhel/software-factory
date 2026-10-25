@@ -28,6 +28,10 @@ jobs:
   janitor:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The secrets context cannot appear in a step's `if:`; its presence is read here.
+    env:
+      FACTORY_APP_ID: ${{ vars.FACTORY_APP_ID }}
+      HAS_APP_KEY: ${{ secrets.FACTORY_APP_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -48,10 +52,23 @@ jobs:
                echo "::notice::factory/HALT is on main; the janitor sweep is skipped" ;;
             *) exit "$rc" ;;
           esac
+      # Retiring a node removes its owner as a collaborator (step-1 ruling Q4), which needs the
+      # Administration permission: GITHUB_TOKEN never has it, so the hook runs on the factory App's
+      # token when one is configured. Without it the revoke line fails and a human revokes by hand.
+      - name: mint the factory App token for the revoke hook
+        id: app
+        if: steps.halt.outputs.halted == 'false' && env.FACTORY_APP_ID != '' && env.HAS_APP_KEY == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_KEY }}
+          permission-administration: write
       - name: janitor sweep
         if: steps.halt.outputs.halted == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
+          JANITOR_REVOKE_HOOK: ./factory/bin/revoke-collaborator.sh --apply
+          REVOKE_GH_TOKEN: ${{ steps.app.outputs.token }}
           DISCORD_WEBHOOK: ${{ secrets.SUMMONER_WEBHOOK }}
           SUMMONER_TO: ${{ vars.SUMMONER_TO }}
           APPLY: ${{ vars.JANITOR_DRY_RUN == 'false' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false) }}
@@ -60,6 +77,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
           echo "janitor $mode" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$REVOKE_GH_TOKEN" ]; then
+            echo "janitor: no factory App token (FACTORY_APP_ID or FACTORY_APP_KEY unset); the revoke hook runs on GITHUB_TOKEN, which GitHub refuses for collaborator removal" >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
           set +e
           ./factory/bin/janitor.sh "$mode" | tee -a "$GITHUB_STEP_SUMMARY"

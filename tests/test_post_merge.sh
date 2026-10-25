@@ -256,10 +256,50 @@ case_refuses_apply_off_hosted() {
   check "an unknown flag: exit 1" eq "$RC" 1
 }
 
+# T10 acceptance 3 (step-1 follow-up 2): the completion commit carries the three trailers in one
+# paragraph git parses, and the next run passes over it (it names no ticket).
+case_trailers() {
+  pm_setup
+  local head; head="$(git -C "$R" rev-parse HEAD)"
+  pm --apply
+  check "exit 0" eq "$RC" 0
+  check "git interpret-trailers --parse: Through, Assisted-by, Ticket, Node" \
+    eq "$(git -C "$R" log -1 --format=%B | git interpret-trailers --parse)" \
+       "$(printf 'Through: %s\nAssisted-by: none\nTicket: post-merge\nNode: github-actions' "$head")"
+  check "one trailer paragraph (the I6 check reads it)" \
+    eq "$(git -C "$R" log -1 --format='%(trailers:key=Ticket,valueonly)%(trailers:key=Node,valueonly)%(trailers:key=Assisted-by,valueonly)' | tr -s '\n' ' ')" \
+       "post-merge github-actions none "
+  check "no Signed-off-by: no human wrote it" eq "$(git -C "$R" log -1 --format='%(trailers:key=Signed-off-by)')" ""
+  commit g "Ticket: T3"
+  git -C "$R" push -q origin main 2>/dev/null
+  : >"$FAKE_ADLC_LOG"
+  pm --apply
+  check "the next run reads its own commit but reports only T3" eq "$RC $(ticket_lines)" '0 [["T3","done"]]'
+  check "the store is never asked about post-merge" eq "$(jq -sc '[.[] | select(index("post-merge"))]' "$FAKE_ADLC_LOG")" '[]'
+}
+
 case_workflow() {
   local wf="$REPO_ROOT/.github/workflows/post-merge.yml"
   check "post-merge.yml runs post-merge.sh --apply (the script is dry-run by default)" grep -q "./factory/bin/post-merge.sh --apply" "$wf"
-  check "it checks out main with full history" grep -q "ref: main, fetch-depth: 0" "$wf"
+  check "it checks out main with full history" eval 'grep -A4 "uses: actions/checkout@v4" "$wf" | head -n5 | grep -q "fetch-depth: 0" &&
+    grep -A4 "uses: actions/checkout@v4" "$wf" | head -n5 | grep -q "ref: main"'
+  # T10 acceptance 5 and ruling Q6: the App token, pinned by commit, with the GITHUB_TOKEN fallback.
+  local jw="$REPO_ROOT/.github/workflows/janitor.yml" f
+  for f in "$wf" "$jw"; do
+    check "$(basename "$f"): every create-github-app-token use is pinned by a 40-hex commit sha" \
+      eval '[ "$(grep -c "uses: actions/create-github-app-token@" "$f")" -ge 1 ] &&
+            ! grep "uses: actions/create-github-app-token@" "$f" | grep -Eqv "@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$"'
+    check "$(basename "$f"): the App step runs only with FACTORY_APP_ID set and FACTORY_APP_KEY present" \
+      eval 'grep -q "HAS_APP_KEY: \${{ secrets.FACTORY_APP_KEY != '"''"' }}" "$f" &&
+            grep -q "env.FACTORY_APP_ID != '"''"' && env.HAS_APP_KEY == '"'true'"'" "$f"'
+  done
+  check "the pinned sha is the same in both workflows" \
+    eq "$(grep -ho "create-github-app-token@[0-9a-f]*" "$wf" "$jw" | sort -u | wc -l | tr -d ' ')" 1
+  check "the checkout (whose credentials push) takes the App token, else GITHUB_TOKEN" \
+    grep -q 'token: ${{ steps.app.outputs.token || github.token }}' "$wf"
+  check "no App: a step-summary line says the push is on GITHUB_TOKEN" \
+    eval 'grep -A2 "if: steps.app.outcome == '"'skipped'"'" "$wf" | grep -q "pushed on GITHUB_TOKEN.*GITHUB_STEP_SUMMARY"'
+  check "the App token asks for contents: write only" eval '[ "$(grep -c "permission-" "$wf")" = 1 ] && grep -q "permission-contents: write" "$wf"'
   check "the mirror job waits for the completion job" grep -Eq "^    needs: complete$" "$wf"
   check "the mirror job shares the concurrency group mirror" eval 'grep -A1 -E "^    concurrency:$" "$wf" | grep -Eq "^      group: mirror$"'
   check "the mirror job applies" grep -q "./factory/bin/mirror.sh --apply" "$wf"
@@ -267,7 +307,7 @@ case_workflow() {
 }
 
 for c in completes refuses-off-main dry-run-inert findings-ledger range-since-marker completion-failure push-refused \
-         refuses-apply-off-hosted workflow; do
+         refuses-apply-off-hosted trailers workflow; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

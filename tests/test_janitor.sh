@@ -306,7 +306,8 @@ EOF
   : >"$FAKE_ADLC_LOG"
   jan --apply
   check "changed set: exit 0" eq "$RC" 0
-  check "changed set: ticket list then merge-forecast" eq "$(jq -sc 'map(.[0:2])' "$FAKE_ADLC_LOG")" '[["ticket","list"],["merge-forecast","--json"]]'
+  check "changed set: ticket list, ticket show per id, then merge-forecast" eq "$(jq -sc 'map(.[0:3])' "$FAKE_ADLC_LOG")" \
+    '[["ticket","list","--json"],["ticket","show","T2"],["ticket","show","T1"],["merge-forecast","--json"]]'
   check "changed set: the mirror recomputes labels from the forecast" \
     eq "$(jq -sc 'map([.argv[0], .argv[1], .forecast.mergeOrder])' "$FAKE_MIRROR_LOG")" '[["--apply","--forecast",["T1","T2"]]]'
   check "changed set: line done" eq "$(pick '.action == "ready-recompute"' 'map([.open_set, .merge_order, .result])')" '[[["T1","T2"],["T1","T2"],"done"]]'
@@ -314,7 +315,7 @@ EOF
   : >"$FAKE_ADLC_LOG"; : >"$FAKE_MIRROR_LOG"
   jan --apply
   check "same set: no forecast, no mirror, no line" \
-    eval '[ "$RC" = 0 ] && [ -z "$OUT" ] && [ "$(jq -sc "map(.[0:2])" "$FAKE_ADLC_LOG")" = "[[\"ticket\",\"list\"]]" ] && [ ! -s "$FAKE_MIRROR_LOG" ]'
+    eval '[ "$RC" = 0 ] && [ -z "$OUT" ] && [ "$(jq -sc "map(.[0:2]) | unique" "$FAKE_ADLC_LOG")" = "[[\"ticket\",\"list\"],[\"ticket\",\"show\"]]" ] && [ ! -s "$FAKE_MIRROR_LOG" ]'
   export FAKE_ADLC_TICKETS='[{"id":"T1","title":"a","ticketHash":"h1"}]' FAKE_MIRROR_FAIL=1
   jan --apply
   check "mirror fails: exit 1, line failed" eq "$RC $(pick '.action == "ready-recompute"' 'map(.result)')" '1 ["failed"]'
@@ -332,6 +333,65 @@ EOF
   jan --apply
   check "forecast fails: exit 1, set not saved, mirror not called" \
     eq "$RC $(on_nodes janitor/state.json | jq -c .open_set) $(jq -s length "$FAKE_MIRROR_LOG")" '1 ["T1","T3"] 3'
+}
+
+# T10 AC4 (step-1 follow-up 1): `ticket list` lists completed tickets too, so the set is the ids
+# whose `ticket show` says not completed. A completion is a change; a completed id never counts.
+case_ready_open_only() {
+  jan_setup <<EOF
+state {"open_set": ["T1","T2"]}
+EOF
+  export FAKE_ADLC_STORE="$WORLD/store.json"
+  echo '[{"id":"T1","title":"a"},{"id":"T2","title":"b"},{"id":"T3","title":"c","completed":true}]' >"$FAKE_ADLC_STORE"
+  jan --apply
+  check "a completed ticket in the list is not part of the open set: no change, no recompute" \
+    eval '[ "$RC" = 0 ] && [ -z "$OUT" ] && [ ! -s "$FAKE_MIRROR_LOG" ]'
+  check "every listed id was read with ticket show --json" \
+    eq "$(jq -sc '[.[] | select(.[0:2] == ["ticket","show"]) | .[2:]]' "$FAKE_ADLC_LOG")" '[["T1","--json"],["T2","--json"],["T3","--json"]]'
+  (cd "$WORLD/ci" && "$FAKES_DIR/adlc" ticket complete T2 --write --authorize >/dev/null)
+  check "the fixture: T2 now completed, still listed" \
+    eq "$("$FAKES_DIR/adlc" ticket list --json | jq -c 'map(.id)')" '["T1","T2","T3"]'
+  : >"$FAKE_ADLC_LOG"
+  jan --apply
+  check "a completion (T2 leaves the open set) triggers the recompute" \
+    eq "$RC $(pick '.action == "ready-recompute"' 'map([.open_set, .previous, .removed, .added, .result])')" \
+       '0 [[["T1"],["T1","T2"],["T2"],[],"done"]]'
+  check "the mirror ran on the forecast" eq "$(jq -sc 'map(.argv[0:2])' "$FAKE_MIRROR_LOG")" '[["--apply","--forecast"]]'
+  check "the saved set holds the open ids only" eq "$(on_nodes janitor/state.json | jq -c .open_set)" '["T1"]'
+  : >"$FAKE_MIRROR_LOG"
+  jan --apply
+  check "the next run: same open set, nothing to do" eval '[ "$RC" = 0 ] && [ -z "$OUT" ] && [ ! -s "$FAKE_MIRROR_LOG" ]'
+  export FAKE_ADLC_FAIL='ticket show T1'
+  jan --apply
+  check "a failed ticket show: line failed, exit 1, set unchanged" \
+    eq "$RC $(pick '.action == "ready-recompute"' 'map(.result)') $(on_nodes janitor/state.json | jq -c .open_set)" '1 ["failed"] ["T1"]'
+}
+
+# T10 AC1 wiring: janitor.yml's hook is `revoke-collaborator.sh --apply`, a command line with a flag.
+# The retired node's owner stops being a collaborator; a code owner is refused and reported.
+case_revoke_hook_wired() {
+  jan_setup <<EOF
+node r1 $((NOW - 8 * D)) stale 2 bob
+node r2 $((NOW - 8 * D)) stale 2 musicofhel
+EOF
+  # tests/fakes/gh has no collaborators route (not T10's to edit; test_revoke.sh models it): a shim
+  # logs the DELETE and answers it, every other call goes to the fake.
+  mkdir -p "$WORLD/shim"
+  printf '#!/usr/bin/env bash\nif [[ "$*" == "api -X DELETE repos/test/repo/collaborators/"* ]]; then for a in "$@"; do jq -n --arg a "$a" '"'"'$a'"'"'; done | jq -sc . >>"$FAKE_GH_LOG"; exit 0; fi\nexec "%s/gh" "$@"\n' \
+    "$FAKES_DIR" >"$WORLD/shim/gh"
+  chmod +x "$WORLD/shim/gh"
+  export PATH="$WORLD/shim:$PATH"
+  local wired; wired="$(sed -n 's/^ *JANITOR_REVOKE_HOOK: *//p' "$REPO_ROOT/.github/workflows/janitor.yml")"
+  check "janitor.yml wires the revoke hook" eq "$wired" "./factory/bin/revoke-collaborator.sh --apply"
+  check "janitor.yml hands the hook the App token" grep -q 'REVOKE_GH_TOKEN: ${{ steps.app.outputs.token }}' "$REPO_ROOT/.github/workflows/janitor.yml"
+  export JANITOR_REVOKE_HOOK="$REPO_ROOT/${wired#./}"   # the workflow's value, from the repo root it runs in
+  jan --apply
+  check "exit 1: one revoke refused" eq "$RC" 1
+  check "revoke lines: r1 done, r2 failed (a code owner)" \
+    eq "$(pick '.action == "revoke-token"' 'map([.handle, .owner, .result])')" '[["r1","bob","done"],["r2","musicofhel","failed"]]'
+  check "exactly one DELETE, for bob (the code owner never reaches gh)" \
+    eq "$(jq -sc '[.[] | select(index("DELETE"))]' "$FAKE_GH_LOG")" '[["api","-X","DELETE","repos/test/repo/collaborators/bob"]]'
+  check "the refusal reason reaches the log" eval '[[ "$ERR" == *"musicofhel is a code owner"* ]]'
 }
 
 # Everything fires at once. --dry-run (and no flag) must leave every ref and tree byte-identical,
@@ -544,7 +604,7 @@ case_fake_semantics() {
 
 echo "test_janitor"
 for c in stale-lock stale-node over-slots fresh-branch-kept no-pr-48h branch-sweep node-lifecycle preview-ttl \
-         ready-recompute dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
+         ready-recompute ready-open-only revoke-hook-wired dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

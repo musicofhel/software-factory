@@ -12,6 +12,13 @@
 # reported as unmanaged and left alone (never deleted). The policy's `unexpressed` rules are
 # printed on every run. Needs repo admin for --apply; the plan needs read access.
 #
+# FACTORY_APP_ID (the factory GitHub App's numeric App ID; step-1 ruling Q6) adds the App to every
+# policy ruleset's bypass_actors as {actor_id, actor_type: "Integration", bypass_mode: "always"},
+# so post-merge can push its completion commit on the App token. The dry run prints it, --apply
+# sends it, and it is compared like any other field. Unset or empty: the output is unchanged. A
+# ruleset bypass does not lift the classic branch protection above (required reviews and checks,
+# enforce_admins); every run with the App set prints that as a NOTE.
+#
 # Exit 0: planned, or applied every call. 1: a read or a write failed. 2: the policy has a field
 # that is not a real GitHub REST field (refused before any call).
 set -euo pipefail
@@ -19,7 +26,7 @@ PROG="apply-branch-protection"
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 json=0 repo="" policy="$FACTORY_ROOT/factory/policy/branch-protection.json"
 while [ $# -gt 0 ]; do
@@ -61,6 +68,8 @@ bad="$(jq -r '
 ' "$policy")"
 [ -z "$bad" ] || refuse "policy $policy is not GitHub REST: $(paste -sd ';' <<<"$bad")"
 
+APP_ID="${FACTORY_APP_ID:-}"
+[ -z "$APP_ID" ] || [[ "$APP_ID" =~ ^[1-9][0-9]{0,18}$ ]] || refuse "FACTORY_APP_ID must be the App's numeric ID, got '$APP_ID'"
 REPO="$(resolve_repo "$repo")"
 BRANCH="$(jq -r '.branch // "main"' "$policy")"
 [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || die "bad branch name '$BRANCH'"
@@ -139,7 +148,10 @@ while IFS= read -r rs; do
   cur="$(jq -c '{name, target, enforcement, bypass_actors: (.bypass_actors // []), conditions, rules}' <<<"$cur")"
   if jq -e --argjson w "$rs" "$JQ_LIB same(\$w)" <<<"$cur" >/dev/null; then action=noop; else action=update; fi
   add_call "$action" PUT "repos/$REPO/rulesets/$id" "$rs" "ruleset $name"
-done < <(jq -c "$JQ_LIB (.rulesets // [])[] | strip" "$policy")
+done < <(jq -c --arg app "$APP_ID" "$JQ_LIB (.rulesets // [])[] | strip
+  | if \$app == \"\" then . else .bypass_actors = ((.bypass_actors // [])
+      | map(select(.actor_type != \"Integration\" or .actor_id != (\$app | tonumber)))
+      + [{actor_id: (\$app | tonumber), actor_type: \"Integration\", bypass_mode: \"always\"}]) end" "$policy")
 
 unmanaged="$(jq -c --argjson want "$(jq -c '[(.rulesets // [])[].name]' "$policy")" \
   '[.[] | select(.name | IN($want[]) | not) | .name]' <<<"$existing")"
@@ -160,8 +172,12 @@ fi
 out="$(jq -cn --arg mode "$([ "$apply" = 1 ] && echo apply || echo dry-run)" --arg repo "$REPO" \
   --arg branch "$BRANCH" --argjson calls "$plan" --argjson results "$results" \
   --argjson unmanaged "$unmanaged" --argjson unexpressed "$unexpressed" \
+  --arg app "$APP_ID" --argjson rulesets "$(jq -c '[(.rulesets // [])[].name]' "$policy")" \
   '{mode: $mode, repo: $repo, branch: $branch, calls: $calls, results: $results,
-    unmanaged_rulesets: $unmanaged, unexpressed: $unexpressed}')"
+    unmanaged_rulesets: $unmanaged, unexpressed: $unexpressed}
+   + (if $app == "" then {} else {app_bypass: {actor_id: ($app | tonumber), actor_type: "Integration",
+        bypass_mode: "always", rulesets: $rulesets,
+        not_covered: "classic branch protection on \($branch) (required reviews and status checks, enforce_admins): a ruleset bypass actor does not lift it, so a direct push by the App is still refused while it is set"}} end)')"
 if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
   jq -r '
     (.calls[] | "# \(.action): \(.what)" + (if .action == "noop" then " (already matches; not sent)" else "" end),
@@ -170,6 +186,8 @@ if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
     (.results[] | "# \(.result): \(.method) \(.path)" + (if .error then " (\(.error))" else "" end)),
     (.unmanaged_rulesets[] | "# unmanaged ruleset on GitHub, not in the policy (left alone): \(.)"),
     (.unexpressed[] | "# NOT EXPRESSIBLE on GitHub, not enforced: \(.rule). \(.why) See \(.adr // "the policy").") ,
+    (.app_bypass // empty | "# bypass actor: GitHub App \(.actor_id) (\(.actor_type), \(.bypass_mode)) on ruleset(s) \(.rulesets | join(", ")) (FACTORY_APP_ID)",
+                            "# NOTE: not covered by the bypass: \(.not_covered)"),
     (if .mode == "dry-run" then
        "# dry run: \([.calls[] | select(.action != "noop")] | length) write(s) planned, none sent; --apply to send"
      else "# applied \([.results[] | select(.result == "ok")] | length) of \(.results | length) write(s)" end)
