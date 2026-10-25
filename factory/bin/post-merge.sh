@@ -15,7 +15,11 @@
 #             merge order. An id the store does not hold (`Ticket: scaffold`) and a ticket already
 #             complete are reported and skipped. `Ticket: post-merge` names this job's own
 #             commit, not a ticket: it is passed over without a line.
-#   complete  `adlc ticket complete <id> --write --authorize` for each.
+#   complete  `adlc ticket complete <id> --write --authorize --allow-unsigned` for each. Once any
+#             ticket declares a rail the store is a frozen trust root (adlc 1.12.0) and a write
+#             without ADLC_MANIFEST_KEY refuses (MANIFEST_KEY_REQUIRED) unless it is passed; no key
+#             exists, so the completion is recorded unsigned (factory-run-calls-v1 ruling Q1,
+#             `.adlc/config.json` securityMode unsigned-fallback). An unfrozen store ignores it.
 #   ledger    one line per verified finding of that ticket appended to factory/ledger/findings.jsonl:
 #             its p5-finding-verified gate records (`adlc gate-manifest show --ticket <id>`), less
 #             any finding a later p5-finding-killed record kills. A line keeps ids, category,
@@ -44,7 +48,7 @@ PROG=post-merge
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 remote=origin
 while [ $# -gt 0 ]; do
@@ -170,7 +174,7 @@ while IFS= read -r p; do
   if [ "$apply" = 0 ]; then emit "$line" planned; continue; fi
   id="$(jq -r .ticket <<<"$p")"
   rc=0
-  "${ADLC[@]}" ticket complete "$id" --write --authorize --json >"$WORK/complete.json" 2>"$WORK/complete.err" || rc=$?
+  "${ADLC[@]}" ticket complete "$id" --write --authorize --allow-unsigned --json >"$WORK/complete.json" 2>"$WORK/complete.err" || rc=$?
   if [ "$rc" = 0 ] && jq -se 'last | .applied == true' "$WORK/complete.json" >/dev/null 2>&1; then
     jq -c '.lines[]' <<<"$p" >>"$LEDGER"
     completed_ids+=("$id")

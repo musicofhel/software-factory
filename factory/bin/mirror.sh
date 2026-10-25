@@ -6,7 +6,7 @@
 #   mirror.sh [--dry-run | --apply] [--forecast FILE] [--repo owner/name] [--json]
 #
 # Reads every ticket (`adlc ticket list --json`, then `adlc ticket show <id> --json` for the body,
-# edges and completed flag), the gate records (`adlc gate-manifest show --json`: .adlc/manifest.jsonl
+# edges, rails and completed flag), the gate records (`adlc gate-manifest show --json`: .adlc/manifest.jsonl
 # plus .adlc/manifest.d/), the merge forecast (FILE, which the janitor passes, else `adlc
 # merge-forecast --json`; exit 2 with a JSON object is still a forecast) and every Issue. Then:
 #
@@ -21,6 +21,10 @@
 # (`weight: light|heavy`, `tier: 0|1|2`, `charter: C<n>`), plus `ready` when all of these hold and
 # `needs-desk` otherwise:
 #   header          weight, tier and charter parse
+#   rails           the ticket declares at least one rail (the desk's convention is `factory/policy/**`
+#                   at least, factory/RULES.md and ADR-0002); fleet's rails-guard fails every strike
+#                   on a ticket without one. Reason `rails: none declared`. A completed ticket is
+#                   never relabeled for it
 #   spec-lint       the ticket's latest spec-lint record is a verified pass
 #   coldstart       the ticket's latest coldstart record has an empty gap list and was taken on the
 #                   ticket's current ticketHash (a ticket edited since is stale)
@@ -60,7 +64,7 @@ PROG=mirror
 # shellcheck source=factory/bin/lib/desk-marker.sh
 . "$(dirname "$0")/lib/desk-marker.sh"
 
-usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 forecast="" repo=""
 while [ $# -gt 0 ]; do
@@ -108,7 +112,7 @@ while IFS= read -r id; do
   "${ADLC[@]}" ticket show "$id" --json >"$WORK/show.json" || die "adlc ticket show $id failed"
   jq -ce --arg id "$id" 'select(.ticket.id == $id and (.ticketHash | type) == "string")
     | {id: .ticket.id, title: (.ticket.title // ""), body: (.ticket.body // ""), edges: (.ticket.edges // []),
-       completed: (.ticket.completed == true), hash: .ticketHash}' "$WORK/show.json" >>"$WORK/tickets.jsonl" 2>/dev/null ||
+       rails: (.ticket.rails // null), completed: (.ticket.completed == true), hash: .ticketHash}' "$WORK/show.json" >>"$WORK/tickets.jsonl" 2>/dev/null ||
     die "adlc ticket show $id: not the ticket asked for"
 done <<<"$ids"
 
@@ -165,6 +169,12 @@ def header_reasons($h):
     (if $h.charter == null then "header: charter missing"
      elif ($h.charter | test("^C[0-9]+$")) then empty
      else "header: charter \u0027\($h.charter)\u0027 is not a PROJECT.md line id (C<n>)" end) ];
+
+# A rail is a non-blank string in the `rails` list; `rails: []`, a missing key or a list of blanks
+# declares none.
+def rails_reasons($t):
+  if ([$t.rails | arrays | .[] | strings | select(test("\\S"))] | length) > 0 then []
+  else ["rails: none declared"] end;
 
 # coldstart records come in two shapes (adlc runner/lib/assertions.mjs): live data.cache, or a
 # prompt-only data.verdict JSON string.
@@ -235,7 +245,7 @@ def record_reasons($t):
         elif $cur == null and ($imp | length) > 0 then empty
         else
           ($t | header) as $h
-          | (header_reasons($h) + record_reasons($t) + forecast_reasons($t.id)) as $store
+          | (header_reasons($h) + rails_reasons($t) + record_reasons($t) + forecast_reasons($t.id)) as $store
           | desk_hold($cur; $t) as $hold
           | ($store + if $hold == null then []
                       else ["node: `\($hold.node)` stopped it (\($hold.reason)); needs-desk holds until the ticket changes or a new claim"]

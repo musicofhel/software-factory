@@ -5,6 +5,8 @@
 # store, gate manifest and forecast come from the fake adlc. Offline, no keys.
 # T14 acceptance 1-3 (case node-needs-desk): a node's needs-desk, with the run loop's marker, is kept
 # until the ticket's store state changes; one without the marker is recomputed as before.
+# T18 acceptance 1-3 (case rails-required): an open ticket without rails gets needs-desk with the
+# reason `rails: none declared`; with the rail it can be ready; a completed one is never relabeled.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -27,10 +29,11 @@ mir_setup() {
   export FACTORY_ADLC="$FAKES_DIR/adlc" FAKE_ADLC_STORE="$WORLD/store.json"
   export FAKE_GH_USER=app/github-actions FAKE_GH_BOT=1 RUNNER_ENVIRONMENT=github-hosted
 }
-ticket() {  # ticket <id> <title> <body> [edge-targets,csv] [completed]
+ticket() {  # ticket <id> <title> <body> [edge-targets,csv] [completed]: with the default rail
   local tmp; tmp="$(mktemp)"
   jq --arg id "$1" --arg t "$2" --arg b "$3" --arg e "${4:-}" --argjson c "${5:-false}" \
-    '. + [{id: $id, title: $t, body: $b, edges: ($e | split(",") | map(select(. != "")) | map({to: .})), completed: $c}]' \
+    '. + [{id: $id, title: $t, body: $b, edges: ($e | split(",") | map(select(. != "")) | map({to: .})),
+           rails: ["factory/policy/**"], completed: $c}]' \
     "$WORLD/store.json" >"$tmp"
   mv "$tmp" "$WORLD/store.json"
 }
@@ -207,6 +210,52 @@ case_ready_only_when_gated() {
   check "and readies nothing" eq "$(lines '.gate == "ready"')" 0
   want='merge-forecast: the forecast has gate failures (vetoed pair T2-T8 concurrent)'
   check "T8 names the forecast failure" eq "$(reasons T8)" "[\"$want\"]"
+}
+
+case_rails_required() {
+  mir_setup
+  ticket T1 "railed" "$HDR"
+  ticket T2 "rails: []" "$HDR"; set_ticket T2 '.rails = []'
+  ticket T3 "no rails key" "$HDR"; set_ticket T3 'del(.rails)'
+  ticket T4 "blank rails" "$HDR"; set_ticket T4 '.rails = ["", "  "]'
+  ticket T5 "another rail only" "$HDR"; set_ticket T5 '.rails = ["docs/**"]'
+  ticket T6 "done, no rails key, Issue closed" "$HDR" "" true; set_ticket T6 'del(.rails)'
+  ticket T7 "done, rails: [], Issue still open" "$HDR" "" true; set_ticket T7 '.rails = []'
+  ticket T8 "done, rails: [], no Issue" "$HDR" "" true; set_ticket T8 '.rails = []'
+  local t; for t in T1 T2 T3 T4 T5 T6 T7 T8; do gated "$t"; done
+  # T6 and T7 were mirrored while open, as T1-T16 were: T6's Issue is closed, T7's not yet.
+  local m='<!-- factory-mirror: generated from the ADLC ticket store by factory/bin/mirror.sh; edits here are overwritten -->'
+  fakegh_issue 50 1761300000 "tier:1,w:light" "T6" "$m"$'
+Ticket: T6' app/github-actions true; fakegh_close 50
+  fakegh_issue 51 1761300000 "ready,tier:1,w:light" "T7" "$m"$'
+Ticket: T7' app/github-actions true
+  local t6
+  # shellcheck disable=SC2034  # t6 is read inside the eval string passed to check
+  t6="$(iss T6 .)"
+  mir --apply
+  check "exit 0" eq "$RC" 0
+  reasons() { jq -sc --arg t "$1" '.[] | select(.ticket == $t) | .reasons' <<<"$OUT"; }
+  check "T1, with the default rail: ready" eq "$(labels T1)" '["ready","tier:1","w:light"]'
+  for t in T2 T3 T4; do
+    check "$t: needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'
+    check "$t: the reason is rails: none declared, and only that" eq "$(reasons "$t")" '["rails: none declared"]'
+  done
+  check "the Issue body shows the verdict and the reason" has "$(body T2)" $'Gate: needs-desk\n- rails: none declared\n'
+  check "T5: any declared rail satisfies the check (rails-guard can evaluate it): ready" eq "$(labels T5)" '["ready","tier:1","w:light"]'
+  check "T6, completed without rails: no line, its closed Issue untouched" \
+    eval '[ "$(lines '"'"'.ticket == "T6"'"'"')" = 0 ] && [ "$(iss T6 .)" = "$t6" ]'
+  check "T7, completed with rails: []: closed and ready removed, never needs-desk" \
+    eq "$(jq -sc '.[] | select(.ticket == "T7") | [.action, .add, .remove, .result]' <<<"$OUT")" '["close",[],["ready"],"done"]'
+  check "T7's Issue: closed, no needs-desk" eq "$(iss T7 '[.state, ([.labels[].name] | sort)]')" '["closed",["tier:1","w:light"]]'
+  check "T8, completed without rails and no Issue: none is created" eq "$(lines '.ticket == "T8"')" 0
+  # The desk adds the rail to T2: ready on the next run, nothing else moves.
+  set_ticket T2 '.rails = ["factory/policy/**"]'
+  local before; before="$(writes)"
+  mir --apply
+  check "T2 with the rail: ready, needs-desk removed" \
+    eq "$(jq -sc '.[] | select(.ticket == "T2") | [.gate, .reasons, .add, .remove]' <<<"$OUT")" '["ready",[],["ready"],["needs-desk"]]'
+  check "one write: T2's edit" eq "$(( $(writes) - before ))" 1
+  check "T6 and T7 get no line on the rerun" eq "$(lines '.ticket | IN("T6", "T7", "T8")')" 0
 }
 
 case_depends_on_lines() {
@@ -510,6 +559,9 @@ case_fake_semantics() {
   ticket T1 "one" "$HDR" "T2"; ticket T2 "two" "$HDR"
   check "adlc ticket list: id, title, ticketHash" eq "$(adlc ticket list --json | jq -c '.[0]')" '{"id":"T1","title":"one"}'
   check "adlc ticket show: the ticket and its hash" eq "$(adlc ticket show T1 --json | jq -c '[.ticket.id, .ticket.edges, .ticketHash]')" '["T1",[{"to":"T2"}],"hash-T1"]'
+  set_ticket T2 'del(.rails)'
+  check "adlc ticket show carries rails, and no key when the fixture gave none" \
+    eq "$(adlc ticket show T1 --json | jq -c '.ticket.rails')$(adlc ticket show T2 --json | jq -c '.ticket | has("rails")')" '["factory/policy/**"]false'
   check "adlc ticket show: unknown id exits 2, TICKET_NOT_FOUND on stderr, stdout empty" \
     eval '[ "$(adlc ticket show T9 --json 2>&1 >/dev/null | jq -r .code; echo "${PIPESTATUS[0]}")" = $'"'"'TICKET_NOT_FOUND\n2'"'"' ] && [ -z "$(adlc ticket show T9 --json 2>/dev/null)" ]'
   record '{"type":"p5-finding-verified","ticket":"T1","finding":{"id":"F"}}'
@@ -519,16 +571,19 @@ case_fake_semantics() {
   check "adlc ticket complete --write without --authorize exits 2" eval '! (cd "$WORLD/repo" && adlc ticket complete T1 --write >/dev/null 2>&1)'
   (cd "$WORLD/repo" && adlc ticket complete T1 --json >/dev/null)
   check "adlc ticket complete without --write changes nothing" eq "$(jq -c '.[0].completed' "$WORLD/store.json")" false
-  check "adlc ticket complete --write --authorize: applied" \
-    eq "$(cd "$WORLD/repo" && adlc ticket complete T1 --write --authorize --json | jq -sc 'last.applied')" true
+  check "a railed store is frozen: --write --authorize alone exits 2, MANIFEST_KEY_REQUIRED, nothing changed" \
+    eval '[ "$(cd "$WORLD/repo" && adlc ticket complete T1 --write --authorize --json 2>&1 >/dev/null | jq -r .code; echo "${PIPESTATUS[0]}")" = $'"'"'MANIFEST_KEY_REQUIRED\n2'"'"' ] &&
+          [ "$(jq -c '"'"'.[0].completed'"'"' "$WORLD/store.json")" = false ]'
+  check "adlc ticket complete --write --authorize --allow-unsigned: applied" \
+    eq "$(cd "$WORLD/repo" && adlc ticket complete T1 --write --authorize --allow-unsigned --json 2>/dev/null | jq -sc 'last.applied')" true
   check "the store says completed and the manifest has the entry" \
-    eq "$(jq -c '.[0].completed' "$WORLD/store.json")$(jq -sc 'last | [.gate, .ticket]' "$WORLD/repo/.adlc/manifest.jsonl")" 'true["ticket-complete","T1"]'
+    eq "$(jq -c '.[0].completed' "$WORLD/store.json")$(jq -sc 'last | [.gate, .ticket, .data.bypass]' "$WORLD/repo/.adlc/manifest.jsonl")" 'true["ticket-complete","T1",true]'
   check "adlc merge-forecast leaves completed tickets out" eq "$(adlc merge-forecast --json | jq -c .mergeOrder)" '["T2"]'
 }
 
 adlc() { "$FAKES_DIR/adlc" "$@"; }
 
-for c in creates updates-idempotent ready-only-when-gated depends-on-lines dry-run-inert closes-completed all-completed \
+for c in creates updates-idempotent ready-only-when-gated rails-required depends-on-lines dry-run-inert closes-completed all-completed \
          stranger-issues node-needs-desk forecast-file read-failures-write-nothing refuses-apply workflow fake-semantics; do
   run_case "$c"
 done

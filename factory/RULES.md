@@ -28,6 +28,19 @@ ticket hash) or a new claim cycle (a claim comment after the marker). Only marke
 the repo owner, org members and collaborators count. A `needs-desk` without the marker is
 recomputed from the store as before. To send the ticket back to the queue, fix it at the desk.
 
+## Every ticket declares a rail (the desk's ticket convention)
+
+Every ticket the desk writes declares at least `factory/policy/**` in `rails`, beside the ADR-0002
+header block (`weight`, `tier`, `charter`) in its body (factory-step2-followups ruling Q2). fleet's
+gate runs `adlc rails-guard --ticket <id>`, which fails every strike on a ticket with no rails, and
+`factory/policy/**` is the glob the run loop's ralon lock protects for every ticket. Two checks
+hold the rule: the mirror (`factory/bin/mirror.sh`) gives an open ticket without rails no `ready`,
+only `needs-desk` with the reason `rails: none declared`, and `make tickets`
+(`factory/bin/ticket-check.sh`) exits 2 on it. Completed tickets are never relabeled for it
+(T1-T16 predate the rule). A railed store is a frozen trust root: every later `adlc ticket` write
+needs `--allow-unsigned` while no manifest key exists (factory-run-calls-v1 ruling Q1), and
+post-merge passes it.
+
 ## Commit-check exemption (for build order step 3)
 
 One commit on `main` is written by no human and no node: post-merge's completion commit

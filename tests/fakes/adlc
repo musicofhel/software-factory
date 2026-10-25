@@ -6,10 +6,13 @@
 # the shapes adlc 1.12.0 prints (measured in specs/factory-step1-v1/records/TB4.md):
 #   The ticket store is $FAKE_ADLC_STORE (a file holding a JSON array of tickets; `ticket complete
 #   --write` rewrites it) if set, else $FAKE_ADLC_TICKETS (a JSON array, read-only, default []).
-#   A ticket is {id, title, body?, edges?, completed?, ticketHash?}; a missing ticketHash is
-#   "hash-<id>" (except in `ticket list`, which echoes only the fields the fixture gave).
+#   A ticket is {id, title, body?, edges?, rails?, completed?, ticketHash?}; a missing ticketHash is
+#   "hash-<id>" (except in `ticket list`, which echoes only the fields the fixture gave). The store is
+#   frozen (adlc 1.12.0's "frozen trust root") once any ticket declares a non-empty `rails`,
+#   completed ones included.
 #   ticket list --json        [{id, title, ticketHash}] for every ticket, completed ones included
-#   ticket show <id> --json   {ticket: {...}, ticketHash, storeHash}; an unknown id exits 2 with
+#   ticket show <id> --json   {ticket: {...every field the fixture gave but ticketHash, rails
+#                             included}, ticketHash, storeHash}; an unknown id exits 2 with
 #                             {"ok": false, "code": "TICKET_NOT_FOUND", ...} on stderr and nothing
 #                             on stdout (as the real CLI; `ticket complete` the same)
 #   ticket complete <id> [--write --authorize] [--json]
@@ -18,7 +21,12 @@
 #                             (a no-op when it already is, as the real CLI) and appends a
 #                             ticket-complete entry to ./.adlc/manifest.jsonl, then prints
 #                             {"applied": true, ...}. --write without --authorize exits 2 here, so
-#                             a caller that forgets the flag the ticket names is caught.
+#                             a caller that forgets the flag the ticket names is caught. In a frozen
+#                             store --write without --allow-unsigned prints the plan, then exits 2
+#                             with {"ok": false, "code": "MANIFEST_KEY_REQUIRED", ...} on stderr
+#                             and changes nothing; with it, a warning on stderr and the entry's
+#                             data gains bypass: true. An unfrozen store takes the flag silently
+#                             (all as the real CLI, specs/factory-run-calls-v1/records/TB2.md §1).
 #   gate-manifest show [--ticket id] --json
 #                             {entries: [...], skipped: $FAKE_ADLC_SKIPPED (default [])} from
 #                             ./.adlc/manifest.jsonl (cwd, as the real CLI); each entry gains
@@ -67,11 +75,22 @@ case "${1:-} ${2:-}" in
     jq -cn --arg id "$id" --argjson w "$write" \
       '{version: 1, operation: "complete", ticketId: $id, changedFields: ["completed"], dryRun: ($w == 0)}'
     if [ "$write" = 1 ]; then
+      bypass=false
+      if jq -e 'any(.[]; (.rails | type) == "array" and (.rails | length) > 0)' <<<"$tickets" >/dev/null; then
+        if ! has --allow-unsigned "${@:4}"; then
+          jq -cn '{ok: false, kind: "policy", code: "MANIFEST_KEY_REQUIRED",
+                   message: "this ticket store is a frozen trust root (a ticket declares rails), so mutating it is an audited override — and ADLC_MANIFEST_KEY is not set. Refusing before the write: nothing has changed. To record an UNSIGNED audit entry on purpose, pass --allow-unsigned."}' >&2
+          exit 2
+        fi
+        echo "warning: --allow-unsigned with no ADLC_MANIFEST_KEY — this mutation of a frozen trust root will be recorded UNSIGNED." >&2
+        bypass=true
+      fi
       tmp="$(mktemp "$FAKE_ADLC_STORE.XXXXXX")"
       jq --arg id "$id" 'map(if .id == $id then .completed = true else . end)' "$FAKE_ADLC_STORE" >"$tmp"
       mv "$tmp" "$FAKE_ADLC_STORE"
       mkdir -p .adlc
-      jq -cn --arg id "$id" '{gate: "ticket-complete", ticket: $id, data: {operation: "complete", action: "apply"}}' >>"$MANIFEST"
+      jq -cn --arg id "$id" --argjson b "$bypass" \
+        '{gate: "ticket-complete", ticket: $id, data: ({operation: "complete", action: "apply"} + if $b then {bypass: true} else {} end)}' >>"$MANIFEST"
       jq -cn --arg id "$id" '{applied: true, storeHash: "store-fake", ticketHash: "hash-\($id)-done"}'
     fi ;;
   "gate-manifest show")

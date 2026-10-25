@@ -26,8 +26,11 @@ lint:
 	elif command -v uvx >/dev/null; then uvx --from actionlint-py actionlint -shellcheck "$$SC"; \
 	else echo "actionlint not installed; workflows not linted"; fi
 
+# The store, then the desk's check on it (factory/bin/ticket-check.sh: exit 2 on an open ticket
+# without rails).
 tickets:
 	@npx -y @adlc/cli@1.12.0 ticket list
+	@./factory/bin/ticket-check.sh
 
 doctor:
 	@npx -y @adlc/cli@1.12.0 ticket doctor

@@ -4,6 +4,8 @@
 # --authorize`, appends one line per verified finding to factory/ledger/findings.jsonl, lands one
 # commit on main, and refuses to run anywhere but a checkout of main (exit 2). The origin is a
 # local bare repo, the store and gate manifest come from the fake adlc. Offline, no keys.
+# T18 acceptance 5 (case railed-store): post-merge passes --allow-unsigned (ruling Q1), so it completes
+# tickets in a railed store, which the fake adlc, as the real CLI, refuses to write without it.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -82,7 +84,9 @@ case_completes() {
   check "exit 0" eq "$RC" 0
   check "T1 and T2 are complete in the store, T3 is not" eq "$(completed)" '["T1","T2"]'
   check "adlc ticket complete <id> --write --authorize --json, once per named ticket, in merge order" \
-    eq "$(completions)" '[["ticket","complete","T1","--write","--authorize","--json"],["ticket","complete","T2","--write","--authorize","--json"]]'
+    eq "$(completions)" '[["ticket","complete","T1","--write","--authorize","--allow-unsigned","--json"],["ticket","complete","T2","--write","--authorize","--allow-unsigned","--json"]]'
+  check "an unrailed store takes --allow-unsigned silently: no bypass entry, no warning" \
+    eval '[ "$(jq -sc '"'"'[.[] | select(.gate == "ticket-complete") | .data.bypass]'"'"' "$R/.adlc/manifest.jsonl")" = "[null,null]" ] && lacks "$ERR" "UNSIGNED"'
   check "lines: T1 done, T2 done, scaffold unknown (skipped)" eq "$(ticket_lines)" '[["T1","done"],["T2","done"],["scaffold","unknown"]]'
   check "T2's line names its PR and merge commit" \
     eq "$(jq -sc '.[] | select(.ticket == "T2") | [.pr, .commit, .findings]' <<<"$OUT")" "[7,\"$merge\",1]"
@@ -180,7 +184,7 @@ case_range_since_marker() {
   check "only the commits since the marker are read: T3 done, T1 already complete" \
     eq "$(ticket_lines)" '[["T3","done"],["T1","already"]]'
   check "T3 is credited to PR #8" eq "$(jq -sc '.[] | select(.ticket == "T3") | .pr' <<<"$OUT")" 8
-  check "only T3 is completed again" eq "$(completions)" '[["ticket","complete","T3","--write","--authorize","--json"]]'
+  check "only T3 is completed again" eq "$(completions)" '[["ticket","complete","T3","--write","--authorize","--allow-unsigned","--json"]]'
   check "no duplicate ledger lines" eq "$(command cat "$R/factory/ledger/findings.jsonl")" "$led1"
   check "the marker advances to the scanned head" eq "$(jq -r .through "$R/factory/ledger/post-merge.json")" "$(git -C "$R" rev-parse HEAD~1)"
   check "the second commit sits on the first run's commit" eq "$(git -C "$R" rev-parse HEAD~4)" "$head1"
@@ -228,6 +232,36 @@ case_completion_failure() {
   FACTORY_ADLC="$WORLD/adlc-nowrite" pm --apply
   check "exit 0 without {applied: true} is a failed completion: exit 1" eval '[ "$RC" = 1 ] && [ "$(ticket_lines)" = "[[\"T3\",\"failed\"]]" ]'
   check "and nothing lands" eq "$(land)" '["skipped"]'
+}
+
+case_railed_store() {
+  pm_setup
+  # T3 (open) declares the default rail: the store is a frozen trust root, as main's is since TB0.
+  local tmp; tmp="$(mktemp)"
+  jq 'map(if .id == "T3" then .rails = ["factory/policy/**"] else . end)' "$FAKE_ADLC_STORE" >"$tmp" && mv "$tmp" "$FAKE_ADLC_STORE"
+  git -C "$R" commit -q -am "T3 declares a rail"; git -C "$R" push -q origin main 2>/dev/null
+  local before; before="$(state)"
+  local rc=0; (cd "$R" && "$FAKES_DIR/adlc" ticket complete T1 --write --authorize --json >/dev/null 2>"$WORLD/refused") || rc=$?
+  check "the fake adlc refuses the write without --allow-unsigned: exit 2, MANIFEST_KEY_REQUIRED, nothing changed" \
+    eval '[ "$rc" = 2 ] && [ "$(jq -r .code "$WORLD/refused")" = MANIFEST_KEY_REQUIRED ] && [ "$(state)" = "$before" ]'
+  # An adlc call without the flag (post-merge before T18): every completion fails and nothing lands.
+  printf '#!/usr/bin/env bash\nargs=(); for a in "$@"; do [ "$a" = --allow-unsigned ] || args+=("$a"); done\nexec "%s" "${args[@]}"\n' \
+    "$FAKES_DIR/adlc" >"$WORLD/adlc-signed-only"
+  chmod +x "$WORLD/adlc-signed-only"
+  FACTORY_ADLC="$WORLD/adlc-signed-only" pm --apply
+  check "without the flag: exit 1, T1 and T2 failed" eval '[ "$RC" = 1 ] && [ "$(ticket_lines)" = "[[\"T1\",\"failed\"],[\"T2\",\"failed\"],[\"scaffold\",\"unknown\"]]" ]'
+  check "the failed lines name MANIFEST_KEY_REQUIRED" \
+    eq "$(jq -sc '[.[] | select(.result == "failed") | .detail | test("^adlc ticket complete exit 2: .*MANIFEST_KEY_REQUIRED")]' <<<"$OUT")" '[true,true]'
+  check "and nothing completes or lands" eval '[ "$(completed)" = "[]" ] && [ "$(land)" = "[\"skipped\"]" ] && [ "$(state)" = "$before" ]'
+  : >"$FAKE_ADLC_LOG"
+  pm --apply
+  check "post-merge as it is: exit 0, T1 and T2 done" eval '[ "$RC" = 0 ] && [ "$(ticket_lines)" = "[[\"T1\",\"done\"],[\"T2\",\"done\"],[\"scaffold\",\"unknown\"]]" ]'
+  check "it passed --allow-unsigned on both completions" \
+    eq "$(jq -sc '[.[] | select(.[0:2] == ["ticket", "complete"]) | index("--allow-unsigned") != null]' "$FAKE_ADLC_LOG")" '[true,true]'
+  check "T1 and T2 complete in the store, T3 open" eq "$(completed)" '["T1","T2"]'
+  check "each completion is recorded unsigned (bypass: true)" \
+    eq "$(jq -sc '[.[] | select(.gate == "ticket-complete") | [.ticket, .data.bypass]]' "$R/.adlc/manifest.jsonl")" '[["T1",true],["T2",true]]'
+  check "the run landed and pushed" eval '[ "$(land)" = "[\"done\"]" ] && [ "$(origin_main)" = "$(git -C "$R" rev-parse HEAD)" ]'
 }
 
 case_push_refused() {
@@ -306,7 +340,7 @@ case_workflow() {
   check "it triggers on pushes to main only" eval 'grep -A2 -E "^  push:$" "$wf" | grep -q "branches: \[main\]"'
 }
 
-for c in completes refuses-off-main dry-run-inert findings-ledger range-since-marker completion-failure push-refused \
+for c in completes refuses-off-main dry-run-inert findings-ledger range-since-marker completion-failure railed-store push-refused \
          refuses-apply-off-hosted trailers workflow; do
   run_case "$c"
 done
