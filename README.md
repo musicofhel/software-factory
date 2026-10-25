@@ -24,7 +24,7 @@ Read it once; nothing below contradicts it.
 - **Your account stays yours.** Quota cap defaults to 40 % of your window and the node
   sleeps through your working day.
 
-## Joining (once the join wizard lands, build order step 2)
+## Joining (build order step 2: built locally, awaiting first join)
 
 ```sh
 git clone https://github.com/musicofhel/software-factory
@@ -34,8 +34,8 @@ claude            # then: /factory:join
 
 The wizard probes your box, installs the pinned toolchain in safe mode, registers a
 repo-scoped token and runner, and commits your node manifest to the `nodes` branch. It
-writes nowhere outside the clone and `~/.factory/`. Until it lands, `factory/skills/join/`
-documents every step it will take.
+writes nowhere outside the clone and `~/.factory/`. `factory/skills/join/SKILL.md` documents
+every step, and `/factory:run` (`factory/skills/run/`) starts one run loop per slot.
 
 ## Layout
 
@@ -71,7 +71,7 @@ else is long-lived.
 | # | Step | Status |
 |---|---|---|
 | 1 | Clock + janitor, claim protocol, kill switch | **built locally, awaiting first push** (`specs/factory-step1-v1`) |
-| 2 | Join wizard and run loop (vetto, Ralon, dcg, cux) | queued |
+| 2 | Join wizard and run loop (vetto, Ralon, dcg, cux) | **built locally, awaiting first join** (`specs/factory-step2-v1`) |
 | 3 | CI gates and merge queue with the `Depends-on:` hold | queued |
 | 4 | Rail author charter, prosecution CLI, verifier wrapper, summoner, digest | queued |
 | 5 | Preview, behavior diff, release | queued |

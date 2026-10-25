@@ -6,6 +6,9 @@
 #
 # <bare-dir> must not exist. The spec is read from stdin, one item per line (# comments allowed):
 #
+#   main-dir <dir>                           copy every file under <dir> onto main (for example a
+#                                            `git archive` of the factory itself); lines after it
+#                                            overlay it, lines before it are overwritten by it
 #   version <x.y.z>                          factory/VERSION on main (default 0.1.0)
 #   main-file <path> <content...>            any other file on main (one line of content)
 #   node <handle> <last_seen-epoch> [status] [slots] [owner]
@@ -64,6 +67,10 @@ while IFS= read -r line || [ -n "$line" ]; do
   read -r -a f <<<"$line"
   [ "${#f[@]}" -gt 0 ] || continue
   case "${f[0]}" in
+    main-dir)
+      [ "${#f[@]}" = 2 ] && [ -d "${f[1]}" ] || die "main-dir needs one existing directory"
+      [ ! -e "${f[1]}/.git" ] || die "main-dir ${f[1]} holds a .git: pass an exported tree"
+      cp -a "${f[1]}/." "$WORK/main/" ;;
     version) echo "${f[1]:?version needs x.y.z}" >"$WORK/main/factory/VERSION" ;;
     main-file)
       [ "${#f[@]}" -ge 3 ] || die "main-file needs <path> <content>"
