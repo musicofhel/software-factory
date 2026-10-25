@@ -2,7 +2,9 @@
 # T7: the join wizard (factory/bin/join.sh, factory/bin/lib/probe.sh). Offline: a temporary HOME,
 # a probe root standing in for /proc and /etc, a fixture origin from tests/fixtures/make-repo.sh,
 # and a closed PATH whose tools are the multi-call fake tests/fakes/join/multi plus a few real
-# coreutils. Acceptance 1 (one case per refusal), 2 (slots), 3 (home-diff), 4 (nodes-cas).
+# coreutils. Acceptance 1 (one case per refusal), 2 (slots), 3 (home-diff), 4 (nodes-cas). T12
+# acceptance 6: the probe reports the bwrap shim's prerequisites (case shim-prereqs); the probe root
+# is a merged-usr host unless a case says otherwise.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -27,6 +29,9 @@ join_setup() {
   echo '{"permissions": {"defaultMode": "default"}}' >"$HOME/.claude/settings.json"
   echo "Linux version 6.8.0-fake (gcc) #1 SMP" >"$WORLD/root/proc/version"
   printf 'NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\n' >"$WORLD/root/etc/os-release"
+  mkdir -p "$WORLD/root/usr/bin" "$WORLD/root/usr/sbin" "$WORLD/root/usr/lib" "$WORLD/root/usr/lib64" "$WORLD/root/etc/ssl"
+  for t in bin sbin lib lib64; do ln -s "usr/$t" "$WORLD/root/$t"; done
+  echo 'nameserver 10.0.0.1' >"$WORLD/root/etc/resolv.conf"; echo '127.0.0.1 localhost' >"$WORLD/root/etc/hosts"
   meminfo 16 12
   tests/fixtures/make-repo.sh "$WORLD/origin.git" </dev/null
   git clone -q "$WORLD/origin.git" "$WORLD/clone"
@@ -435,9 +440,37 @@ case_usage() {
 }
 
 cd "$REPO_ROOT"
+case_shim_prereqs() {
+  join_setup; all_installed
+  jn --handle node-a --no-suite --json
+  check "a merged-usr box: the probe carries the shim's prerequisites, no warning" \
+    eq "$(jq -c '[.exit, (.probe.sandbox.shim | .fleet_pin, .bwrap, .ready, .merged_usr), .warnings]' <<<"$OUT")" \
+       "[0,\"1.12.0\",\"$WORLD/bin/bwrap\",true,true,[]]"
+  check "  every host path the shim reads, with what it inserts" \
+    eq "$(jq -c '[.probe.sandbox.shim.paths[] | "\(.path) \(.insert // .why)"]' <<<"$OUT")" \
+       '["/usr ro-bind","/bin symlink","/sbin symlink","/lib symlink","/lib64 symlink","/etc/ssl ro-bind","/etc/resolv.conf ro-bind","/etc/hosts ro-bind"]'
+  jn --handle node-a --no-suite
+  check "  the report prints a shim line" grep -qF -- "bwrap shim for fleet 1.12.0 (ADR-0006): real bwrap $WORLD/bin/bwrap, ready true, merged usr true; adds /usr /bin->usr/bin" <<<"$OUT"
+  rm "$WORLD/root/bin"; mkdir "$WORLD/root/bin"
+  jn --handle node-a --no-suite --json
+  check "/bin a real directory: exit 0, a warning names /bin/sh and #1266" \
+    eq "$(jq -c '[.exit, .probe.sandbox.shim.merged_usr, (.warnings | length), (.warnings[0] | test("finds no /bin/sh.*adlc#1266"))]' <<<"$OUT")" '[0,false,1,true]'
+  rm -rf "$WORLD/root/usr"
+  jn --handle node-a --no-suite --json
+  check "no /usr: exit 0, the warning says the shim cannot run" \
+    eq "$(jq -c '[.exit, .probe.sandbox.shim.ready, (.warnings[0] | startswith("the bwrap shim (ADR-0006) cannot run here (no /usr to bind)"))]' <<<"$OUT")" '[0,false,true]'
+  rm "$WORLD/bin/bwrap"
+  jn --handle node-a --no-suite --json
+  check "no bwrap: refused for the sandbox, no shim warning on top" \
+    eq "$(jq -c '[.exit, .probe.sandbox.shim.bwrap, (.warnings | length)]' <<<"$OUT")" '[2,null,0]'
+  ln -s "$MULTI" "$WORLD/bin/sandbox-exec"
+  FAKE_UNAME_S=Darwin jn --handle node-a --no-suite --json
+  check "macOS: no shim" eq "$(jq -c '.probe.sandbox.shim' <<<"$OUT")" null
+}
+
 for c in dry-run-ok slots refuse-no-sandbox refuse-macos-sandbox refuse-skip-permissions-rc \
          refuse-skip-permissions-settings refuse-no-adapter refuse-schema refuse-other heavy-gates plan \
-         home-diff nodes-cas no-nodes-branch validator usage; do
+         home-diff nodes-cas no-nodes-branch validator usage shim-prereqs; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

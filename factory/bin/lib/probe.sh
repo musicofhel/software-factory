@@ -13,6 +13,10 @@
 #   sandbox       the backend fleet needs (ADR-0003): bwrap on Linux and WSL2, run with a read-only
 #                 bind of / (a bare `bwrap --unshare-all true` fails on every box, records/TB0.md
 #                 gotcha 8); sandbox-exec on macOS. present, works, and the install line when absent.
+#                 On Linux and WSL2 also `shim`: the bwrap shim's prerequisites (`bwrap-shim probe`,
+#                 ADR-0006): the real bwrap it would exec, each host path it reads with what it
+#                 inserts for it, merged_usr (/bin a symlink, so /bin/sh exists in fleet 1.12.0's
+#                 canary), ready (a real bwrap and /usr to bind). null elsewhere.
 #   adapters      claude, codex, agy, opencode: installed, version, authenticated. Only claude-code
 #                 has a measured auth check (`claude auth status --json` → .loggedIn); the others
 #                 report authenticated=null (not measured) and count as not authenticated.
@@ -23,14 +27,15 @@
 #                 symlinks: vetto then fails closed with exit 125 (measured on ~/.aws, records/TB1.md)
 #   uid           the user id the wizard runs as (root is refused by the wizard)
 #
-# FACTORY_PROBE_ROOT (tests only) is prefixed to every /proc and /etc path read here.
+# FACTORY_PROBE_ROOT (tests only) is prefixed to every /proc and /etc path read here, and to the
+# host paths the shim reads.
 # Exit 0 always when the probe ran; 1 on bad usage.
 set -euo pipefail
 PROG=probe
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/common.sh"
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 json=0 clone=""
 while [ $# -gt 0 ]; do
@@ -84,7 +89,7 @@ disk_kb="$(df -Pk "$clone" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
 [[ "$disk_kb" =~ ^[0-9]+$ ]] || disk_kb=0
 
 # ---- Sandbox backend ---------------------------------------------------------------------------
-sb_name="" sb_present=false sb_works=false sb_version="" sb_install=""
+sb_name="" sb_present=false sb_works=false sb_version="" sb_install="" sb_shim=null
 case "$os" in
   linux|wsl2)
     sb_name=bwrap
@@ -100,7 +105,9 @@ case "$os" in
       sb_present=true
       sb_version="$(bwrap --version 2>/dev/null | semver_of)"
       if bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1; then sb_works=true; fi
-    fi ;;
+    fi
+    sb_shim="$(FACTORY_SHIM_ROOT="$R" "$(dirname "$0")/bwrap-shim" probe 2>/dev/null)" || sb_shim=null
+    jq -e 'type == "object"' <<<"$sb_shim" >/dev/null 2>&1 || sb_shim=null ;;
   macos)
     sb_name=sandbox-exec
     sb_install="sandbox-exec ships with macOS at /usr/bin/sandbox-exec; restore it (it cannot be installed separately)"
@@ -168,7 +175,7 @@ done
 out="$(jq -cn --arg os "$os" --arg note "$os_note" --arg kernel "$kernel" --arg arch "$arch" --arg distro "$distro" \
   --argjson cpu "$cpu" --argjson tk "$total_kb" --argjson fk "$free_kb" --argjson dk "$disk_kb" \
   --arg sbn "$sb_name" --argjson sbp "$sb_present" --argjson sbw "$sb_works" --arg sbv "$sb_version" \
-  --arg sbi "$sb_install" --argjson adapters "$adapters" --argjson skips "$skips" --argjson masks "$masks" \
+  --arg sbi "$sb_install" --argjson sbs "$sb_shim" --argjson adapters "$adapters" --argjson skips "$skips" --argjson masks "$masks" \
   --argjson uid "$(id -u)" --arg clone "$clone" '
   def gb: . / 1048576 * 100 | round / 100;
   {os: (if $os == "" then null else $os end), os_note: (if $note == "" then null else $note end),
@@ -176,13 +183,15 @@ out="$(jq -cn --arg os "$os" --arg note "$os_note" --arg kernel "$kernel" --arg 
    cpu: $cpu, ram_total_kb: $tk, ram_free_kb: $fk, ram_gb: ($tk | gb), free_ram_gb: ($fk | gb),
    clone: $clone, disk_free_gb: ($dk | gb),
    sandbox: {backend: (if $sbn == "" then null else $sbn end), present: $sbp, works: $sbw,
-             version: (if $sbv == "" then null else $sbv end), install_line: (if $sbi == "" then null else $sbi end)},
+             version: (if $sbv == "" then null else $sbv end), install_line: (if $sbi == "" then null else $sbi end),
+             shim: $sbs},
    adapters: $adapters, skip_permissions: $skips, vetto_masks: $masks, uid: $uid}')"
 
 if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
   jq -r '"os \(.os // "unsupported")\(if .os_note then " (\(.os_note))" else "" end), \(.kernel) \(.arch)",
          "cpu \(.cpu), RAM \(.ram_gb) GB total, \(.free_ram_gb) GB free, disk \(.disk_free_gb) GB free",
          "sandbox \(.sandbox.backend // "none"): present \(.sandbox.present), works \(.sandbox.works)",
+         (.sandbox.shim // empty | "bwrap shim for fleet \(.fleet_pin) (ADR-0006): real bwrap \(.bwrap // "none"), ready \(.ready), merged usr \(.merged_usr); adds \([.paths[] | select(.insert) | if .insert == "symlink" then "\(.path)->\(.target)" else .path end] | join(" "))"),
          (.adapters[] | "adapter \(.name): \(if .installed then "\(.version // "?") authenticated \(.authenticated // "not measured")" else "absent" end)"),
          (.skip_permissions[] | "skip-permissions in \(.file) (\(.kind))"),
          (.vetto_masks[] | "vetto masks \(.path), a symlink to a \(.target_kind)")' <<<"$out"

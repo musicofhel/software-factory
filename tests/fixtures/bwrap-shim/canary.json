@@ -1,0 +1,1 @@
+["bwrap","--unshare-net","--die-with-parent","--chdir","/tmp/fleet-canary-AbC123","--bind","/tmp/fleet-canary-AbC123","/tmp/fleet-canary-AbC123","--bind","/tmp/fleet-canary-AbC123/.home","/tmp/fleet-canary-AbC123/.home","--setenv","HOME","/tmp/fleet-canary-AbC123/.home","--","/bin/sh","-c","echo __fleet_canary_ok__"]

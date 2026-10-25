@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# bwrap-shim — the system roots fleet 1.12.0's sandboxes leave out, added read-only (ADR-0006, ticket
+# T12, ruling Q1 of specs/factory-step2-v1/RULINGS.md). Upstream: voodootikigod/adlc#1266, the
+# preflight canary runs /bin/sh in a bwrap that binds no system root, so every `fleet run` stops at
+# preflight on a bubblewrap host. Temporary by construction (I13): on only while the pinned fleet is
+# exactly 1.12.0; ADR-0006 names the removal steps.
+#
+# run.sh links this file as `bwrap` into $FACTORY_HOME/run/bwrap-shim/slot-<n>/, writes the pinned
+# fleet version beside it (`fleet-pin`), and puts that directory first on the PATH it gives fleet,
+# and only fleet. Invoked as `bwrap`:
+#   pin 1.12.0     prepends, for each path below that the argv does not already mount (a mount
+#                  destination equal to `/` or to the path):
+#                    /bin /sbin /lib /lib64        `--symlink <target> <p>` when a symlink on the host
+#                                                  (merged usr)
+#                    /usr /lib /lib64 /etc/ssl     `--ro-bind <p> <p>` when it exists (fleet's own
+#                    /etc/resolv.conf /etc/hosts   SYSTEM_ROOTS, @adlc/fleet 1.12.0
+#                                                  lib/bounded-model-plane.mjs). A symlinked file
+#                                                  such as WSL's /etc/resolv.conf is bound through:
+#                                                  bwrap follows the source
+#                  then execs the real bwrap with those arguments followed by fleet's, untouched.
+#   any other pin  execs the real bwrap with fleet's argv unchanged. So does an argv the shim cannot
+#   (or none)      read: --help, --version, --args FD, or an option bwrap 0.9.0 does not have.
+# Prepending is the order rule: bwrap mounts in argv order and a later mount wins, so every mount
+# fleet passed still lands on top of the shim's. Only --ro-bind and --symlink are ever added (I12):
+# no writable bind, no network or namespace flag, nothing of fleet's dropped or moved.
+# The real bwrap is the first `bwrap` on PATH that is neither this file nor in this file's directory
+# or the directory it was invoked from. None → exit 127.
+#
+# Invoked as bwrap-shim (tests and probe.sh), it never execs anything:
+#   bwrap-shim argv <pin> [bwrap args...]  one JSON array: the arguments the real bwrap would get
+#   bwrap-shim probe                       one JSON object: the real bwrap (or null), each host path
+#                                          with what the shim inserts for it, merged_usr, ready
+# FACTORY_SHIM_ROOT (tests only) is prefixed to every host path the shim inspects; the arguments it
+# emits always name the real paths.
+set -euo pipefail
+
+SHIM_PIN=1.12.0
+ROOT="${FACTORY_SHIM_ROOT:-}"
+ORDER=(/usr /bin /sbin /lib /lib64 /etc/ssl /etc/resolv.conf /etc/hosts)
+MERGED=" /bin /sbin /lib /lib64 "
+SYSTEM_ROOTS=" /usr /lib /lib64 /etc/ssl /etc/resolv.conf /etc/hosts "
+
+# Every option of bwrap 0.9.0 (`bwrap --help`) and how many arguments it takes. MOUNTS are the ones
+# that put something at a destination, their last argument.
+declare -A ARITY=()
+for o in --unshare-all --share-net --unshare-user --unshare-user-try --unshare-ipc --unshare-pid \
+         --unshare-net --unshare-uts --unshare-cgroup --unshare-cgroup-try --disable-userns \
+         --assert-userns-disabled --clearenv --new-session --die-with-parent --as-pid-1; do ARITY[$o]=0; done
+for o in --argv0 --userns --userns2 --pidns --uid --gid --hostname --chdir --unsetenv --lock-file \
+         --sync-fd --remount-ro --exec-label --file-label --proc --dev --tmpfs --mqueue --dir --seccomp \
+         --add-seccomp-fd --block-fd --userns-block-fd --info-fd --json-status-fd --cap-add --cap-drop \
+         --perms --size; do ARITY[$o]=1; done
+for o in --setenv --bind --bind-try --dev-bind --dev-bind-try --ro-bind --ro-bind-try --bind-fd \
+         --ro-bind-fd --file --bind-data --ro-bind-data --symlink --chmod; do ARITY[$o]=2; done
+MOUNTS=" --bind --bind-try --dev-bind --dev-bind-try --ro-bind --ro-bind-try --bind-fd --ro-bind-fd \
+--proc --dev --tmpfs --mqueue --dir --file --bind-data --ro-bind-data --symlink "
+
+norm() {  # a destination as bwrap reaches it: repeated and trailing slashes dropped
+  local p="$1"
+  while [[ "$p" == *//* ]]; do p="${p//\/\//\/}"; done
+  [ "$p" = / ] || p="${p%/}"
+  printf '%s' "$p"
+}
+
+declare -A MOUNTED=()
+scan() {  # scan <bwrap args...>: fills MOUNTED; 1 = an argv the shim leaves alone (reason on stderr)
+  local -a v=("$@")
+  local i=0 n=$# a k
+  MOUNTED=()
+  while [ "$i" -lt "$n" ]; do
+    a="${v[$i]}"
+    case "$a" in
+      --) return 0 ;;
+      --help|--version) return 1 ;;
+      --args) echo "bwrap-shim: --args reads options the shim cannot see; argv passed through unchanged" >&2; return 1 ;;
+      --*) ;;
+      *) return 0 ;;   # the command starts here
+    esac
+    k="${ARITY[$a]:-}"
+    if [ -z "$k" ]; then echo "bwrap-shim: unknown bwrap option $a; argv passed through unchanged" >&2; return 1; fi
+    if [ $((i + k)) -ge "$n" ]; then return 1; fi   # malformed: let the real bwrap say so
+    if [[ "$MOUNTS" == *" $a "* ]]; then MOUNTED["$(norm "${v[$((i + k))]}")"]=1; fi
+    i=$((i + k + 1))
+  done
+}
+
+plan_for() {  # plan_for <p>: prints `symlink <target>`, `ro-bind`, or `none <why>`
+  local p="$1" host="$ROOT$1"
+  if [[ "$MERGED" == *" $p "* ]] && [ -L "$host" ]; then printf 'symlink %s\n' "$(readlink "$host")"
+  elif [[ "$SYSTEM_ROOTS" == *" $p "* ]] && [ -e "$host" ]; then echo ro-bind
+  elif [ -L "$host" ] && [ ! -e "$host" ]; then echo "none dangling-symlink"
+  elif [ -e "$host" ]; then echo "none not-a-system-root"
+  else echo "none absent"; fi
+}
+
+OUT=()
+transform() {  # transform <pin> <bwrap args...>: sets OUT
+  local pin="$1" p kind rest
+  shift
+  OUT=("$@")
+  [ "$pin" = "$SHIM_PIN" ] || return 0
+  scan "$@" || return 0
+  [ -z "${MOUNTED[/]:-}" ] || return 0
+  local -a ins=()
+  for p in "${ORDER[@]}"; do
+    [ -z "${MOUNTED[$p]:-}" ] || continue
+    read -r kind rest < <(plan_for "$p")
+    case "$kind" in
+      symlink) ins+=(--symlink "$rest" "$p") ;;
+      ro-bind) ins+=(--ro-bind "$p" "$p") ;;
+    esac
+  done
+  OUT=(${ins[@]+"${ins[@]}"} "$@")
+}
+
+real_bwrap() {  # the first bwrap on PATH that is not this shim
+  local self selfdir invdir d dd c
+  local -a dirs=()
+  self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  selfdir="$(dirname "$self")"
+  invdir="$(cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd)" || invdir=""
+  IFS=: read -r -a dirs <<<"${PATH:-}"
+  for d in ${dirs[@]+"${dirs[@]}"}; do
+    case "$d" in /*) ;; *) continue ;; esac
+    dd="$(cd -P -- "$d" 2>/dev/null && pwd)" || continue
+    [ "$dd" != "$selfdir" ] && [ "$dd" != "$invdir" ] || continue
+    c="$d/bwrap"
+    [ -f "$c" ] && [ -x "$c" ] || continue
+    [ "$(readlink -f -- "$c")" != "$self" ] || continue
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+json_array() { if [ $# = 0 ]; then echo '[]'; else printf '%s\0' "$@" | jq -Rsc 'split("\u0000")[:-1]'; fi; }
+
+if [ "$(basename -- "$0")" = bwrap-shim ]; then
+  case "${1:-}" in
+    argv)
+      [ $# -ge 2 ] || { echo "usage: bwrap-shim argv <pin> [bwrap args...]" >&2; exit 1; }
+      pin="$2"; shift 2
+      transform "$pin" "$@"
+      json_array ${OUT[@]+"${OUT[@]}"} ;;
+    probe)
+      real="$(real_bwrap)" || real=""
+      paths='[]'
+      for p in "${ORDER[@]}"; do
+        read -r kind rest < <(plan_for "$p")
+        host=absent
+        if [ -L "$ROOT$p" ]; then host=symlink; elif [ -d "$ROOT$p" ]; then host=directory; elif [ -e "$ROOT$p" ]; then host="file"; fi
+        paths="$(jq -c --arg p "$p" --arg h "$host" --arg k "$kind" --arg r "$rest" \
+          '. + [{path: $p, host: $h, insert: (if $k == "none" then null else $k end)}
+                + (if $k == "symlink" then {target: $r} elif $k == "none" then {why: $r} else {} end)]' <<<"$paths")"
+      done
+      # ready: a real bwrap and /usr to bind. merged_usr: /bin is a symlink, so /bin/sh exists in
+      # the sandbox; on a host with a real /bin directory the canary still fails (ADR-0006).
+      jq -cn --arg b "$real" --arg pin "$SHIM_PIN" --argjson paths "$paths" '
+        {fleet_pin: $pin, bwrap: (if $b == "" then null else $b end), paths: $paths,
+         merged_usr: any($paths[]; .path == "/bin" and .insert == "symlink"),
+         ready: ($b != "" and any($paths[]; .path == "/usr" and .insert == "ro-bind"))}' ;;
+    *) echo "usage: bwrap-shim argv <pin> [bwrap args...] | bwrap-shim probe" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+
+pin=""
+[ ! -f "$(dirname -- "$0")/fleet-pin" ] || read -r pin <"$(dirname -- "$0")/fleet-pin" || true
+real="$(real_bwrap)" || { echo "bwrap-shim: no real bwrap on PATH" >&2; exit 127; }
+transform "$pin" "$@"
+exec "$real" ${OUT[@]+"${OUT[@]}"}

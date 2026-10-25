@@ -23,7 +23,11 @@
 #                --model-plane-egress allowlist [--dead-end-file <f>] --json   (vetto cannot wrap
 #                fleet: ADR-0005 decision 2; it wraps the loop's own tamperguard step). <m> is a
 #                disposable bare mirror, $FACTORY_HOME/run/mirrors/<run id>.git, holding only the
-#                base commit (fleet's allowlist egress needs bounded reads, which need it; ADR-0005)
+#                base commit (fleet's allowlist egress needs bounded reads, which need it; ADR-0005).
+#                While the fleet pin is exactly 1.12.0, fleet runs as `env PATH=<shim dir>:$PATH
+#                <fleet> …`: <shim dir> is $FACTORY_HOME/run/bwrap-shim/slot-<n>, holding `bwrap`
+#                (a link to lib/bwrap-shim, which adds fleet's missing system roots read-only) and
+#                `fleet-pin`. Only fleet's PATH changes, never the loop's or ralon's (ADR-0006, #1266)
 #   case on fleet's reason (success = exitCode 0, reason null, a fleet/run-* branch, merged >= 1):
 #     success                       tamperguard (under vetto + build.toml) then scope-check. Both
 #                                   pass → push ticket/<id>/<handle>, open the PR, comment; the
@@ -53,8 +57,9 @@
 # --once runs one iteration and exits without napping; --max-iterations K stops after K.
 # Environment: FACTORY_HOME (default ~/.factory; its env file is sourced when FACTORY_MANIFEST is
 # unset), FACTORY_MANIFEST, FACTORY_REPO, FACTORY_NOW, FACTORY_ADLC, FACTORY_FLEET (default
-# `npx -y @adlc/cli@1.12.0 fleet`), FACTORY_SCOPE_CHECK (default factory/bin/scope-check.sh),
-# FACTORY_SLEEP (default sleep).
+# `npx -y @adlc/cli@1.12.0 fleet`), FACTORY_FLEET_PIN (default: the <v> of `@adlc/cli@<v>` in
+# FACTORY_FLEET, else none; the bwrap shim is on only at exactly 1.12.0), FACTORY_SCOPE_CHECK
+# (default factory/bin/scope-check.sh), FACTORY_SLEEP (default sleep).
 # Exit 0 done (--once, --max-iterations); 1 operational error or a run-level fleet failure; 2 the
 # governor refused or the slot stopped at a gate.
 set -euo pipefail
@@ -64,7 +69,7 @@ PROG=run
 # shellcheck source=factory/bin/lib/run.sh
 . "$(dirname "$0")/lib/run.sh"
 
-usage() { sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -115,6 +120,10 @@ PIECE_S="$(mins .governor.nodeHeartbeatMinutes)"
 LOCKBEAT_S="$(mins .claim.heartbeatMinutes)"
 MAX_RESUMES=3
 read -r -a FLEET <<<"${FACTORY_FLEET:-npx -y @adlc/cli@1.12.0 fleet}"
+FLEET_PIN="${FACTORY_FLEET_PIN:-}"
+if [ -z "$FLEET_PIN" ]; then
+  for w in "${FLEET[@]}"; do [[ "$w" =~ ^@adlc/cli@(.+)$ ]] && FLEET_PIN="${BASH_REMATCH[1]}"; done
+fi
 read -r -a SLEEP <<<"${FACTORY_SLEEP:-sleep}"
 SCOPE_CHECK="${FACTORY_SCOPE_CHECK:-$FACTORY_ROOT/factory/bin/scope-check.sh}"
 B="$FACTORY_ROOT/factory/bin"
@@ -147,6 +156,17 @@ SLOT_MUTEX="$RUN_DIR/slot-$slot.mutex"
 NODE_MUTEX="$RUN_DIR/node.mutex"
 run_mutex_take "$SLOT_MUTEX" 0 || refuse "slot $slot already has a run loop (pid $(command cat "$SLOT_MUTEX/pid" 2>/dev/null || echo '?'))"
 trap 'run_mutex_drop "$SLOT_MUTEX"; [ "$(command cat "$NODE_MUTEX/pid" 2>/dev/null)" != "$$" ] || run_mutex_drop "$NODE_MUTEX"' EXIT
+# fleet 1.12.0's sandboxes bind no system root (voodootikigod/adlc#1266): the bwrap shim, first on
+# fleet's PATH only, and only at that exact pin (I13, ADR-0006). Any other pin: no shim directory.
+SHIM_DIR="$RUN_DIR/bwrap-shim/slot-$slot"
+FLEET_ENV=()
+rm -rf "$SHIM_DIR"
+if [ "$FLEET_PIN" = 1.12.0 ]; then
+  mkdir -p "$SHIM_DIR"
+  ln -s "$B/lib/bwrap-shim" "$SHIM_DIR/bwrap"
+  printf '%s\n' "$FLEET_PIN" >"$SHIM_DIR/fleet-pin"
+  FLEET_ENV=(env "PATH=$SHIM_DIR:$PATH")
+fi
 serial() {  # serial <cmd...>: one at a time per node (governor fetches, git fetch)
   local rc=0
   run_mutex_take "$NODE_MUTEX" 600 || { warn "node mutex $NODE_MUTEX held for 10 min"; return 1; }
@@ -302,7 +322,9 @@ run_fleet() {  # sets DOC (fleet's --json document, or empty); 1 = no mirror, fl
   mirror_make || return 1
   while IFS= read -r -d '' x; do argv+=("$x"); done < <(jq -j '.[] | . + "\u0000"' <<<"$FLEET_ARGV")
   act fleet-run
-  (cd "$WT" && ralon run -C "$WT" -- "${FLEET[@]}" "${argv[@]}") >"$LOGBASE.fleet.json" 2>>"$LOGBASE.fleet.err" || frc=$?
+  rec --argjson s "$([ ${#FLEET_ENV[@]} -gt 0 ] && echo true || echo false)" '.bwrap_shim = $s'
+  (cd "$WT" && ralon run -C "$WT" -- ${FLEET_ENV[@]+"${FLEET_ENV[@]}"} "${FLEET[@]}" "${argv[@]}") \
+    >"$LOGBASE.fleet.json" 2>>"$LOGBASE.fleet.err" || frc=$?
   DOC="$(jq -c 'select(type == "object" and has("exitCode"))' "$LOGBASE.fleet.json" 2>/dev/null | head -n1 || true)"
   rec --argjson rc "$frc" '.fleet_exit = $rc'
 }

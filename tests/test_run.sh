@@ -7,7 +7,8 @@
 # Acceptance 1 (one case per fleet reason: success, scope-stub, tamper, quota-paused, wall-clock,
 # strikes-exhausted, flail, review-unavailable, anything-else), 2 argv, 3 resume, 4 no-transcript,
 # 5 once, 6 scope-stub; plus the paused claim's resume in place, the resume cap, a lost lock, the
-# governor's verdicts, the dry run, slot guards and the fakes themselves.
+# governor's verdicts, the dry run, slot guards and the fakes themselves. T12 acceptance 4: the bwrap
+# shim on fleet's PATH only, and only at fleet pin 1.12.0 (case bwrap-shim).
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -28,6 +29,7 @@ run_setup() {
   export FAKE_CUX_USAGE="$WORLD/usage.json" FAKE_CUX_LOG="$WORLD/cux.log" FAKE_FLEET_LOG="$WORLD/fleet.log"
   export FAKE_RALON_LOG="$WORLD/ralon.log" FAKE_VETTO_LOG="$WORLD/vetto.log" FAKE_TAMPERGUARD_LOG="$WORLD/tg.log"
   export FACTORY_ADLC="$FAKES_DIR/adlc" FACTORY_FLEET="$FAKES_DIR/fleet" FACTORY_SLEEP="$WORLD/bin/nap"
+  export FACTORY_FLEET_PIN=1.12.0   # the fake copies fleet 1.12.0
   export FAKE_FLEET_TRANSCRIPT="worker said: $MARK" FAKE_TAMPERGUARD_DETAIL="assert True  # $MARK"
   export FAKE_ADLC_TICKETS='[{"id": "T-run", "title": "add hello.sh", "body": "Build hello.sh. '"$MARK"'", "rails": ["tests/rail/**"]}]'
   unset FACTORY_SCOPE_CHECK FAKE_FLEET_REASON FAKE_FLEET_REASONS FAKE_TAMPERGUARD_VERDICT FAKE_FLEET_STRIKES FAKE_CLAUDE_VERSION
@@ -313,9 +315,10 @@ case_argv() {
   loop --once
   local wt ps
   wt="$(cd "$WORLD/clone" && pwd -P)/.worktrees/T-run"
-  check "ralon: run -C <worktree> -- <fleet> run …" \
-    eq "$(jq -c '.[0:5]' "$FAKE_RALON_LOG")" "$(jq -cn --arg wt "$wt" --arg f "$FAKES_DIR/fleet" '["run", "-C", $wt, "--", $f]')"
-  check "  the rest of ralon's argv is fleet's" eq "$(jq -c '.[5:]' "$FAKE_RALON_LOG")" "$(jq -c .argv "$FAKE_FLEET_LOG")"
+  check "ralon: run -C <worktree> -- env PATH=<shim dir>:<PATH> <fleet> run …" \
+    eq "$(jq -c '.[0:7]' "$FAKE_RALON_LOG")" "$(jq -cn --arg wt "$wt" --arg f "$FAKES_DIR/fleet" \
+         --arg p "PATH=$FACTORY_HOME/run/bwrap-shim/slot-1:$PATH" '["run", "-C", $wt, "--", "env", $p, $f]')"
+  check "  the rest of ralon's argv is fleet's" eq "$(jq -c '.[7:]' "$FAKE_RALON_LOG")" "$(jq -c .argv "$FAKE_FLEET_LOG")"
   check "fleet runs in the worktree" eq "$(jq -r .cwd "$FAKE_FLEET_LOG")" "$wt"
   check "fleet's argv: ADR-0005's real flags, in order" \
     eq "$(jq -c '.argv | del(.[16], .[18], .[24])' "$FAKE_FLEET_LOG")" \
@@ -521,9 +524,57 @@ case_fakes() {
     eq "$rc $(jq -c '[.readPolicy, .gitSource, .mirror == "'"$WORLD/m.git"'", .egress]' <<<"$doc")" '0 ["bounded","mirror",true,"allowlist"]'
 }
 
+shim_world() {  # run_setup + a recording `npx` (the PATH and bwrap fleet sees, then the fake fleet) and `ralon` (its PATH)
+  run_setup
+  passing_scope
+  unset FACTORY_FLEET_PIN
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$PATH" >"%s/fleet.path"\n{ command -v bwrap || echo none; } >"%s/fleet.bwrap"\nshift 3\nexec "%s/fleet" "$@"\n' \
+    "$WORLD" "$WORLD" "$FAKES_DIR" >"$WORLD/bin/npx"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$PATH" >"%s/ralon.path"\nexec "%s/ralon" "$@"\n' "$WORLD" "$FAKES_DIR" >"$WORLD/bin/ralon"
+  chmod +x "$WORLD/bin/npx" "$WORLD/bin/ralon"
+  SHIM_DIR="$FACTORY_HOME/run/bwrap-shim/slot-1"
+}
+case_bwrap_shim() {
+  shim_world
+  export FACTORY_FLEET="$WORLD/bin/npx -y @adlc/cli@1.12.0 fleet"
+  loop --once
+  check "pin 1.12.0 (read from @adlc/cli@1.12.0 in the fleet command): the loop ran fleet" eq "$RC $(field .outcome)" "0 built"
+  check "  fleet's PATH: the shim directory first, then the node's PATH unchanged" eq "$(command cat "$WORLD/fleet.path")" "$SHIM_DIR:$PATH"
+  check "  fleet finds bwrap there: a link to factory/bin/lib/bwrap-shim" \
+    eq "$(command cat "$WORLD/fleet.bwrap") $(readlink -f "$SHIM_DIR/bwrap")" "$SHIM_DIR/bwrap $BIN/lib/bwrap-shim"
+  check "  the pin beside it is 1.12.0" eq "$(command cat "$SHIM_DIR/fleet-pin")" 1.12.0
+  check "  ralon's PATH is the node's (the shim is on fleet's only)" eq "$(command cat "$WORLD/ralon.path")" "$PATH"
+  check "  env sets PATH and nothing else" eq "$(jq -c '.[4:6] | .[0], (.[1] | split("=")[0])' "$FAKE_RALON_LOG" | tr '\n' ' ')" '"env" "PATH" '
+  check "  the ledger line says the shim was on" eq "$(field .bwrap_shim)" true
+  check "  nothing but bwrap and fleet-pin in the shim directory" eq "$(ls "$SHIM_DIR" | tr '\n' ' ')" "bwrap fleet-pin "
+
+  local p
+  for p in 1.12.1 1.13.0; do
+    shim_world
+    mkdir -p "$SHIM_DIR"; ln -s "$BIN/lib/bwrap-shim" "$SHIM_DIR/bwrap"   # left over from a 1.12.0 run
+    export FACTORY_FLEET="$WORLD/bin/npx -y @adlc/cli@$p fleet"
+    loop --once
+    check "pin $p: the loop ran fleet" eq "$RC $(field .outcome)" "0 built"
+    check "  fleet's PATH is the node's, no shim" eq "$(command cat "$WORLD/fleet.path")" "$PATH"
+    check "  ralon runs fleet directly (no env)" eq "$(jq -r '.[4]' "$FAKE_RALON_LOG")" "$WORLD/bin/npx"
+    check "  the stale shim directory is gone" test ! -e "$SHIM_DIR"
+    check "  the ledger line says the shim was off" eq "$(field .bwrap_shim)" false
+  done
+
+  shim_world
+  export FACTORY_FLEET="$FAKES_DIR/fleet" FACTORY_FLEET_PIN=1.12.1
+  loop --once
+  check "FACTORY_FLEET_PIN 1.12.1 with a fleet command that names no version: no shim" \
+    eq "$(field .bwrap_shim) $(jq -r '.[4]' "$FAKE_RALON_LOG")" "false $FAKES_DIR/fleet"
+  shim_world
+  export FACTORY_FLEET="$FAKES_DIR/fleet"
+  loop --once
+  check "no pin at all: no shim" eq "$(field .bwrap_shim) $(test -e "$SHIM_DIR" && echo shim)" "false "
+}
+
 for c in ${CASES:-success scope-stub tamper quota-paused wall-clock resume-in-place resume-cap lock-lost \
                   strikes-exhausted flail review-unavailable anything-else argv resume no-transcript once \
-                  governor dry-run guards fakes}; do
+                  governor dry-run guards fakes bwrap-shim}; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

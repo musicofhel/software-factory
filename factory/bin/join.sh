@@ -13,7 +13,9 @@
 #                slots < 1, --dangerously-skip-permissions in a shell rc or Claude settings file,
 #                no authenticated adapter that factory/policy/adapters.json pins. A timed run of
 #                `make test` in the clone (timeout: budget.json weights.light.suiteMinutesMax)
-#                sets heavy_gates.
+#                sets heavy_gates. Warnings: the bwrap shim (ADR-0006) cannot run (no real bwrap,
+#                no /usr), or the host is not merged usr (/bin a real directory: fleet 1.12.0's
+#                canary still finds no /bin/sh there).
 #   2. install   the pinned toolchain (vetto 0.6.5, ralon 0.1.7, tamperguard 0.2.0, dcg v0.15.3,
 #                cux v0.4.1, @adlc/cli 1.12.0, the adapter pins). A tool already on PATH at its pin
 #                is skipped; the rest install under $FACTORY_HOME (default ~/.factory): cargo
@@ -39,7 +41,7 @@ PROG="join"
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 SCHEMA="$FACTORY_ROOT/factory/nodes/manifest.schema.json"
 PINS_FILE="$FACTORY_ROOT/factory/policy/adapters.json"
@@ -179,6 +181,12 @@ sb_refusal="$(jq -r 'if .os == null then empty else .sandbox | if .present and .
          elif .present then "sandbox backend \(.backend) is installed but cannot start a sandbox here (unprivileged user namespaces off?); fleet needs it (ADR-0003)"
          else "no sandbox backend: fleet needs \(.backend) (ADR-0003). Install: \(.install_line)" end end' <<<"$PROBE")"
 [ -z "$sb_refusal" ] || refusal "$sb_refusal"
+if [ -z "$sb_refusal" ]; then
+  while IFS= read -r w; do [ -z "$w" ] || warning "$w"; done < <(jq -r '.sandbox.shim // empty |
+    if .ready | not then "the bwrap shim (ADR-0006) cannot run here (\(if .bwrap == null then "no real bwrap on PATH" else "no /usr to bind" end)): fleet 1.12.0 stops every run at its preflight canary (voodootikigod/adlc#1266)"
+    elif .merged_usr | not then "/bin is a directory here, not a link to usr/bin: the bwrap shim (ADR-0006) binds only fleet'"'"'s system roots, so fleet 1.12.0'"'"'s preflight canary still finds no /bin/sh and stops every run (voodootikigod/adlc#1266)"
+    else empty end' <<<"$PROBE")
+fi
 
 # slots = min(8, floor(free_ram_gb / 2) - 1), GB = GiB, computed on whole kB so the boundaries are exact.
 free_kb="$(jq -r .ram_free_kb <<<"$PROBE")"

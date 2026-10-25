@@ -1,8 +1,9 @@
 SHELL := /usr/bin/env bash
 .PHONY: test lint live tickets doctor
 
-# Every shell file the factory ships or tests with, including helpers and fakes that later rows add.
-SH_FILES = $(shell find factory tests -type f \( -name '*.sh' -o -path 'tests/fakes/*' \) | sort)
+# Every shell file the factory ships or tests with, including helpers and fakes that later rows add,
+# and the extension-less bwrap shim (ADR-0006).
+SH_FILES = $(shell find factory tests -type f \( -name '*.sh' -o -path 'tests/fakes/*' -o -path factory/bin/lib/bwrap-shim \) | sort)
 
 test:
 	@./factory/test.sh
