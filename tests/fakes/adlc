@@ -2,9 +2,27 @@
 # Fake `adlc` (the pinned @adlc/cli) for offline tests. Scripts that call adlc honour FACTORY_ADLC
 # (default `npx -y @adlc/cli@1.12.0`); tests point it here. tests/fakes/lib.sh sets the log.
 #
-# Records every call as one JSON array of its argv in $FAKE_ADLC_LOG (required) and answers:
-#   ticket list --json        $FAKE_ADLC_TICKETS (a JSON array, default [])
-#   merge-forecast --json ... $FAKE_ADLC_FORECAST (a JSON object, default: every listed ticket in
+# Records every call as one JSON array of its argv in $FAKE_ADLC_LOG (required) and answers with
+# the shapes adlc 1.12.0 prints (measured in specs/factory-step1-v1/records/TB4.md):
+#   The ticket store is $FAKE_ADLC_STORE (a file holding a JSON array of tickets; `ticket complete
+#   --write` rewrites it) if set, else $FAKE_ADLC_TICKETS (a JSON array, read-only, default []).
+#   A ticket is {id, title, body?, edges?, completed?, ticketHash?}; a missing ticketHash is
+#   "hash-<id>" (except in `ticket list`, which echoes only the fields the fixture gave).
+#   ticket list --json        [{id, title, ticketHash}] for every ticket, completed ones included
+#   ticket show <id> --json   {ticket: {...}, ticketHash, storeHash}; an unknown id exits 2 with
+#                             {"ok": false, "code": "TICKET_NOT_FOUND", ...}
+#   ticket complete <id> [--write --authorize] [--json]
+#                             only with FAKE_ADLC_STORE (else an unknown verb, exit 2). Prints
+#                             the plan; with --write also sets completed: true in the store
+#                             (a no-op when it already is, as the real CLI) and appends a
+#                             ticket-complete entry to ./.adlc/manifest.jsonl, then prints
+#                             {"applied": true, ...}. --write without --authorize exits 2 here, so
+#                             a caller that forgets the flag the ticket names is caught.
+#   gate-manifest show [--ticket id] --json
+#                             {entries: [...], skipped: $FAKE_ADLC_SKIPPED (default [])} from
+#                             ./.adlc/manifest.jsonl (cwd, as the real CLI); each entry gains
+#                             gate = (.gate // .type) and segment "root"
+#   merge-forecast --json ... $FAKE_ADLC_FORECAST (a JSON object, default: every open ticket in
 #                             one wave, mergeOrder = sorted ids, certifiedWidth = their count),
 #                             then exits $FAKE_ADLC_FORECAST_EXIT (default 0; the real CLI exits 2
 #                             when a gate fails and still prints the forecast)
@@ -16,16 +34,58 @@ for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc . >>"$FAKE_ADLC_LOG"
 if [ -n "${FAKE_ADLC_FAIL:-}" ] && [[ "$*" =~ $FAKE_ADLC_FAIL ]]; then
   echo "adlc: injected failure" >&2; exit 1
 fi
-tickets="${FAKE_ADLC_TICKETS:-[]}"
+if [ -n "${FAKE_ADLC_STORE:-}" ]; then raw="$(jq -c . "$FAKE_ADLC_STORE")"; else raw="${FAKE_ADLC_TICKETS:-[]}"; fi
+tickets="$(jq -c 'map({ticketHash: "hash-\(.id)"} + .)' <<<"$raw")"
+has() { local a; for a in "${@:2}"; do [ "$a" = "$1" ] && return 0; done; return 1; }
+not_found() {
+  jq -cn --arg id "$1" '{ok: false, kind: "invalid", code: "TICKET_NOT_FOUND", message: "ticket not found: \($id)"}'
+  exit 2
+}
+MANIFEST=.adlc/manifest.jsonl
+
 case "${1:-} ${2:-}" in
   "ticket list")
     [ "${3:-}" = --json ] || { echo "fake adlc: ticket list needs --json" >&2; exit 2; }
-    jq -c . <<<"$tickets" ;;
+    jq -c 'map(with_entries(select(.key | IN("id", "title", "ticketHash"))))' <<<"$raw" ;;
+  "ticket show")
+    id="${3:?fake adlc: ticket show needs an id}"
+    has --json "${@:4}" || { echo "fake adlc: ticket show needs --json" >&2; exit 2; }
+    t="$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$tickets")"
+    [ -n "$t" ] || not_found "$id"
+    jq -c '{ticket: del(.ticketHash), ticketHash, storeHash: "store-fake"}' <<<"$t" ;;
+  "ticket complete")
+    [ -n "${FAKE_ADLC_STORE:-}" ] || { echo "fake adlc: ticket complete needs FAKE_ADLC_STORE" >&2; exit 2; }
+    id="${3:?fake adlc: ticket complete needs an id}"
+    jq -e --arg id "$id" 'any(.[]; .id == $id)' <<<"$tickets" >/dev/null || not_found "$id"
+    write=0
+    if has --write "${@:4}"; then
+      has --authorize "${@:4}" || { echo "fake adlc: complete --write needs --authorize in this fake" >&2; exit 2; }
+      write=1
+    fi
+    jq -cn --arg id "$id" --argjson w "$write" \
+      '{version: 1, operation: "complete", ticketId: $id, changedFields: ["completed"], dryRun: ($w == 0)}'
+    if [ "$write" = 1 ]; then
+      tmp="$(mktemp "$FAKE_ADLC_STORE.XXXXXX")"
+      jq --arg id "$id" 'map(if .id == $id then .completed = true else . end)' "$FAKE_ADLC_STORE" >"$tmp"
+      mv "$tmp" "$FAKE_ADLC_STORE"
+      mkdir -p .adlc
+      jq -cn --arg id "$id" '{gate: "ticket-complete", ticket: $id, data: {operation: "complete", action: "apply"}}' >>"$MANIFEST"
+      jq -cn --arg id "$id" '{applied: true, storeHash: "store-fake", ticketHash: "hash-\($id)-done"}'
+    fi ;;
+  "gate-manifest show")
+    has --json "${@:3}" || { echo "fake adlc: gate-manifest show needs --json" >&2; exit 2; }
+    want=""
+    set -- "${@:3}"
+    while [ $# -gt 0 ]; do [ "$1" = --ticket ] && { want="${2:?--ticket needs an id}"; shift; }; shift; done
+    { [ -f "$MANIFEST" ] && command cat "$MANIFEST"; true; } |
+      jq -sc --arg t "$want" --argjson skipped "${FAKE_ADLC_SKIPPED:-[]}" \
+        '{entries: [.[] | select($t == "" or .ticket == $t) | . + {gate: (.gate // .type), segment: "root"}], skipped: $skipped}' ;;
   "merge-forecast --json"|"merge-forecast "*)
     [[ " $* " == *" --json "* ]] || { echo "fake adlc: merge-forecast needs --json" >&2; exit 2; }
     if [ -n "${FAKE_ADLC_FORECAST:-}" ]; then jq -c . <<<"$FAKE_ADLC_FORECAST"
-    else jq -c '[.[].id] | sort | {pairs: [], waves: [.], mergeOrder: ., firstWaveWidth: length,
-                                   certifiedWidth: length, warnings: [], gateFailures: []}' <<<"$tickets"
+    else jq -c '[.[] | select(.completed != true) | .id] | sort
+                | {pairs: [], waves: [.], mergeOrder: ., firstWaveWidth: length,
+                   certifiedWidth: length, warnings: [], gateFailures: []}' <<<"$tickets"
     fi
     exit "${FAKE_ADLC_FORECAST_EXIT:-0}" ;;
   *) echo "fake adlc: unsupported command: $*" >&2; exit 2 ;;

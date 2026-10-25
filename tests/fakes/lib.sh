@@ -5,7 +5,8 @@
 #                                issue store, an empty settings store (no protection, no rulesets),
 #                                call logs, the fakes (gh, curl, adlc, mirror) first on PATH, the
 #                                clock unpinned
-#   fakegh_issue <n> <created-epoch> <labels,csv> [title] [body]
+#   fakegh_issue <n> <created-epoch> <labels,csv> [title] [body] [author-login] [author-is-bot]
+#                                (the author defaults to the human "someone")
 #   fakegh_close <n>             close Issue n
 #   fakegh_pr <n> <head-branch> [OPEN|CLOSED|MERGED] [created-epoch]
 #   fakegh_lock <n> <handle> <commit-epoch> [run_id] [slots]
@@ -34,7 +35,8 @@ fakegh_setup() {
   export PATH="$FAKES_DIR:$PATH"
   unset FAKE_GH_NOW FAKE_GH_FAIL FAKE_GH_RACE_REFS FAKE_CURL_FAIL DISCORD_WEBHOOK SUMMONER_TO GITHUB_EVENT_PATH FACTORY_NOW FACTORY_HANDLE FACTORY_SLOTS \
         FACTORY_RUN_ID FACTORY_MANIFEST FACTORY_CAPACITY FACTORY_ADLC FACTORY_MIRROR RUNNER_ENVIRONMENT \
-        FAKE_ADLC_TICKETS FAKE_ADLC_FORECAST FAKE_ADLC_FAIL FAKE_ADLC_FORECAST_EXIT FAKE_MIRROR_FAIL JANITOR_PREVIEW_HOOK JANITOR_REVOKE_HOOK
+        FAKE_ADLC_TICKETS FAKE_ADLC_FORECAST FAKE_ADLC_FAIL FAKE_ADLC_FORECAST_EXIT FAKE_MIRROR_FAIL JANITOR_PREVIEW_HOOK JANITOR_REVOKE_HOOK \
+        FAKE_GH_BOT FAKE_ADLC_STORE FAKE_ADLC_SKIPPED MIRROR_AUTHORS
   export FAKE_ADLC_LOG="$WORLD/adlc.log" FAKE_MIRROR_LOG="$WORLD/mirror.log"
   git init -q --bare "$FAKE_GH_GIT"
   local blob tree commit
@@ -63,9 +65,10 @@ _fakegh_commit() {  # _fakegh_commit <tree> <epoch> <message> [parent]
 fakegh_issue() {
   local tmp; tmp="$(mktemp)"
   jq --argjson n "$1" --argjson at "$2" --arg l "$3" --arg t "${4:-issue $1}" --arg b "${5:-}" \
+     --arg who "${6:-someone}" --argjson bot "${7:-false}" \
     '.issues += [{number: $n, title: $t, body: $b, state: "open", createdAt: ($at | todate),
                   labels: ($l | split(",") | map(select(. != "")) | map({name: .})),
-                  assignees: [], comments: []}]' "$FAKE_GH_ISSUES" >"$tmp"
+                  assignees: [], comments: [], author: {login: $who, is_bot: $bot}}]' "$FAKE_GH_ISSUES" >"$tmp"
   mv "$tmp" "$FAKE_GH_ISSUES"
 }
 

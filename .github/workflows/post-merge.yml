@@ -1,4 +1,8 @@
 # Ticket completion happens here, never on a node: .adlc is only written from main.
+# post-merge.sh completes every ticket a merged commit names in a `Ticket:` trailer, appends the
+# verified findings to factory/ledger/findings.jsonl and pushes one commit to main. A push made
+# with the Actions token starts no other workflow, so the mirror job below re-labels the Issues
+# itself (closes the completed tickets' Issues, lets their dependants become ready).
 name: post-merge
 on:
   push:
@@ -9,6 +13,9 @@ concurrency:
 permissions:
   contents: write
   issues: write
+defaults:
+  run:
+    shell: bash
 jobs:
   complete:
     runs-on: ubuntu-latest
@@ -21,4 +28,29 @@ jobs:
       - name: adlc ticket complete --write for every ticket the merged PRs carried; append ledger
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./factory/bin/post-merge.sh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./factory/bin/post-merge.sh --apply | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+  mirror:
+    needs: complete
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: mirror
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: re-mirror the store post-merge just wrote
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./factory/bin/mirror.sh --apply

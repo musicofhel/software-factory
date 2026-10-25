@@ -12,6 +12,7 @@
 #   FAKE_GH_REPO       the one repo this fake serves (default test/repo); anything else is 404
 #   FAKE_GH_LOG        every call appended as one JSON array of its argv
 #   FAKE_GH_USER       who @me is (default fake-user)
+#   FAKE_GH_BOT        1: @me is a bot (Issues it creates answer author.is_bot true)
 #   FAKE_GH_NOW        server clock in epoch seconds, stamped on created commits and comments
 #   FAKE_GH_FAIL       ERE; a call whose joined argv matches fails with HTTP 500
 #   FAKE_GH_RACE_REFS  space-separated refs; when a POST git/refs for one arrives, another node
@@ -31,9 +32,17 @@
 #        Like gh: -f/-F fields (key[]=v arrays, -F typed), POST by default when fields are given,
 #        --jq on success, error body on stdout + "gh: <msg> (HTTP <code>)" on stderr, exit 1.
 # issue: list (--label repeatable = AND, --state, --limit default 30, --json fields, newest first;
-#        state is answered OPEN/CLOSED and a missing body as "", as gh does),
-#        edit (--add/--remove-assignee, --add/--remove-label; unknown repo labels fail),
+#        state is answered OPEN/CLOSED, a missing body as "" and a missing author as a human
+#        {"login": "someone", "is_bot": false}, as gh does),
+#        create (--title, --body | --body-file, --label repeatable; unknown repo labels fail; the
+#        number is max(issue, PR numbers) + 1; prints the Issue URL; the author is @me, a bot
+#        when FAKE_GH_BOT=1),
+#        edit (--title, --body | --body-file, --add/--remove-assignee, --add/--remove-label;
+#        unknown repo labels fail),
+#        close (--reason completed|"not planned", --comment), reopen,
 #        comment (--body | --body-file). --repo is required: a test never falls back to a remote.
+# label: list (--json name, --limit default 30), create <name> (--color, --description; fails
+#        when the label exists unless --force).
 # pr:    list (--state open|closed|merged|all, default open; --head <branch>; --limit default 30;
 #        --json fields; newest first) on the "pulls" array of FAKE_GH_ISSUES: {number, headRefName,
 #        state: OPEN|CLOSED|MERGED, createdAt}.
@@ -276,8 +285,8 @@ mutate() {  # mutate <jq program> [jq args...]: atomic read-modify-write of the 
 issue() {
   : "${FAKE_GH_ISSUES:?fake gh issue needs FAKE_GH_ISSUES}"
   local sub="${1:-}"; shift || true
-  local repo="" n="" labels='[]' state=open limit=30 fields="" body="" have_body=0
-  local add_a='[]' rm_a='[]' add_l='[]' rm_l='[]'
+  local repo="" n="" labels='[]' state=open limit=30 fields="" body="" have_body=0 title="" have_title=0
+  local add_a='[]' rm_a='[]' add_l='[]' rm_l='[]' reason="" comment="" have_comment=0
   csv() { jq -c --arg v "$2" --arg me "$ME" '. + ($v | split(",") | map(if . == "@me" then $me else . end))' <<<"$1"; }
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -286,12 +295,15 @@ issue() {
       -s|--state) state="$2"; shift ;;
       -L|--limit) limit="$2"; shift ;;
       --json) fields="$2"; shift ;;
+      -t|--title) title="$2"; have_title=1; shift ;;
       --add-assignee) add_a="$(csv "$add_a" "$2")"; shift ;;
       --remove-assignee) rm_a="$(csv "$rm_a" "$2")"; shift ;;
       --add-label) add_l="$(csv "$add_l" "$2")"; shift ;;
       --remove-label) rm_l="$(csv "$rm_l" "$2")"; shift ;;
       -b|--body) body="$2"; have_body=1; shift ;;
       -F|--body-file) if [ "$2" = - ]; then body="$(command cat)"; else body="$(command cat "$2")"; fi; have_body=1; shift ;;
+      -r|--reason) reason="$2"; shift ;;
+      -c|--comment) comment="$2"; have_comment=1; shift ;;
       -*) fail "fake gh issue $sub: unsupported flag $1" ;;
       *) [ -z "$n" ] || fail "fake gh issue $sub: two positionals"; n="$1" ;;
     esac
@@ -299,6 +311,8 @@ issue() {
   done
   [ -n "$repo" ] || fail "fake gh issue: --repo is required (tests never infer the repo from a remote)"
   [ "$repo" = "$REPO" ] || fail "GraphQL: Could not resolve to a Repository with the name '$repo'."
+  local at="${FAKE_GH_NOW:-$(date -u +%s)}" missing
+  unknown_labels() { jq -r --argjson l "$1" '.labels as $known | $l[] | select(IN($known[]) | not)' "$FAKE_GH_ISSUES" | head -n1; }
   case "$sub" in
     list)
       [ -n "$fields" ] || fail "fake gh issue list: needs --json"
@@ -308,26 +322,93 @@ issue() {
           | select($state == "all" or .state == $state)
           | select([.labels[].name] as $have | all($want[]; IN($have[]))) ]
         | sort_by(.createdAt) | reverse | .[:$limit]
-        | map({body: ""} + . | .state |= ascii_upcase | with_entries(select(.key | IN($f[]))))' "$FAKE_GH_ISSUES" ;;
-    edit|comment)
+        | map({body: "", author: {login: "someone", is_bot: false}} + .
+              | .state |= ascii_upcase | with_entries(select(.key | IN($f[]))))' "$FAKE_GH_ISSUES" ;;
+    create)
+      [ -z "$n" ] || fail "fake gh issue create: unexpected argument $n"
+      [ "$have_title" = 1 ] && [ -n "$title" ] || fail "fake gh issue create: needs --title (it would prompt)"
+      [ "$have_body" = 1 ] || fail "fake gh issue create: needs --body or --body-file (it would prompt)"
+      missing="$(unknown_labels "$labels")"
+      [ -z "$missing" ] || fail "could not add label: '$missing' not found"
+      mutate '([.issues[].number, (.pulls // [])[].number] | max // 0) as $max
+              | .issues += [{number: ($max + 1), title: $t, body: $b, state: "open", createdAt: ($at | todate),
+                             labels: ($l | unique | map({name: .})), assignees: [], comments: [],
+                             author: {login: $me, is_bot: $bot}}]' \
+        --arg t "$title" --arg b "$body" --argjson l "$labels" --argjson at "$at" --arg me "$ME" \
+        --argjson bot "$([ "${FAKE_GH_BOT:-0}" = 1 ] && echo true || echo false)"
+      printf 'https://github.com/%s/issues/%s\n' "$REPO" "$(jq '[.issues[].number] | max' "$FAKE_GH_ISSUES")" ;;
+    edit|comment|close|reopen)
       [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any(.issues[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
         fail "GraphQL: Could not resolve to an issue or pull request with the number of $n."
-      if [ "$sub" = edit ]; then
-        local missing
-        missing="$(jq -r --argjson l "$add_l" '.labels as $known | $l[] | select(IN($known[]) | not)' "$FAKE_GH_ISSUES")"
-        [ -z "$missing" ] || fail "could not add label: '$(head -n1 <<<"$missing")' not found"
-        mutate '(.issues[] | select(.number == $n)) |= (
-                  .assignees = ([.assignees[].login] + $aa | unique | map(select(IN($ra[]) | not)) | map({login: .}))
-                | .labels = ([.labels[].name] + $al | unique | map(select(IN($rl[]) | not)) | map({name: .})))' \
-          --argjson n "$n" --argjson aa "$add_a" --argjson ra "$rm_a" --argjson al "$add_l" --argjson rl "$rm_l"
-        printf 'https://github.com/%s/issues/%s\n' "$REPO" "$n"
-      else
-        [ "$have_body" = 1 ] || fail "fake gh issue comment: needs --body or --body-file"
-        mutate '(.issues[] | select(.number == $n)).comments += [{author: {login: $me}, body: $b, createdAt: ($at | todate)}]' \
-          --argjson n "$n" --arg me "$ME" --arg b "$body" --argjson at "${FAKE_GH_NOW:-$(date -u +%s)}"
-        printf 'https://github.com/%s/issues/%s#issuecomment-%s\n' "$REPO" "$n" "$(jq --argjson n "$n" '.issues[] | select(.number == $n) | .comments | length' "$FAKE_GH_ISSUES")"
-      fi ;;
+      case "$sub" in
+        edit)
+          [ "$have_title" = 0 ] || [ -n "$title" ] || fail "fake gh issue edit: empty --title"
+          missing="$(unknown_labels "$add_l")"
+          [ -z "$missing" ] || fail "could not add label: '$missing' not found"
+          mutate '(.issues[] | select(.number == $n)) |= (
+                    .assignees = ([.assignees[].login] + $aa | unique | map(select(IN($ra[]) | not)) | map({login: .}))
+                  | .labels = ([.labels[].name] + $al | unique | map(select(IN($rl[]) | not)) | map({name: .}))
+                  | if $ht then .title = $t else . end
+                  | if $hb then .body = $b else . end)' \
+            --argjson n "$n" --argjson aa "$add_a" --argjson ra "$rm_a" --argjson al "$add_l" --argjson rl "$rm_l" \
+            --argjson ht "$([ "$have_title" = 1 ] && echo true || echo false)" --arg t "$title" \
+            --argjson hb "$([ "$have_body" = 1 ] && echo true || echo false)" --arg b "$body"
+          printf 'https://github.com/%s/issues/%s\n' "$REPO" "$n" ;;
+        close)
+          case "$reason" in ""|completed|"not planned") ;; *) fail "invalid argument \"$reason\" for \"-r, --reason\" flag" ;; esac
+          jq -e --argjson n "$n" '.issues[] | select(.number == $n) | .state == "open"' "$FAKE_GH_ISSUES" >/dev/null ||
+            { printf '! Issue #%s is already closed\n' "$n" >&2; return 0; }
+          mutate '(.issues[] | select(.number == $n)) |= (.state = "closed" | .stateReason = ($r | if . == "" then "completed" else . end)
+                  | if $hc then .comments += [{author: {login: $me}, body: $c, createdAt: ($at | todate)}] else . end)' \
+            --argjson n "$n" --arg r "$reason" --argjson hc "$([ "$have_comment" = 1 ] && echo true || echo false)" \
+            --arg c "$comment" --arg me "$ME" --argjson at "$at"
+          printf '✓ Closed issue #%s\n' "$n" >&2 ;;
+        reopen)
+          jq -e --argjson n "$n" '.issues[] | select(.number == $n) | .state == "closed"' "$FAKE_GH_ISSUES" >/dev/null ||
+            { printf '! Issue #%s is already open\n' "$n" >&2; return 0; }
+          mutate '(.issues[] | select(.number == $n)) |= (.state = "open" | del(.stateReason))' --argjson n "$n"
+          printf '✓ Reopened issue #%s\n' "$n" >&2 ;;
+        comment)
+          [ "$have_body" = 1 ] || fail "fake gh issue comment: needs --body or --body-file"
+          mutate '(.issues[] | select(.number == $n)).comments += [{author: {login: $me}, body: $b, createdAt: ($at | todate)}]' \
+            --argjson n "$n" --arg me "$ME" --arg b "$body" --argjson at "$at"
+          printf 'https://github.com/%s/issues/%s#issuecomment-%s\n' "$REPO" "$n" "$(jq --argjson n "$n" '.issues[] | select(.number == $n) | .comments | length' "$FAKE_GH_ISSUES")" ;;
+      esac ;;
     *) fail "fake gh issue: unsupported subcommand '$sub'" ;;
+  esac
+}
+
+label() {
+  : "${FAKE_GH_ISSUES:?fake gh label needs FAKE_GH_ISSUES}"
+  local sub="${1:-}"; shift || true
+  local repo="" name="" fields="" limit=30 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -R|--repo) repo="$2"; shift ;;
+      --json) fields="$2"; shift ;;
+      -L|--limit) limit="$2"; shift ;;
+      -c|--color|-d|--description) shift ;;
+      -f|--force) force=1 ;;
+      -*) fail "fake gh label $sub: unsupported flag $1" ;;
+      *) [ -z "$name" ] || fail "fake gh label $sub: two positionals"; name="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$repo" ] || fail "fake gh label: --repo is required (tests never infer the repo from a remote)"
+  [ "$repo" = "$REPO" ] || fail "GraphQL: Could not resolve to a Repository with the name '$repo'."
+  case "$sub" in
+    list)
+      [ "$fields" = name ] || fail "fake gh label list: only --json name is emulated"
+      jq -c --argjson limit "$limit" '[.labels[:$limit][] | {name: .}]' "$FAKE_GH_ISSUES" ;;
+    create)
+      [ -n "$name" ] || fail "fake gh label create: needs a name"
+      if jq -e --arg l "$name" 'any(.labels[]; ascii_downcase == ($l | ascii_downcase))' "$FAKE_GH_ISSUES" >/dev/null; then
+        [ "$force" = 1 ] || fail "label with name \"$name\" already exists; use \`--force\` to update its color and description"
+      else
+        mutate '.labels += [$l]' --arg l "$name"
+      fi
+      printf '✓ Label "%s" created in %s\n' "$name" "$REPO" >&2 ;;
+    *) fail "fake gh label: unsupported subcommand '$sub'" ;;
   esac
 }
 
@@ -364,5 +445,6 @@ case "${1:-}" in
   api) shift; api "$@" ;;
   issue) shift; issue "$@" ;;
   pr) shift; pr "$@" ;;
+  label) shift; label "$@" ;;
   *) fail "fake gh: unsupported command '${1:-}'" ;;
 esac

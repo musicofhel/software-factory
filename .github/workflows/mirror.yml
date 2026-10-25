@@ -1,6 +1,8 @@
 # Mirror: .adlc ticket store (source of truth, written only from main) → GitHub Issues
 # for display and human interaction. Labels are set only here (write access), so nothing
 # a stranger files becomes claimable without the desk.
+# Applies by default. MIRROR_DRY_RUN=true (a repo variable, flipped by a PR) or a manual dispatch
+# with dry_run narrows a run to printing what it would change.
 name: mirror
 on:
   push:
@@ -8,22 +10,43 @@ on:
     paths: [".adlc/**", "factory/policy/**"]
   schedule:
     - cron: "47 */6 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "print what would change, change nothing"
+        type: boolean
+        default: false
+# Shared with the janitor (which re-runs the mirror) and post-merge's mirror job: two mirrors at
+# once could both create the same Issue.
 concurrency:
   group: mirror
   cancel-in-progress: false
 permissions:
   contents: read
   issues: write
+defaults:
+  run:
+    shell: bash
 jobs:
   mirror:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with: { ref: main }
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - name: tickets → issues (labels ready, w:<weight>, tier:<n>, needs-desk)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./factory/bin/mirror.sh
+          APPLY: ${{ vars.MIRROR_DRY_RUN != 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false) }}
+        run: |
+          if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
+          echo "mirror $mode" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./factory/bin/mirror.sh "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

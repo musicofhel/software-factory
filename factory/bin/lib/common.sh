@@ -47,6 +47,8 @@ resolve_repo() {
 
 valid_handle() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; }
 valid_issue()  { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+# An ADLC ticket id (T1, T-01K..., gh:owner/repo#12); never one that could read as a flag.
+valid_ticket_id() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}$ ]]; }
 
 # load_node <manifest|''> <handle|''> <slots|''>: sets NODE_HANDLE and NODE_SLOTS. Flags win over
 # the manifest (nodes/<handle>.json shape, factory/nodes/manifest.schema.json), which wins over
