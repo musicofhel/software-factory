@@ -267,7 +267,12 @@ ready_pass() {
   open="$(jq -c sort <<<"$open")"
   prev="$(jq -c '.open_set // null' <<<"$STATE")"
   [ "$open" != "$prev" ] || return 0
-  "${ADLC[@]}" merge-forecast --json >"$ffile" || rc=$?
+  if [ "$open" = '[]' ]; then
+    # No open ticket: `adlc merge-forecast` exits 1 ("no active tickets found"); the forecast is empty.
+    echo '{"pairs":[],"waves":[],"mergeOrder":[],"firstWaveWidth":0,"certifiedWidth":0,"warnings":[],"gateFailures":[]}' >"$ffile"
+  else
+    "${ADLC[@]}" merge-forecast --json >"$ffile" || rc=$?
+  fi
   if [ "$rc" != 0 ] && [ "$rc" != 2 ] || ! jq -e 'type == "object"' "$ffile" >/dev/null 2>&1; then
     fail_line "$line" "adlc merge-forecast failed (exit $rc)"; return 0
   fi

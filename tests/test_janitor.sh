@@ -329,7 +329,7 @@ EOF
     eq "$RC $(pick '.action == "ready-recompute"' 'map([.forecast_exit, .result])') $(on_nodes janitor/state.json | jq -c .open_set)" \
        '0 [[2,"done"]] ["T1","T3"]'
   unset FAKE_ADLC_FORECAST_EXIT
-  export FAKE_ADLC_FAIL=merge-forecast FAKE_ADLC_TICKETS='[]'
+  export FAKE_ADLC_FAIL=merge-forecast FAKE_ADLC_TICKETS='[{"id":"T2"}]'
   jan --apply
   check "forecast fails: exit 1, set not saved, mirror not called" \
     eq "$RC $(on_nodes janitor/state.json | jq -c .open_set) $(jq -s length "$FAKE_MIRROR_LOG")" '1 ["T1","T3"] 3'
@@ -365,6 +365,21 @@ EOF
   jan --apply
   check "a failed ticket show: line failed, exit 1, set unchanged" \
     eq "$RC $(pick '.action == "ready-recompute"' 'map(.result)') $(on_nodes janitor/state.json | jq -c .open_set)" '1 ["failed"] ["T1"]'
+}
+
+# Every ticket completed: `adlc merge-forecast` exits 1, so the janitor hands the mirror the empty
+# forecast and saves the empty open set.
+case_ready_all_completed() {
+  jan_setup <<EOF
+state {"open_set": ["T1"]}
+EOF
+  export FAKE_ADLC_STORE="$WORLD/store.json"
+  echo '[{"id":"T1","title":"a","completed":true}]' >"$FAKE_ADLC_STORE"
+  jan --apply
+  check "the recompute is done on the empty forecast" \
+    eq "$RC $(pick '.action == "ready-recompute"' 'map([.open_set, .removed, .merge_order, .result])')" '0 [[[],["T1"],[],"done"]]'
+  check "merge-forecast was not called" eq "$(jq -sc '[.[] | select(.[0] == "merge-forecast")] | length' "$FAKE_ADLC_LOG")" 0
+  check "the saved set is empty" eq "$(on_nodes janitor/state.json | jq -c .open_set)" '[]'
 }
 
 # T10 AC1 wiring: janitor.yml's hook is `revoke-collaborator.sh --apply`, a command line with a flag.
@@ -604,7 +619,7 @@ case_fake_semantics() {
 
 echo "test_janitor"
 for c in stale-lock stale-node over-slots fresh-branch-kept no-pr-48h branch-sweep node-lifecycle preview-ttl \
-         ready-recompute ready-open-only revoke-hook-wired dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
+         ready-recompute ready-open-only ready-all-completed revoke-hook-wired dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

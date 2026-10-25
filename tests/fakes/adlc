@@ -24,7 +24,8 @@
 #                             ./.adlc/manifest.jsonl (cwd, as the real CLI); each entry gains
 #                             gate = (.gate // .type) and segment "root"
 #   merge-forecast --json ... $FAKE_ADLC_FORECAST (a JSON object, default: every open ticket in
-#                             one wave, mergeOrder = sorted ids, certifiedWidth = their count),
+#                             one wave, mergeOrder = sorted ids, certifiedWidth = their count;
+#                             no open ticket: exits 1, "no active tickets found", as the real CLI does),
 #                             then exits $FAKE_ADLC_FORECAST_EXIT (default 0; the real CLI exits 2
 #                             when a gate fails and still prints the forecast)
 #   FAKE_ADLC_FAIL            ERE; a call whose joined argv matches exits 1 with nothing on stdout
@@ -84,6 +85,8 @@ case "${1:-} ${2:-}" in
   "merge-forecast --json"|"merge-forecast "*)
     [[ " $* " == *" --json "* ]] || { echo "fake adlc: merge-forecast needs --json" >&2; exit 2; }
     if [ -n "${FAKE_ADLC_FORECAST:-}" ]; then jq -c . <<<"$FAKE_ADLC_FORECAST"
+    elif ! jq -e 'any(.[]; .completed != true)' <<<"$tickets" >/dev/null; then
+      echo "error: no active tickets found (all tickets are completed)" >&2; exit 1
     else jq -c '[.[] | select(.completed != true) | .id] | sort
                 | {pairs: [], waves: [.], mergeOrder: ., firstWaveWidth: length,
                    certifiedWidth: length, warnings: [], gateFailures: []}' <<<"$tickets"

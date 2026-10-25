@@ -94,6 +94,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/mirror.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 FAILED=0
+EMPTY_FORECAST='{"pairs":[],"waves":[],"mergeOrder":[],"firstWaveWidth":0,"certifiedWidth":0,"warnings":[],"gateFailures":[]}'
 
 # ------------------------------------------------------------------------------------- read
 # Every read completes before the first write: a failed read exits 1 with nothing changed.
@@ -119,6 +120,10 @@ skipped="$(jq '.skipped // [] | length' "$WORK/gm.json")"
 if [ -n "$forecast" ]; then
   [ -f "$forecast" ] || die "forecast file not found: $forecast"
   command cp "$forecast" "$WORK/forecast.json"
+elif ! jq -se 'any(.completed | not)' "$WORK/tickets.jsonl" >/dev/null; then
+  # No open ticket: `adlc merge-forecast` exits 1 ("no active tickets found"), so the forecast is
+  # the empty one and every Issue is just closed.
+  printf '%s\n' "$EMPTY_FORECAST" >"$WORK/forecast.json"
 else
   rc=0
   "${ADLC[@]}" merge-forecast --json >"$WORK/forecast.json" || rc=$?

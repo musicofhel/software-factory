@@ -277,6 +277,22 @@ case_closes_completed() {
   check "and gets no line" eq "$(lines '.ticket == "T1"')" 0
 }
 
+# The mirror run of 2026-10-25 18:50Z: every ticket completed, `adlc merge-forecast` exits 1 ("no
+# active tickets found"). The mirror uses the empty forecast instead, closes the last Issue, exits 0.
+case_all_completed() {
+  mir_setup
+  ticket T1 "one" "$HDR"; gated T1
+  mir --apply
+  set_ticket T1 '.completed = true'
+  check "the fixture: the fake's merge-forecast exits 1 with no open ticket" \
+    eval '! (cd "$WORLD/repo" && "$FAKES_DIR/adlc" merge-forecast --json >/dev/null 2>&1)'
+  : >"$FAKE_ADLC_LOG"
+  mir --apply
+  check "exit 0" eq "$RC" 0
+  check "the last Issue is closed as completed" eq "$(iss T1 '[.state, .stateReason]')" '["closed","completed"]'
+  check "merge-forecast was not called" eq "$(jq -sc '[.[] | select(.[0] == "merge-forecast")] | length' "$FAKE_ADLC_LOG")" 0
+}
+
 case_stranger_issues() {
   mir_setup
   ticket T1 "one" "$HDR"; ticket T2 "two" "$HDR"; gated T1; gated T2
@@ -512,7 +528,7 @@ case_fake_semantics() {
 
 adlc() { "$FAKES_DIR/adlc" "$@"; }
 
-for c in creates updates-idempotent ready-only-when-gated depends-on-lines dry-run-inert closes-completed \
+for c in creates updates-idempotent ready-only-when-gated depends-on-lines dry-run-inert closes-completed all-completed \
          stranger-issues node-needs-desk forecast-file read-failures-write-nothing refuses-apply workflow fake-semantics; do
   run_case "$c"
 done
