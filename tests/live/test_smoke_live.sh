@@ -28,7 +28,8 @@
 #              `cux usage refresh`.
 #   6. review  fleet resolves the reviewer join installed on the orchestrator PATH ($FACTORY_HOME/bin
 #              first, from join's env file).
-#   7. run     `run.sh --slot 1 --apply --once --json` with the real vetto, ralon, tamperguard, cux
+#   7. run     `run.sh --slot 1 --apply --once --json` with the real vetto (tamperguard under the
+#              claim's render of build.toml, T17), ralon, tamperguard, cux
 #              and `npx -y @adlc/cli@1.12.0 fleet`, adapter claude-code, at most 2 strikes in 15 min.
 #
 # It then checks that the loop took the branch ADR-0005 specifies for the reason fleet gave (a
@@ -100,8 +101,11 @@ body="$(printf '%s\n' 'weight: light' 'tier: 0' 'charter: C5' '' \
 # factory/policy/** is the rail ralon-lock.sh protects for every ticket anyway.
 jq -n --arg b "$body" '{id: "T-smoke", title: "Add hello.sh that prints hello, with a test", category: "feature",
     duration: 1, scope: ["hello.sh", "tests/test_hello.sh"], rails: ["factory/policy/**"], edges: [], body: $b}' >"$S/t-smoke.json"
+# HEAD's store already holds railed tickets (T17-T19), so it is a frozen trust root and adlc 1.12.0
+# refuses an unkeyed write with MANIFEST_KEY_REQUIRED; the desk writes unsigned (ruling Q1 of
+# specs/factory-run-calls-v1, as post-merge.sh does), into the fixture's copy only.
 rc=0
-(cd "$S/main" && npx -y @adlc/cli@1.12.0 ticket create --input "$S/t-smoke.json" --write --json) >"$S/ticket-create.json" 2>"$S/ticket-create.err" || rc=$?
+(cd "$S/main" && npx -y @adlc/cli@1.12.0 ticket create --input "$S/t-smoke.json" --write --allow-unsigned --json) >"$S/ticket-create.json" 2>"$S/ticket-create.err" || rc=$?
 check "adlc ticket create --write T-smoke exits 0" eq "$rc" 0
 check "T-smoke is in the fixture's store" quiet ls "$S/main/.adlc/tickets/"t-smoke--*.json
 printf 'main-dir %s\nnode alice 1761300000 active 2\n' "$S/main" | bash "$REPO_ROOT/tests/fixtures/make-repo.sh" "$O"
@@ -249,13 +253,25 @@ if [ -n "$origin_branch" ]; then
   check "the pushed tip is a record commit with the I6 trailers" \
     eq "$(git -C "$O" log -1 --format='%(trailers:key=Ticket,valueonly,separator=)|%(trailers:key=Node,valueonly,separator=)' "$origin_branch")" "T-smoke|dev-box"
 fi
-# Whenever the loop ran its tamperguard step, it ran under vetto + build.toml: the latest vetto
-# session in the scratch HOME is that call (step-2 AC2). vetto exits 125 whatever happened, so
-# this proves where tamperguard ran, not what it said; the ledger's reason says that.
+# Whenever the loop ran its tamperguard step, it ran under vetto + this claim's render of build.toml
+# ($FACTORY_HOME/run/policy/<run id>.build.toml, T17): the latest vetto session in the scratch HOME is
+# that call (step-2 AC2). vetto exits 125 whatever happened, so this proves where tamperguard ran,
+# not what it said; the ledger's reason says that. vetto 0.6.5's session detail redacts a
+# high-entropy path segment in .command (`factory-smoke.[REDACTED_HIGH_ENTROPY].build.toml`), so the
+# render is matched on its history entry's policy_path, which it keeps whole. The render itself only
+# adds read roots (I14).
+RENDER="$FH/run/policy/$(f .run_id).build.toml"
 if [ "$(f '.actions | index("tamperguard") != null')" = true ]; then
-  check "tamperguard ran under vetto: the latest session is factory-build, strict, running tamperguard over the range" \
-    eq "$(vetto audit --latest --json 2>/dev/null | jq -r '"\(.profile) \(.command | test("--profile strict --policy [^ ]*/factory/policy/build.toml ")) \(.command | test("tamperguard --range"))"')" \
+  latest="$(vetto audit --latest --json 2>/dev/null || true)"
+  check "tamperguard ran under vetto: the latest session is factory-build, strict, tamperguard over the range" \
+    eq "$(jq -r '"\(.profile) \(.command | test("--profile strict --policy [^ ]+\\.build\\.toml ")) \(.command | test("tamperguard --range"))"' <<<"$latest" 2>/dev/null)" \
     "factory-build true true"
+  check "  that session ran under this claim's render (vetto's history: its policy_path)" \
+    eq "$(vetto audit --query "$RENDER" --json 2>/dev/null | jq -r --arg p "$RENDER" '[.[] | select(.policy_path == $p) | .session_id] | last // "none"')" \
+    "$(jq -r '.session_id // "no-session"' <<<"$latest" 2>/dev/null)"
+  check "  the render differs from build.toml only on its allow_read line (I14)" \
+    eq "$(diff "$C/factory/policy/build.toml" "$RENDER" 2>/dev/null | grep -E '^[<>]' | sed -E 's/^([<>]) *([a-z_]+).*/\1 \2/' | sort | tr '\n' ' ')" "< allow_read > allow_read "
+  check "  tamperguard's stderr is kept in the run's logs" test -f "$FH/run/logs/$(f .run_id).tamperguard.err"
 fi
 
 # ---- 7. I8: no ticket text in anything that left the node ---------------------------------------------
@@ -286,8 +302,11 @@ info "wall clock: run.sh $elapsed s"
 info "fleet policy echo: $(doc -c '{readPolicy, privateTmp, gitSource, mirror, egress, egressAllowlist, homeBinds, writableRoots}')"
 info "issue #1: labels $labels, $ncomments comment(s)"
 jq -r '.issues[0].comments[].body' "$S/issues.json" | sed 's/^/    | comment: /'
+info "rendered policy: $(grep -E '^[[:space:]]*allow_read[[:space:]]*=' "$RENDER" 2>/dev/null || echo "none (the step did not run)")"
+info "tamperguard: ledger $(f -c .tamperguard), loop reason ${reason:-none}; stderr: $(head -c 300 "$FH/run/logs/$(f .run_id).tamperguard.err" 2>/dev/null | tr '\n' ' ')"
 if quiet vetto audit --latest --json; then
-  info "vetto audit --latest: $(vetto audit --latest --json 2>/dev/null | jq -c '{session: (.session_id // .id), profile, policy: (.policy_path // .policy), command, tier, blocked, events: (.events | if type == "array" then length else . end)}' 2>/dev/null || echo unparsed)"
+  info "vetto audit --latest: $(vetto audit --latest --json 2>/dev/null | jq -c '{session: (.session_id // .id), profile, command, tier, net_mode, violations_total, events_total, filesystem_denials}' 2>/dev/null || echo unparsed)"
+  info "vetto history for the render: $(vetto audit --query "$RENDER" --json 2>/dev/null | jq -c '[.[] | {session_id, profile, policy_path, tier, net_mode, blocked_count}]' 2>/dev/null || echo none)"
 else
   info "vetto audit: no session (the loop's vetto step, tamperguard, runs only after fleet merges)"
 fi
