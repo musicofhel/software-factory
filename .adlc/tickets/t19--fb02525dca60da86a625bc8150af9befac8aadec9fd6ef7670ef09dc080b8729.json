@@ -1,0 +1,16 @@
+{
+  "body": "weight: heavy\ntier: 2\ncharter: C5\n\nRun the toy ticket through fleet and the loop's tamperguard step under the rendered policy (T17) on the dev box, against the local fixture origin (tests/fixtures/make-repo.sh), and close out factory-run-calls-v1. Never against GitHub. The best case is the loop ending `scope-check-not-built`, because scope-check is build-order step 3.\n\nPart A, live run: `FACTORY_SMOKE_KEEP=$HOME/.cache/factory-smoke-evidence make live` (tests/live/test_smoke_live.sh). Record: the canary pass through the bwrap shim, fleet's run id, strikes, the gate, adversarial-review's verdict, tamperguard's verdict under the rendered policy with its `vetto audit` session, and the loop's final branch. Pass is the loop ending `scope-check-not-built` with every earlier step the specified one; a sandbox that ran open or a tamperguard step that ran outside vetto is a fail. If a later stage fails for a reason inside fleet or vetto, name it and draft (never file) an upstream issue in the records.\n\nPart B, close-out: `make test`, `make lint` and `make live` green; coldstart gaps empty for T17-T19; README.md build-order row 2 updated.\n\nAcceptance criteria:\n1. The loop ends `scope-check-not-built` and the recorded items exist with the commands that produced them. Verify: `make live` and specs/factory-run-calls-v1/records/TB3.md.\n2. fleet's sandbox and the tamperguard step were enforced (fleet's policy echo; the `vetto audit` session of the tamperguard step). Verify: the records.\n3. `make test`, `make lint`, `make live` exit 0. Verify: run them.\n4. coldstart gaps empty for T17-T19. Verify: `npx -y @adlc/cli@1.12.0 coldstart --all --offline --json`.\n5. README row 2 updated. Verify: `grep -n \"step 2\" README.md`.\n\nOut of scope: build-order step 3 (CI gate bodies, merge queue, halt-guard, scope-check body, main's .adlc/config.json fleet block); editing anything under factory/policy/; filing anything upstream; any write to GitHub.",
+  "category": "test",
+  "duration": 1,
+  "edges": [],
+  "id": "T19",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "tests/live/test_smoke*.sh",
+    "tests/fixtures/make-repo.sh",
+    "README.md"
+  ],
+  "title": "Run the toy ticket to scope-check-not-built on the dev box, and close out factory-run-calls-v1"
+}

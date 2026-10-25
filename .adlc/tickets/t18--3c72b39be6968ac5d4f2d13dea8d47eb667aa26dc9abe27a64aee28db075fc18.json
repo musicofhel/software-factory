@@ -1,0 +1,28 @@
+{
+  "body": "weight: light\ntier: 0\ncharter: C2\n\nLand ruling Q2 of specs/factory-step2-followups-v1/RULINGS.md: every ticket declares at least the rail `factory/policy/**`, and a check refuses an open ticket without one. fleet's gate runs `adlc rails-guard --base <start> --ticket <id>`, which exits 1 on a ticket with no rails (\"has no rails declared\"), so a ticket with `rails: []` spends every strike on a configuration error (specs/factory-step2-followups-v1/records/TB5.md §4.2; upstream voodootikigod/adlc#1272). `factory/policy/**` is the glob factory/bin/lib/ralon-lock.sh protects for every ticket.\n\nRuling Q1 of specs/factory-run-calls-v1/RULINGS.md: a railed ticket makes the store a frozen trust root (adlc 1.12.0), so every later write, including post-merge's `adlc ticket complete --write --authorize`, refuses with `MANIFEST_KEY_REQUIRED` (exit 2) unless `ADLC_MANIFEST_KEY` is set or `--allow-unsigned` is passed (specs/factory-run-calls-v1/records/TB0.md §2.1). No key exists; the ruling is unsigned, matching `.adlc/config.json` `securityMode: unsigned-fallback`.\n\nDeliverables:\n- The desk's ticket convention states the default rail: docs/adr/0002-adlc-sharded-ticket-store.md (where the ADR-0002 header block is defined) and factory/RULES.md say every ticket declares at least `factory/policy/**` in `rails`.\n- factory/bin/mirror.sh's ready conditions gain `rails`: an open ticket whose `rails` is empty or missing gets no `ready` and gets `needs-desk` with the reason `rails: none declared`.\n- The ticket check behind `make tickets` (or the existing desk check; the records cite which) fails on an open ticket without rails.\n- Completed tickets are never relabeled for it (T1-T16 have no rails and stay as they are).\n- tests/fakes/adlc carries `rails` through `ticket show`.\n- factory/bin/post-merge.sh passes `--allow-unsigned` to `adlc ticket complete --write --authorize` (ruling Q1), and tests/fakes/adlc refuses a railed store's write without it, as the real CLI does.\n\nAcceptance criteria:\n1. An open ticket with `rails: []` gets `needs-desk` with the reason `rails: none declared`. Verify: `make test` (tests/test_mirror.sh).\n2. An open ticket with the rail can be `ready`. Verify: `make test` (tests/test_mirror.sh).\n3. A completed ticket without rails is untouched. Verify: `make test` (tests/test_mirror.sh).\n4. The ticket check fails on an open ticket without rails and passes on the store as it stands. Verify: `make test` and `make tickets`.\n5. post-merge completes a ticket in a railed store: it passes `--allow-unsigned`, and the fake adlc refuses the same write without it (exit 2, `MANIFEST_KEY_REQUIRED`). Verify: `make test` (tests/test_post_merge.sh).\n6. The convention is written down. Verify: `grep -n \"factory/policy/\\*\\*\" factory/RULES.md docs/adr/0002-adlc-sharded-ticket-store.md`.\n7. shellcheck -S warning clean. Verify: `make lint`.\n\nOut of scope: editing tickets T1-T16; editing anything under factory/policy/; a manifest signing key or any workflow secret; step 3's CI desk gate; any write to GitHub.",
+  "category": "feature",
+  "duration": 1,
+  "edges": [
+    {
+      "to": "T19"
+    }
+  ],
+  "id": "T18",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "factory/bin/mirror.sh",
+    "factory/bin/ticket-check.sh",
+    "factory/bin/post-merge.sh",
+    "factory/RULES.md",
+    "docs/adr/0002-adlc-sharded-ticket-store.md",
+    "Makefile",
+    "tests/test_mirror.sh",
+    "tests/test_ticket_check.sh",
+    "tests/test_post_merge.sh",
+    "tests/fakes/adlc",
+    "tests/fakes/mirror/**"
+  ],
+  "title": "Make factory/policy/** every ticket's default rail and refuse an open ticket without rails (ruling Q2)"
+}

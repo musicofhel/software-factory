@@ -1,16 +1,17 @@
-# TB0 — Register and tickets T17–T19 (PARTIAL: blocked on Q1)
+# TB0 — Register and tickets T17–T19
 
 Session date 2026-10-25. Box: WSL2, Linux 6.18.33.2-microsoft-standard-WSL2. Measured at `098cc3f`
 (= `origin/main` = local `main`, the SPEC commit on top of `139a06b`). Nothing was pushed (I1). Every
 GitHub call below is a read (`gh issue view`, `git ls-remote`). `a` = `npx -y @adlc/cli@1.12.0`.
 Blocks are `$ <command>`, its output (trimmed where marked) and `exit=<code>`.
 
-**State: the register is re-measured (§1) and T17–T19 are drafted and proven in a scratch clone (§2),
-but nothing is written to main's ticket store.** Writing a railed ticket turns main's store into a
-frozen trust root. After that, every later ticket write needs `ADLC_MANIFEST_KEY`, which this box does
-not have, or `--allow-unsigned`, which leaves a permanent unsigned audit entry. Post-merge's `ticket
-complete` is refused the same way. That is a credential and trust-root call, so it goes to Aaron
-(HANDOFF Q1). A second register finding bears on TB1's live DoD (HANDOFF Q2).
+**State: done.** Session 1 re-measured the register (§1) and drafted and proved T17–T19 in a scratch
+clone (§2.1–§2.3), then stopped before writing main's store: a railed ticket turns the store into a
+frozen trust root, after which every later write needs `ADLC_MANIFEST_KEY` (absent) or
+`--allow-unsigned` (a permanent unsigned audit entry). Aaron ruled on 2026-10-25 22:31Z
+(`RULINGS.md`): Q1 **unsigned**, Q2 **scratch HOME in TB1's live test**. Session 2 widened T18's draft for
+Q1, aligned T17's live criterion with Q2, re-proved the drafts in a fresh scratch clone, and wrote
+T19, T18 and T17 to main's store (§2.4).
 
 ## 1. The register, re-measured
 
@@ -171,7 +172,7 @@ $ git ls-remote https://github.com/voodootikigod/adlc.git refs/heads/main
 b43800fb7d9543ef556dcb334fce2d4e09005289	refs/heads/main
 ```
 
-## 2. Tickets T17–T19: drafted, proven in a scratch clone, NOT written to main's store
+## 2. Tickets T17–T19: drafted, proven in a scratch clone, written to main's store (§2.4)
 
 ### 2.1 Why the write stopped
 
@@ -224,7 +225,7 @@ documents. Each body opens with the ADR-0002 header block, every acceptance crit
 | id | header | title | scope | edges |
 |---|---|---|---|---|
 | T17 | light / 1 / C5 | Run the loop's tamperguard step under a per-claim rendered copy of build.toml (ruling Q1) | `factory/bin/run.sh`, `factory/bin/lib/run.sh`, `factory/bin/lib/policy-render.sh`, `docs/adr/0005-run-loop-cli-reality.md`, `tests/test_run.sh`, `tests/fakes/vetto`, `tests/fakes/tamperguard`, `tests/live/test_render_live.sh` | T18, T19 |
-| T18 | light / 0 / C2 | Make factory/policy/** every ticket's default rail and refuse an open ticket without rails (ruling Q2) | `factory/bin/mirror.sh`, `factory/bin/ticket-check.sh`, `factory/RULES.md`, `docs/adr/0002-adlc-sharded-ticket-store.md`, `Makefile`, `tests/test_mirror.sh`, `tests/test_ticket_check.sh`, `tests/fakes/adlc`, `tests/fakes/mirror/**` | T19 |
+| T18 | light / 0 / C2 | Make factory/policy/** every ticket's default rail and refuse an open ticket without rails (ruling Q2) | `factory/bin/mirror.sh`, `factory/bin/ticket-check.sh`, `factory/bin/post-merge.sh` (§2.4), `factory/RULES.md`, `docs/adr/0002-adlc-sharded-ticket-store.md`, `Makefile`, `tests/test_mirror.sh`, `tests/test_ticket_check.sh`, `tests/test_post_merge.sh` (§2.4), `tests/fakes/adlc`, `tests/fakes/mirror/**` | T19 |
 | T19 | heavy / 2 / C5 | Run the toy ticket to scope-check-not-built on the dev box, and close out factory-run-calls-v1 | `tests/live/test_smoke*.sh`, `tests/fixtures/make-repo.sh`, `README.md` | — |
 
 No scope names `factory/policy/**` (I15). Charters as in step 2: the run loop is C5 (T12, T16), and the
@@ -270,12 +271,92 @@ T19	00625c0fd8e5		factory/policy/**	weight: heavy tier: 2 charter: C5
 So once Q1 is ruled, the write on main is this same loop with the ruled flag or key: two `ticket-mutation`
 manifest entries (T18 and T17) and three new ticket files. No edge update is needed afterwards.
 
+### 2.4 Session 2: the ruling, the draft changes, the write on main
+
+The ruling (`RULINGS.md`, 2026-10-25 22:31Z): Q1 **unsigned**. T19 is written first without a flag,
+then T18 and T17 with `--allow-unsigned`, and post-merge.sh learns `--allow-unsigned` inside T18's
+scope. Q2 **scratch HOME** for TB1's live test.
+
+`origin/main` moved from `098cc3f` to `c13c121` since §1, but only through `specs/factory-run-calls-v1/`
+(`git diff --name-only 098cc3f c13c121`: LEDGER, RULINGS, SPEC, records/TB0.md and the three drafts).
+So the register stands, and `make test` and `make lint` below re-prove the repo line.
+
+Draft changes (`records/tickets/`):
+
+| draft | change | why |
+|---|---|---|
+| T18 | scope += `factory/bin/post-merge.sh`, `tests/test_post_merge.sh` (11 globs). Body: a Q1 paragraph, a deliverable (post-merge passes `--allow-unsigned` to `ticket complete --write --authorize`; the fake adlc refuses a railed store's write without it), a new criterion 5 with `Verify: make test (tests/test_post_merge.sh)` (the old 5–6 became 6–7), and "a manifest signing key or any workflow secret" added to out of scope | ruling Q1; SPEC TB0 amendment |
+| T17 | criterion 4 says the live run is under a scratch `$HOME` whose render points at the real uv tool and python dirs, and that the records state the real-HOME failure (ADR-0005 amendment T6 item 10) and name the python dir | ruling Q2; SPEC TB1 amendment. No scope or edge change |
+| T19 | none | |
+
+The re-proof is on a fresh clone of `c13c121` plus the edited drafts (`~/.cache/tb0-run/scratch2`):
+
+```
+$ for t in T19 T18 T17; do a ticket create --input $D/$t.json --json; a ticket create --input $D/$t.json --write [--allow-unsigned for T18,T17] --json; done
+T19 dry=0 write=0                  {"applied":true,"ticketHash":"00625c0fd8e5"}
+T18 dry=0 write=0 --allow-unsigned {"applied":true,"ticketHash":"4a11b4d92cd4"} warning: --allow-unsigned with no ADLC_MANIFEST_KEY — …
+T17 dry=0 write=0 --allow-unsigned {"applied":true,"ticketHash":"cbee2ca1bb18"} warning: --allow-unsigned with no ADLC_MANIFEST_KEY — …
+$ a ticket doctor            → All checks passed. exit=0
+$ a coldstart --all --offline --json → ok true; T17, T18, T19 pass, gaps []
+$ a merge-forecast --json    → exit=0 {"gateFailures":[],"waves":[["T17"],["T18"],["T19"]]}
+```
+
+The wider T18 scope (post-merge.sh) added no co-change pair. The forecast is the same as §2.3.
+
+The write on main is the same loop in the main checkout at `c13c121` (outputs in `~/.cache/tb0-run/main-write/`).
+Every hash matches the scratch:
+
+```
+$ git fetch -q origin && git rev-parse origin/main HEAD
+c13c121d76764a9d95c8735c7cc37421a8f7e991
+c13c121d76764a9d95c8735c7cc37421a8f7e991
+$ for t in T19 T18 T17; do …create… ; done
+T19 dry=0 write=0                  {"applied":true,"ticketHash":"00625c0fd8e5"}
+T18 dry=0 write=0 --allow-unsigned {"applied":true,"ticketHash":"4a11b4d92cd4"} warning: --allow-unsigned with no ADLC_MANIFEST_KEY — this mutation of a frozen trust root will be recorded UNSIGNED. An unsigned audit entry is not evidence: …
+T17 dry=0 write=0 --allow-unsigned {"applied":true,"ticketHash":"cbee2ca1bb18"} warning: (the same)
+$ a ticket doctor; echo doctor=$?
+All checks passed.
+doctor=0
+$ a coldstart --all --offline --json | jq -c '.ok, (.results[] | select(.id|IN("T17","T18","T19")) | {id, pass, gaps})'
+true
+{"id":"T17","pass":true,"gaps":[]}
+{"id":"T18","pass":true,"gaps":[]}
+{"id":"T19","pass":true,"gaps":[]}
+$ a merge-forecast --json; echo mf=$?
+mf=0
+{"gateFailures":[],"waves":[["T17"],["T18"],["T19"]]}
+$ for t in T17 T18 T19; do a ticket show $t --json | jq -r '[.ticket.id, .ticketHash[0:12], (edges), (rails), (header)] | @tsv'; done
+T17	cbee2ca1bb18	T18,T19	factory/policy/**	weight: light tier: 1 charter: C5
+T18	4a11b4d92cd4	T19	factory/policy/**	weight: light tier: 0 charter: C2
+T19	00625c0fd8e5		factory/policy/**	weight: heavy tier: 2 charter: C5
+$ tail -2 .adlc/manifest.jsonl | jq -c '{seq,gate,ticket,bypass:.data.bypass,sig:(.sig // .signature // null)}'
+{"seq":21,"gate":"ticket-mutation","ticket":"T18","bypass":true,"sig":null}
+{"seq":22,"gate":"ticket-mutation","ticket":"T17","bypass":true,"sig":null}
+$ make test   → 15 files PASS (2:32 wall), exit=0     # run concurrently with make lint
+$ make lint   → exit=0
+$ make tickets → exit=0 (lists T1–T19)
+```
+
+Main's store is now frozen. Every later write needs `--allow-unsigned` (ruling Q1) until a key exists.
+That includes desk edits to T17–T19, every new ticket, and post-merge's `ticket complete`.
+
+**A consequence for T17's completion (measured from the code, not run).** The waves merge T17 before
+T18, but post-merge.sh learns `--allow-unsigned` only in T18. So post-merge's completion of T17 fails
+(`failed adlc ticket complete exit 2: … MANIFEST_KEY_REQUIRED`, exit 1). That failure is safe by
+design: the marker does not advance (`factory/bin/post-merge.sh` header, "After a failed completion the
+commit keeps the old marker, so the next run retries the rest"; `tests/test_post_merge.sh`
+`case_completion_failure`). The first post-merge run after T18 lands, which runs T18's post-merge.sh,
+rescans the range and completes T17 and T18 together. Until then the post-merge job for T17's merge is red.
+
 ## 3. Gotchas for the next rows
 
-1. **The frozen trust root (§2.1).** Every row after TB0 that writes the store, and post-merge, inherits
-   Q1's answer. TB2's mirror check reads the store and does not write it.
-2. **vetto never starts under this box's real `$HOME`** (§1.4; ADR-0005 amendment T6 item 10). TB1's
-   live test must either run with a scratch HOME, as the smoke does, or wait for `~/.aws` to change (Q2).
+1. **The frozen trust root (§2.1, §2.4).** Main's store is frozen since this row. Ruling Q1 is
+   unsigned: every desk write passes `--allow-unsigned`, and post-merge learns it in T18 (TB2). Until
+   T18 lands, post-merge cannot complete T17, and it retries safely (§2.4). TB2's mirror check reads
+   the store and does not write it.
+2. **vetto never starts under this box's real `$HOME`** (§1.4; ADR-0005 amendment T6 item 10). Ruling
+   Q2: TB1's live test runs with a scratch HOME, as the smoke does, and its records state the real-HOME
+   failure.
 3. **Two-hop uv interpreter** (§1.4): `tools/tamperguard/bin/python` → `uv/python/cpython-3.14-…` (a
    symlink) → `cpython-3.14.3-…`. Landlock checks every path the exec walks. The render's interpreter
    root must cover the link dir as well as the resolved dir. On this box `~/.local/share/uv/python` covers
@@ -288,8 +369,9 @@ manifest entries (T18 and T17) and three new ticket files. No edge update is nee
 
 ## 4. Result
 
-PARTIAL. Every register line is re-measured (§1). The "not measured" line is now measured, and its answer
-is a blocker for TB1's live line as worded (Q2). No fleet past 1.12.0 has shipped. T17–T19 are drafted and
-proven in a scratch store: doctor ok, coldstart gaps empty, merge-forecast exit 0 (§2.3). They are not
-written to main's store pending Q1. `make test` 15 PASS, `make lint` 0. No commit `Ticket: scaffold`
-with store changes yet.
+Done. Every register line is re-measured (§1). No fleet past 1.12.0 has shipped. The "not measured"
+line is measured: vetto cannot start under this box's real `$HOME`, and ruling Q2 moves TB1's live test
+to a scratch HOME. T17, T18 and T19 are in main's store with `rails: ["factory/policy/**"]` and edges
+T17→T18, T17→T19, T18→T19. Gates after the write: doctor ok, coldstart gaps empty for T17–T19,
+merge-forecast exit 0 (waves T17 → T18 → T19), `make test` 15 PASS, `make lint` 0, `make tickets` 0
+(§2.4). Commit `Ticket: scaffold`, local only (I1).
