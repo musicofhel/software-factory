@@ -1,6 +1,7 @@
 {
   "body": "weight: light\ntier: 0\ncharter: C5\n\nThe one open decision in SPEC-v0.2 ('The one open decision: the chassis'). Read Symphony `SPEC.md` (github.com/openai/symphony), norma `docs/pdca-agent.md` (github.com/normahq/norma), Fabro's example graphs (github.com/fabro-sh/fabro) and Untrivial-ai/agent-orchestrator's adapter list, plus ADLC `packages/fleet/README.md` (the default). Then amend docs/adr/0003-chassis.md from `proposed` to `accepted` with the decision.\n\nAcceptance criteria:\n1. ADR-0003 has a Decision section naming ONE chassis and, for each of the five candidates, one line SAME/DIFFERENT versus fleet on: multi-machine over a public repo, adapter count, deterministic gating, `--json` reason codes the run loop can key on, and sandbox story; verified by `grep -c -e SAME -e DIFFERENT docs/adr/0003-chassis.md` >= 5.\n2. Every claim cites the file and line or heading it came from; verified by `grep -c 'https://' docs/adr/0003-chassis.md` >= 5.\n3. The state machines, trust rules, manifest and claim protocol are unchanged by the decision (the ADR says so explicitly); verified by `grep -q 'only the run loop' docs/adr/0003-chassis.md`.\n\nNo code changes. The run loop (build order 2) reads this ADR for its inner command.",
   "category": "architecture",
+  "completed": true,
   "duration": 1,
   "id": "T5",
   "scope": [
