@@ -20,7 +20,9 @@
     "tests/test_halt*.sh",
     "tests/test_summon*.sh",
     "tests/fakes/**",
-    ".github/workflows/summoner.yml"
+    ".github/workflows/summoner.yml",
+    "CODEOWNERS",
+    "docs/adr/0004-halt-two-person-rule.md"
   ],
   "title": "Implement the kill switch: halt-check, branch rules as code, halt notice"
 }

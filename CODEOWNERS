@@ -7,7 +7,7 @@ factory/**   @musicofhel
 .claude/**   @musicofhel
 CODEOWNERS   @musicofhel
 
-# Kill switch: zero approvals to ADD factory/HALT (any write-access member, one-line PR),
-# two approvals to REMOVE it. Branch protection expresses this as a required-reviewers
-# rule keyed on deletion (factory/policy/branch-protection.json).
+# Kill switch: the spec wants zero approvals to ADD factory/HALT and two to REMOVE it.
+# GitHub has no rule keyed on deletion (docs/adr/0004-halt-two-person-rule.md, proposed),
+# so until that ADR is decided this line means one code-owner approval to add and to remove.
 factory/HALT @musicofhel

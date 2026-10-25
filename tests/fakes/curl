@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Fake `curl` for offline tests. Put tests/fakes on PATH; tests/fakes/lib.sh sets it up.
+#
+# Records every call as one JSON object per line in $FAKE_CURL_LOG:
+#   {"url": ..., "method": ..., "headers": [...], "body": "<the bytes sent, as a string>", "argv": [...]}
+# and answers like a Discord webhook without ?wait=true: HTTP 204, nothing on stdout.
+#
+#   FAKE_CURL_LOG    where calls are recorded (required)
+#   FAKE_CURL_FAIL   ERE; a call whose URL matches fails like `curl -f` on HTTP 500 (exit 22). The
+#                    message names the full URL (worst case), so a caller's redaction is tested
+#
+# Supports -X/--request, -H/--header, -d/--data/--data-raw/--data-binary (@file, @- for stdin),
+# -o/--output, -m/--max-time, -w/--write-out (ignored), and the boolean flags -f -s -S -L --fail.
+# Anything else fails loudly so a script never relies on a flag the fake silently ignores.
+set -euo pipefail
+: "${FAKE_CURL_LOG:?fake curl needs FAKE_CURL_LOG}"
+
+argv="$(for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc .)"
+url="" method="" body="" have_body=0
+headers='[]'
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X|--request) method="$2"; shift ;;
+    -H|--header) headers="$(jq -c --arg h "$2" '. + [$h]' <<<"$headers")"; shift ;;
+    -d|--data|--data-raw|--data-binary)
+      [ "$have_body" = 0 ] || { echo "fake curl: two bodies are not supported" >&2; exit 2; }
+      case "$2" in
+        @-) body="$(command cat)" ;;
+        @*) body="$(command cat "${2#@}")" ;;
+        *) body="$2" ;;
+      esac
+      have_body=1; shift ;;
+    -o|--output|-m|--max-time|-w|--write-out) shift ;;
+    -f|--fail|-s|--silent|-S|--show-error|-L|--location|-fsS|-fsSL|-sS) ;;
+    -*) echo "fake curl: unsupported flag $1" >&2; exit 2 ;;
+    *) [ -z "$url" ] || { echo "fake curl: two URLs" >&2; exit 2; }; url="$1" ;;
+  esac
+  shift
+done
+[ -n "$url" ] || { echo "curl: no URL specified" >&2; exit 2; }
+[ -n "$method" ] || { if [ "$have_body" = 1 ]; then method=POST; else method=GET; fi; }
+
+jq -cn --arg url "$url" --arg m "$method" --argjson h "$headers" --arg b "$body" --argjson argv "$argv" \
+  '{url: $url, method: $m, headers: $h, body: $b, argv: $argv}' >>"$FAKE_CURL_LOG"
+
+if [ -n "${FAKE_CURL_FAIL:-}" ] && [[ "$url" =~ $FAKE_CURL_FAIL ]]; then
+  echo "curl: (22) The requested URL returned error: 500 ($url)" >&2
+  exit 22
+fi
+exit 0

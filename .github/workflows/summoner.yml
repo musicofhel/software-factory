@@ -26,9 +26,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # The factory:halt label and a push of factory/HALT are both a halt notice; summon.sh skips
+      # a push whose commit no longer has factory/HALT (a lift is digest news, not a summons).
       - name: one message, one human
         env:
           GH_TOKEN: ${{ github.token }}
           DISCORD_WEBHOOK: ${{ secrets.SUMMONER_WEBHOOK }}
-          KIND: ${{ github.event_name == 'push' && 'halt' || github.event.label.name }}
-        run: ./factory/bin/summon.sh --kind "$KIND"
+          SUMMONER_TO: ${{ vars.SUMMONER_TO }}
+          KIND: ${{ (github.event_name == 'push' || github.event.label.name == 'factory:halt') && 'halt' || github.event.label.name }}
+        run: ./factory/bin/summon.sh --apply --kind "$KIND"

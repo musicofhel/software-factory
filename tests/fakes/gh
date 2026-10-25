@@ -7,6 +7,8 @@
 #
 #   FAKE_GH_GIT        bare repo backing repos/<FAKE_GH_REPO>/git/*            (required for api)
 #   FAKE_GH_ISSUES     {"labels": [names], "issues": [...]} backing `issue`   (required for issue)
+#   FAKE_GH_SETTINGS   {"protection": {branch: PUT body}, "rulesets": [...], "next_id": n} backing
+#                      branches/<b>/protection and rulesets                    (required for those)
 #   FAKE_GH_REPO       the one repo this fake serves (default test/repo); anything else is 404
 #   FAKE_GH_LOG        every call appended as one JSON array of its argv
 #   FAKE_GH_USER       who @me is (default fake-user)
@@ -19,6 +21,13 @@
 #        POST git/commits (message, tree, parents[]), git/refs (ref, sha; 422 if the ref exists)
 #        PATCH git/refs/<ref> (sha, force; 422 if missing or not a fast-forward without force)
 #        DELETE git/refs/<ref> (422 if missing)
+#        GET  branches/<b>/protection (404 "Branch not protected"; answers GitHub's GET shape:
+#             {enabled: bool} objects, urls, checks[], defaults for the fields never PUT)
+#        PUT  branches/<b>/protection (422 unless the four required keys are present; 404 for a
+#             branch the bare repo lacks)
+#        GET  rulesets (summaries only, no rules: callers must GET by id), rulesets/<id>
+#        POST rulesets, PUT rulesets/<id> (422 on a duplicate name or an unknown rule type)
+#        A ?query on the path is ignored. --input FILE|- sends a JSON body (as gh does).
 #        Like gh: -f/-F fields (key[]=v arrays, -F typed), POST by default when fields are given,
 #        --jq on success, error body on stdout + "gh: <msg> (HTTP <code>)" on stderr, exit 1.
 # issue: list (--label repeatable = AND, --state, --limit default 30, --json fields, newest first),
@@ -65,7 +74,7 @@ ref_json() { jq -n --arg r "$1" --arg s "$2" '{ref: $r, object: {sha: $s, type: 
 ref_sha() { g show-ref --verify -s "$1" 2>/dev/null || true; }
 
 api() {
-  local method="" path="" jqx="" fields='{}' k v explicit=0
+  local method="" path="" jqx="" fields='{}' k v explicit=0 input="" explicit_body=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -X|--method) method="$2"; explicit=1; shift ;;
@@ -78,6 +87,7 @@ api() {
         else fields="$(jq -c --arg k "$k" --argjson v "$v" '.[$k] = $v' <<<"$fields")"; fi
         shift ;;
       --jq|-q) jqx="$2"; shift ;;
+      --input) input="$2"; shift ;;
       -H|--header) shift ;;
       --paginate|--silent) ;;
       -*) fail "fake gh api: unsupported flag $1" ;;
@@ -85,9 +95,19 @@ api() {
     esac
     shift
   done
-  [ "$explicit" = 1 ] || { if [ "$fields" != '{}' ]; then method=POST; else method=GET; fi; }
-  : "${FAKE_GH_GIT:?fake gh api needs FAKE_GH_GIT}"
+  if [ -n "$input" ]; then
+    [ "$fields" = '{}' ] || fail "fake gh api: --input and -f/-F together are not supported"
+    if [ "$input" = - ]; then fields="$(command cat)"; else fields="$(command cat "$input")"; fi
+    fields="$(jq -c . <<<"$fields" 2>/dev/null)" || http_err 400 "Problems parsing JSON"
+    explicit_body=1
+  fi
+  [ "$explicit" = 1 ] || { if [ "$fields" != '{}' ] || [ -n "$explicit_body" ]; then method=POST; else method=GET; fi; }
+  path="${path%%\?*}"
   case "$path" in "repos/$REPO/"*) path="${path#"repos/$REPO/"}" ;; *) http_err 404 "Not Found" ;; esac
+  case "$path" in
+    branches/*/protection|rulesets|rulesets/*) settings "$method" "$path" "$fields" "$jqx"; return ;;
+  esac
+  : "${FAKE_GH_GIT:?fake gh api needs FAKE_GH_GIT}"
   f() { jq -r --arg k "$1" '.[$k] // empty' <<<"$fields"; }
 
   local out="" ref sha old tree p
@@ -146,6 +166,94 @@ api() {
       [ -n "$old" ] || http_err 422 "Reference does not exist"
       g update-ref -d "$ref" "$old" 2>/dev/null || http_err 422 "Reference cannot be deleted"
       return 0 ;;
+    *) http_err 404 "Not Found" ;;
+  esac
+  if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+}
+
+# ---------------------------------------------------------------- settings (protection, rulesets)
+smutate() {  # smutate <jq program> [jq args...]: atomic read-modify-write of the settings store
+  local prog="$1"; shift
+  (
+    flock 9
+    local tmp; tmp="$(mktemp "$FAKE_GH_SETTINGS.XXXXXX")"
+    jq "$@" "$prog" "$FAKE_GH_SETTINGS" >"$tmp" && mv "$tmp" "$FAKE_GH_SETTINGS"
+  ) 9>"$FAKE_GH_SETTINGS.lock"
+}
+
+RULE_TYPES='["creation","update","deletion","required_linear_history","merge_queue","required_deployments",
+  "required_signatures","pull_request","required_status_checks","non_fast_forward","commit_message_pattern",
+  "commit_author_email_pattern","committer_email_pattern","branch_name_pattern","tag_name_pattern",
+  "file_path_restriction","max_file_path_length","file_extension_restriction","max_file_size","workflows",
+  "code_scanning","copilot_code_review"]'
+
+settings() {  # settings <method> <path below repos/R/> <body-json> <jq>
+  : "${FAKE_GH_SETTINGS:?fake gh api needs FAKE_GH_SETTINGS for protection and rulesets}"
+  local method="$1" path="$2" body="$3" jqx="$4" out="" b id url="https://api.github.com/repos/$REPO"
+  # What GitHub answers to GET protection: wrapped booleans, urls, checks, and defaults.
+  local render_prot='def w($v): {enabled: ($v // false)};
+    . as $p | {url: "\($u)/branches/\($b)/protection"}
+    + (if $p.required_status_checks == null then {} else {required_status_checks: ($p.required_status_checks
+        + {url: "\($u)/branches/\($b)/protection/required_status_checks", contexts_url: "x",
+           checks: [$p.required_status_checks.contexts[]? | {context: ., app_id: null}]})} end)
+    + (if $p.required_pull_request_reviews == null then {} else {required_pull_request_reviews:
+        ({url: "x", dismiss_stale_reviews: false, require_code_owner_reviews: false,
+          require_last_push_approval: false, required_approving_review_count: 0} + $p.required_pull_request_reviews)} end)
+    + (if $p.restrictions == null then {} else {restrictions: {url: "x",
+        users: [($p.restrictions.users // [])[] | {login: .}], teams: [($p.restrictions.teams // [])[] | {slug: .}],
+        apps: [($p.restrictions.apps // [])[] | {slug: .}]}} end)
+    + {required_signatures: {url: "x", enabled: false}, enforce_admins: {url: "x", enabled: ($p.enforce_admins // false)},
+       required_linear_history: w($p.required_linear_history), allow_force_pushes: w($p.allow_force_pushes),
+       allow_deletions: w($p.allow_deletions), block_creations: w($p.block_creations),
+       required_conversation_resolution: w($p.required_conversation_resolution), lock_branch: w($p.lock_branch),
+       allow_fork_syncing: w($p.allow_fork_syncing)}'
+  # What GitHub answers to GET rulesets/<id>: the stored body plus server fields and rule defaults.
+  local render_rs='. + {source_type: "Repository", source: $r, node_id: "RRS_\(.id)", current_user_can_bypass: "never",
+      bypass_actors: (.bypass_actors // []), created_at: "2026-10-24T00:00:00Z", updated_at: "2026-10-24T00:00:00Z",
+      _links: {self: {href: "\($u)/rulesets/\(.id)"}},
+      rules: [(.rules // [])[] | if .type == "pull_request"
+                then .parameters = ({allowed_merge_methods: ["merge", "squash", "rebase"]} + (.parameters // {}))
+                else . end]}'
+  local check_rs='def bad: (if (.name // "") == "" then "Name can'"'"'t be blank" else empty end),
+      ([(.rules // [])[].type | select(IN($types[]) | not)] | if length > 0 then "Invalid rule \(.[0])" else empty end),
+      (.enforcement // "active" | if IN("active", "disabled", "evaluate") then empty else "Invalid enforcement" end);
+    [bad][0] // empty'
+  case "$method $path" in
+    "GET branches/"*/protection|"PUT branches/"*/protection)
+      b="${path#branches/}"; b="${b%/protection}"
+      [ -n "${FAKE_GH_GIT:-}" ] && git -C "$FAKE_GH_GIT" show-ref --verify -q "refs/heads/$b" || http_err 404 "Branch not found"
+      if [ "$method" = PUT ]; then
+        local miss
+        miss="$(jq -r '["required_status_checks", "enforce_admins", "required_pull_request_reviews", "restrictions"][]
+                       as $k | select(has($k) | not)' <<<"$body" | head -n1)"
+        [ -z "$miss" ] || http_err 422 "Invalid request. \"$miss\" wasn't supplied."
+        smutate '.protection[$b] = $p' --arg b "$b" --argjson p "$body"
+      fi
+      jq -e --arg b "$b" '.protection[$b] != null' "$FAKE_GH_SETTINGS" >/dev/null || http_err 404 "Branch not protected"
+      out="$(jq --arg b "$b" --arg u "$url" ".protection[\$b] | $render_prot" "$FAKE_GH_SETTINGS")" ;;
+    "GET rulesets")
+      out="$(jq --arg r "$REPO" '[.rulesets[] | {id, name, target, source_type: "Repository", source: $r, enforcement}]' "$FAKE_GH_SETTINGS")" ;;
+    "POST rulesets")
+      b="$(jq -r --argjson types "$RULE_TYPES" "$check_rs" <<<"$body")"
+      [ -z "$b" ] || http_err 422 "Validation Failed: $b"
+      jq -e --argjson x "$body" 'any(.rulesets[]; .name == $x.name)' "$FAKE_GH_SETTINGS" >/dev/null &&
+        http_err 422 "Validation Failed: Name must be unique"
+      smutate '.next_id = ((.next_id // 1) + 1) | .rulesets += [{id: (.next_id - 1)} + ($x | del(.id))]' --argjson x "$body"
+      id="$(jq '.next_id - 1' "$FAKE_GH_SETTINGS")"
+      out="$(jq --argjson id "$id" --arg r "$REPO" --arg u "$url" ".rulesets[] | select(.id == \$id) | $render_rs" "$FAKE_GH_SETTINGS")" ;;
+    "GET rulesets/"*|"PUT rulesets/"*)
+      id="${path#rulesets/}"
+      [[ "$id" =~ ^[0-9]+$ ]] && jq -e --argjson id "$id" 'any(.rulesets[]; .id == $id)' "$FAKE_GH_SETTINGS" >/dev/null ||
+        http_err 404 "Not Found"
+      if [ "$method" = PUT ]; then
+        b="$(jq -r --argjson types "$RULE_TYPES" "$check_rs" <<<"$(jq -c --argjson id "$id" --argjson x "$body" \
+              '.rulesets[] | select(.id == $id) | . + $x' "$FAKE_GH_SETTINGS")")"
+        [ -z "$b" ] || http_err 422 "Validation Failed: $b"
+        jq -e --argjson id "$id" --argjson x "$body" 'any(.rulesets[]; .id != $id and .name == ($x.name // null))' \
+          "$FAKE_GH_SETTINGS" >/dev/null && http_err 422 "Validation Failed: Name must be unique"
+        smutate '(.rulesets[] | select(.id == $id)) |= (. + ($x | del(.id)))' --argjson id "$id" --argjson x "$body"
+      fi
+      out="$(jq --argjson id "$id" --arg r "$REPO" --arg u "$url" ".rulesets[] | select(.id == \$id) | $render_rs" "$FAKE_GH_SETTINGS")" ;;
     *) http_err 404 "Not Found" ;;
   esac
   if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi

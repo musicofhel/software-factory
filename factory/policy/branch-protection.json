@@ -1,30 +1,52 @@
 {
-  "_comment": "Branch rules as code for `main`. Applied by factory/bin/apply-branch-protection.sh (repo admin, once; re-run after any change here). Admin bypass OFF for everyone, org owners included.",
+  "_comment": "Branch rules as code for `main`, applied by factory/bin/apply-branch-protection.sh (repo admin; dry-run by default, --apply writes, a second run is a no-op; re-run after any change here). Only real GitHub REST fields live here: `protection` is the body of PUT repos/{r}/branches/{branch}/protection and each `rulesets` entry is the body of POST/PUT repos/{r}/rulesets (keys starting with `_` are stripped). A rule GitHub cannot express is listed under `unexpressed`, printed on every run, and never silently dropped. Admin bypass OFF for everyone, org owners included.",
   "branch": "main",
-  "required_status_checks": {
-    "strict": true,
-    "contexts": ["gates / build-test", "gates / rails-proof", "gates / scope", "gates / tamper", "gates / dependencies", "gates / attest-verify", "gates / commit-check"]
+  "protection": {
+    "required_status_checks": {
+      "strict": true,
+      "contexts": ["gates / build-test", "gates / rails-proof", "gates / scope", "gates / tamper", "gates / dependencies", "gates / attest-verify", "gates / commit-check"]
+    },
+    "enforce_admins": true,
+    "required_pull_request_reviews": {
+      "dismiss_stale_reviews": true,
+      "require_code_owner_reviews": true,
+      "required_approving_review_count": 1
+    },
+    "restrictions": null,
+    "allow_force_pushes": false,
+    "allow_deletions": false,
+    "required_linear_history": false,
+    "lock_branch": false
   },
-  "enforce_admins": true,
-  "required_pull_request_reviews": {
-    "dismiss_stale_reviews": true,
-    "require_code_owner_reviews": true,
-    "required_approving_review_count": 1
-  },
-  "restrictions": null,
-  "allow_force_pushes": false,
-  "allow_deletions": false,
-  "required_linear_history": false,
-  "lock_branch": false,
-  "merge_queue": { "required": true, "merge_method": "merge", "max_entries_to_build": 1 },
   "rulesets": [
     {
-      "name": "halt-removal-needs-two",
-      "_comment": "Deleting factory/HALT needs two approvals; adding it needs zero. Expressed as a ruleset with a file-path condition on deletion.",
-      "target": "branch", "enforcement": "active",
+      "name": "main-merge-queue",
+      "_comment": "The merge queue is a ruleset rule; the classic protection endpoint has no field for it. One entry built at a time, merge commits. The four parameters the old file did not name are GitHub's UI defaults.",
+      "target": "branch",
+      "enforcement": "active",
+      "bypass_actors": [],
       "conditions": { "ref_name": { "include": ["refs/heads/main"], "exclude": [] } },
-      "rules": [{ "type": "pull_request", "parameters": { "required_approving_review_count": 2, "require_code_owner_review": true } }],
-      "path_filter": { "paths": ["factory/HALT"], "on": "deletion" }
+      "rules": [
+        {
+          "type": "merge_queue",
+          "parameters": {
+            "merge_method": "MERGE",
+            "max_entries_to_build": 1,
+            "max_entries_to_merge": 1,
+            "min_entries_to_merge": 1,
+            "min_entries_to_merge_wait_minutes": 5,
+            "grouping_strategy": "ALLGREEN",
+            "check_response_timeout_minutes": 60
+          }
+        }
+      ]
+    }
+  ],
+  "unexpressed": [
+    {
+      "rule": "factory/HALT: zero approvals to add, two to remove",
+      "why": "GitHub has no rule keyed on file deletion. Ruleset `required_reviewers` (file_patterns + minimum_approvals) needs a Team reviewer, so it is unavailable on this user-owned repo, and it would gate adding HALT as much as removing it. Until decided, HALT follows the CODEOWNERS rule: one code-owner approval to add and to remove.",
+      "adr": "docs/adr/0004-halt-two-person-rule.md"
     }
   ]
 }

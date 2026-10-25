@@ -2,7 +2,8 @@
 # Test harness for the fake gh (tests/fakes/gh). Sourced by tests/test_*.sh, never executed.
 #
 #   fakegh_setup                 fresh temp world: a bare origin with `main` and `nodes`, an empty
-#                                issue store, a call log, the fake first on PATH, the clock unpinned
+#                                issue store, an empty settings store (no protection, no rulesets),
+#                                a call log, the fakes (gh, curl) first on PATH, the clock unpinned
 #   fakegh_issue <n> <created-epoch> <labels,csv> [title]
 #   fakegh_lock <n> <handle> <commit-epoch> [run_id] [slots]
 #                                a lock ref as another node would leave it (same commit shape as
@@ -25,9 +26,10 @@ fakegh_setup() {
   # shellcheck disable=SC2064  # expand now: WORLD is per case
   trap "rm -rf '$WORLD'" EXIT
   export FAKE_GH_GIT="$WORLD/origin.git" FAKE_GH_ISSUES="$WORLD/issues.json" FAKE_GH_LOG="$WORLD/gh.log"
+  export FAKE_GH_SETTINGS="$WORLD/settings.json" FAKE_CURL_LOG="$WORLD/curl.log"
   export FAKE_GH_REPO=test/repo FACTORY_REPO=test/repo FAKE_GH_USER=fake-user
   export PATH="$FAKES_DIR:$PATH"
-  unset FAKE_GH_NOW FAKE_GH_FAIL FAKE_GH_RACE_REFS FACTORY_NOW FACTORY_HANDLE FACTORY_SLOTS \
+  unset FAKE_GH_NOW FAKE_GH_FAIL FAKE_GH_RACE_REFS FAKE_CURL_FAIL DISCORD_WEBHOOK SUMMONER_TO GITHUB_EVENT_PATH FACTORY_NOW FACTORY_HANDLE FACTORY_SLOTS \
         FACTORY_RUN_ID FACTORY_MANIFEST FACTORY_CAPACITY
   git init -q --bare "$FAKE_GH_GIT"
   local blob tree commit
@@ -38,7 +40,9 @@ fakegh_setup() {
   commit="$(_fakegh_commit "$tree" 1761300000 'nodes: registry' )"
   git -C "$FAKE_GH_GIT" update-ref refs/heads/nodes "$commit"
   printf '{"labels":["ready","needs-desk","in-progress","w:light","w:heavy","tier:0","tier:1"],"issues":[]}\n' >"$FAKE_GH_ISSUES"
+  printf '{"protection":{},"rulesets":[],"next_id":1}\n' >"$FAKE_GH_SETTINGS"
   : >"$FAKE_GH_LOG"
+  : >"$FAKE_CURL_LOG"
 }
 
 _fakegh_commit() {  # _fakegh_commit <tree> <epoch> <message> [parent]
