@@ -52,6 +52,7 @@ iss() {  # iss <ticket-id> <jq>: the jq of the one Issue whose body has the line
   jq -c --arg l "Ticket: $1" "[.issues[] | select(.body | split(\"\n\") | index(\$l) != null)] | if length == 1 then .[0] | $2 else error(\"\(length) Issues for \(\$l)\") end" "$FAKE_GH_ISSUES"
 }
 labels() { iss "$1" '[.labels[].name] | sort'; }
+body() { iss "$1" .body | jq -r .; }   # the raw body text (iss prints JSON)
 writes() { fakegh_calls "$WRITES"; }
 has() { [[ "$1" == *"$2"* ]] || { printf '      [%s] lacks [%s]\n' "$1" "$2"; return 1; }; }
 lacks() { [[ "$1" != *"$2"* ]] || { printf '      [%s] has [%s]\n' "$1" "$2"; return 1; }; }
@@ -71,8 +72,8 @@ case_creates() {
   check "T1: title from the store" eq "$(iss T1 .title)" '"Claim protocol"'
   check "T1: labels w:light tier:1 ready" eq "$(labels T1)" '["ready","tier:1","w:light"]'
   check "T2: labels w:heavy tier:0 ready" eq "$(labels T2)" '["ready","tier:0","w:heavy"]'
-  check "T1: body carries the ticket id line and the ticket body" \
-    eval 'has "$(iss T1 .body)" $'"'"'\nTicket: T1\n'"'"' && has "$(iss T1 .body)" "Build claim.sh."'
+  check "T1: body carries the ticket id line" has "$(body T1)" $'\nTicket: T1\n'
+  check "T1: body carries the ticket body" has "$(body T1)" "Build claim.sh."
   check "created by gh issue create, two calls, labels passed at creation" \
     eq "$(fakegh_calls '.[0] == "issue" and .[1] == "create" and (index("--label") != null)')" 2
   check "the missing labels were created first" \
@@ -97,21 +98,23 @@ case_updates_idempotent() {
   check "second run: no write call at all" eq "$(writes)" "$before"
   check "second run: every ticket unchanged" eq "$(lines '.action == "unchanged" and .result == "unchanged"')" 2
   local n1; n1="$(iss T1 .number)"
-  # A claim adds in-progress (claim.sh owns it); a human edits the body; the desk edits T1.
+  # A claim adds in-progress (claim.sh owns it); a human rewrites T2's body (marker gone, Ticket
+  # line kept); the desk edits T1.
   gh issue edit "$n1" --repo test/repo --add-label in-progress >/dev/null
-  gh issue edit "$(iss T2 .number)" --repo test/repo --body "hand-edited" >/dev/null
+  gh issue edit "$(iss T2 .number)" --repo test/repo --body $'Ticket: T2\n\nhand-edited' >/dev/null
   set_ticket T1 '.title = "Claim protocol v2" | .body = "weight: heavy\ntier: 1\ncharter: C1\n\nBuild claim.sh and heartbeat.sh."'
   : >"$FAKE_GH_LOG"
   mir --apply
   check "third run exit 0" eq "$RC" 0
   check "the same Issue is updated, not a new one" eq "$(jq '.issues | length' "$FAKE_GH_ISSUES")" 2
   check "T1 title updated" eq "$(iss T1 .title)" '"Claim protocol v2"'
-  check "T1 body updated" eval 'has "$(iss T1 .body)" "heartbeat.sh"'
+  check "T1 body updated" has "$(body T1)" "heartbeat.sh"
   check "w:light swapped for w:heavy, in-progress kept" eq "$(labels T1)" '["in-progress","ready","tier:1","w:heavy"]'
   check "T1 line names exactly the diff" \
     eq "$(jq -sc '.[] | select(.ticket == "T1") | [.action, .add, .remove, .title_changed, .body_changed]' <<<"$OUT")" \
        '["update",["w:heavy"],["w:light"],true,true]'
-  check "T2: the hand edit is overwritten from the store" eval 'has "$(iss T2 .body)" "Build halt." && lacks "$(iss T2 .body)" "hand-edited"'
+  check "T2: the hand edit is overwritten from the store" eval 'has "$(body T2)" "Build halt." && lacks "$(body T2)" "hand-edited"'
+  check "T2: the marker is back" has "$(body T2)" "<!-- factory-mirror:"
   check "T2: body only (labels untouched)" \
     eq "$(jq -sc '.[] | select(.ticket == "T2") | [.action, .add, .remove, .title_changed, .body_changed]' <<<"$OUT")" \
        '["update",[],[],false,true]'
@@ -119,6 +122,19 @@ case_updates_idempotent() {
   before="$(writes)"
   mir --apply
   check "fourth run: nothing left to write" eq "$(writes)" "$before"
+  # A web-UI save stores CRLF line ends and a trailing newline; the text is the same, so no write.
+  local tmp; tmp="$(mktemp)"
+  jq --argjson n "$n1" '(.issues[] | select(.number == $n)).body |= (gsub("\n"; "\r\n") + "\r\n")' "$FAKE_GH_ISSUES" >"$tmp" && mv "$tmp" "$FAKE_GH_ISSUES"
+  mir --apply
+  check "a CRLF copy of the same body: unchanged, no write" eval '[ "$(writes)" = "$before" ] && [ "$(lines '"'"'.ticket == "T1" and .action == "unchanged"'"'"')" = 1 ]'
+  # A body wiped of its Ticket line can no longer be matched: a fresh Issue, the old one an orphan.
+  local n2; n2="$(iss T2 .number)"
+  gh issue edit "$n2" --repo test/repo --body "wiped" >/dev/null
+  mir --apply
+  check "wiped Ticket line: exit 0" eq "$RC" 0
+  check "wiped Ticket line: T2 gets a new Issue" eval '[ "$(iss T2 .number)" != "$n2" ]'
+  check "wiped Ticket line: the old Issue is reported as an orphan and kept" \
+    eq "$(jq -sc '[.[] | select(.action == "orphan") | [.issue, .result]]' <<<"$OUT")" "[[$n2,\"kept\"]]"
 }
 
 case_ready_only_when_gated() {
@@ -133,6 +149,7 @@ case_ready_only_when_gated() {
   ticket T8 "prompt-only coldstart, clean" "$HDR"
   ticket T9 "sequenced behind T1" "$HDR"
   ticket T10 "wave 2" "$HDR"
+  ticket T11 "merge-forecast record is a failure" "$HDR"
   gated T1
   record '{"gate":"coldstart","ticket":"T2","data":{"cache":{"ticketHash":"hash-T2","gaps":[]}}}'
   record '{"gate":"merge-forecast","ticket":"T2","data":{}}'
@@ -146,16 +163,17 @@ case_ready_only_when_gated() {
   record '{"gate":"coldstart","ticket":"T8","data":{"verdict":"{\"gaps\":[],\"ticketHash\":\"hash-T8\"}"}}'
   record '{"gate":"merge-forecast","ticket":"T8","data":{}}'
   gated T9; gated T10
+  gated T11; record '{"gate":"merge-forecast","ticket":"T11","data":{"verified":false}}'
   record '{"gate":"spec-lint","ticket":"T1-other","data":{"verified":false}}'
-  export FAKE_ADLC_FORECAST='{"waves":[["T1","T2","T3","T4","T5","T6","T7","T8","T9"],["T10"]],
-    "mergeOrder":["T1","T2","T3","T4","T5","T6","T7","T8","T9","T10"],
+  export FAKE_ADLC_FORECAST='{"waves":[["T1","T2","T3","T4","T5","T6","T7","T8","T9","T11"],["T10"]],
+    "mergeOrder":["T1","T2","T3","T4","T5","T6","T7","T8","T9","T11","T10"],
     "pairs":[{"a":"T1","b":"T9","verdict":"SEQUENCE","hardVeto":true},{"a":"T2","b":"T3","verdict":"PARALLEL","hardVeto":false}],
     "gateFailures":[],"certifiedWidth":8}'
   mir --apply
   check "exit 0" eq "$RC" 0
   local t want
   for t in T1 T8; do check "$t ready" eq "$(labels "$t")" '["ready","tier:1","w:light"]'; done
-  for t in T2 T3 T4 T5 T7 T9 T10; do check "$t needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'; done
+  for t in T2 T3 T4 T5 T7 T9 T10 T11; do check "$t needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'; done
   check "T6: needs-desk and no w:/tier: label from an invalid header" eq "$(labels T6)" '["needs-desk"]'
   reasons() { jq -sc --arg t "$1" '.[] | select(.ticket == $t) | .reasons' <<<"$OUT"; }
   check "T2 reason" eq "$(reasons T2)" '["spec-lint: no record"]'
@@ -167,7 +185,8 @@ case_ready_only_when_gated() {
   check "T7: the latest spec-lint record counts" eq "$(reasons T7)" '["spec-lint: the latest record is not a verified pass"]'
   check "T9 reason" eq "$(reasons T9)" '["merge-forecast: sequenced behind T1 in wave 1"]'
   check "T10 reason" eq "$(reasons T10)" '["merge-forecast: in wave 2, not wave 1"]'
-  check "the Issue body shows the verdict and reasons" eval 'has "$(iss T3 .body)" $'"'"'Gate: needs-desk\n- coldstart: 1 unresolved gap(s)'"'"''
+  check "T11: the latest merge-forecast record counts" eq "$(reasons T11)" '["merge-forecast: the latest record is a failure"]'
+  check "the Issue body shows the verdict and reasons" has "$(body T3)" $'Gate: needs-desk\n- coldstart: 1 unresolved gap(s)'
   # The gate turns: T2 gets its spec-lint pass, T1 regresses. Labels swap; in-progress stays.
   gh issue edit "$(iss T1 .number)" --repo test/repo --add-label in-progress >/dev/null
   record '{"gate":"spec-lint","ticket":"T2","data":{"verified":true}}'
@@ -345,6 +364,7 @@ case_refuses_apply() {
 }
 
 case_workflow() {
+  # shellcheck disable=SC2034  # wf is read inside the eval strings passed to check
   local wf="$REPO_ROOT/.github/workflows/mirror.yml"
   check "mirror.yml passes --apply (the script is dry-run by default)" eval 'grep -q "mode=--apply" "$wf" && grep -q "./factory/bin/mirror.sh \"\$mode\"" "$wf"'
   check "mirror.yml keeps the shared concurrency group mirror" eval 'grep -Eq "^  group: mirror$" "$wf"'
@@ -380,8 +400,8 @@ case_fake_semantics() {
   ticket T1 "one" "$HDR" "T2"; ticket T2 "two" "$HDR"
   check "adlc ticket list: id, title, ticketHash" eq "$(adlc ticket list --json | jq -c '.[0]')" '{"id":"T1","title":"one"}'
   check "adlc ticket show: the ticket and its hash" eq "$(adlc ticket show T1 --json | jq -c '[.ticket.id, .ticket.edges, .ticketHash]')" '["T1",[{"to":"T2"}],"hash-T1"]'
-  check "adlc ticket show: unknown id exits 2 with TICKET_NOT_FOUND" \
-    eval '[ "$(adlc ticket show T9 --json | jq -r .code; echo "${PIPESTATUS[0]}")" = $'"'"'TICKET_NOT_FOUND\n2'"'"' ]'
+  check "adlc ticket show: unknown id exits 2, TICKET_NOT_FOUND on stderr, stdout empty" \
+    eval '[ "$(adlc ticket show T9 --json 2>&1 >/dev/null | jq -r .code; echo "${PIPESTATUS[0]}")" = $'"'"'TICKET_NOT_FOUND\n2'"'"' ] && [ -z "$(adlc ticket show T9 --json 2>/dev/null)" ]'
   record '{"type":"p5-finding-verified","ticket":"T1","finding":{"id":"F"}}'
   record '{"gate":"spec-lint","ticket":"T2","data":{"verified":true}}'
   check "adlc gate-manifest show --ticket filters, gate = type" \

@@ -139,7 +139,10 @@ while IFS=$'\t' read -r id commit pr; do
   if ! valid_ticket_id "$id"; then skip invalid "not a ticket id"; continue; fi
   rc=0
   "${ADLC[@]}" ticket show "$id" --json >"$WORK/show.json" 2>"$WORK/show.err" || rc=$?
-  if [ "$rc" = 2 ] && jq -e '.code == "TICKET_NOT_FOUND"' "$WORK/show.json" >/dev/null 2>&1; then
+  # adlc 1.12.0 prints the TICKET_NOT_FOUND error object on stderr (stdout is empty); read both,
+  # one JSON document per line, ignoring any other text (npx notices).
+  if [ "$rc" = 2 ] && command cat "$WORK/show.json" "$WORK/show.err" |
+       jq -Rne '[inputs | fromjson? | objects | .code] | index("TICKET_NOT_FOUND") != null' >/dev/null 2>&1; then
     skip unknown "the ticket store has no ticket $id"; continue
   fi
   [ "$rc" = 0 ] || die "adlc ticket show $id failed (exit $rc): $(tail -n1 "$WORK/show.err")"

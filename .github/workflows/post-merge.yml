@@ -7,6 +7,10 @@ name: post-merge
 on:
   push:
     branches: [main]
+# One run at a time; a newer push replaces a pending run. Each run checks out main as it is when
+# the job starts (not the pushed sha), so it sees the previous run's completion commit and covers
+# every merge since the marker in factory/ledger/post-merge.json; a merge that lands mid-run makes
+# its push non-fast-forward (exit 1) and that merge's own run picks the range up.
 concurrency:
   group: post-merge
   cancel-in-progress: false
@@ -22,7 +26,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with: { ref: main, fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - name: adlc ticket complete --write for every ticket the merged PRs carried; append ledger

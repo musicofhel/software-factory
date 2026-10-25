@@ -26,11 +26,14 @@
 #   merge-forecast  the ticket has a merge-forecast record that is not a failure, and the forecast
 #                   certifies it now: no forecast gateFailures, the ticket is in wave 1, and no
 #                   SEQUENCE pair puts it behind a wave-1 ticket earlier in mergeOrder
-# Other labels (in-progress, ...) are never touched. An Issue is the mirror's only when its body has
-# the marker and its author is in MIRROR_AUTHORS; a human's Issue is never adopted. A bot outside
-# MIRROR_AUTHORS carrying the marker is a conflict (MIRROR_AUTHORS is probably wrong) and no Issue
-# is created for its ticket, so a misconfiguration cannot mint a duplicate every run. Of two mirror
-# Issues for one ticket the lower number is kept and the other reported.
+# Other labels (in-progress, ...) are never touched. An Issue is the mirror's when its author is in
+# MIRROR_AUTHORS and its body has a `Ticket: <id>` line (the first one counts); the marker line is a
+# notice for humans, not proof, so a hand edit that keeps the Ticket line is overwritten on the next
+# run, while a mirror Issue wiped of its Ticket line is reported as an orphan and a fresh Issue is
+# created. A human's Issue is never adopted. A bot outside MIRROR_AUTHORS carrying the marker is a
+# conflict (MIRROR_AUTHORS is probably wrong) and no Issue is created for its ticket, so a
+# misconfiguration cannot mint a duplicate every run. Of two mirror Issues for one ticket the lower
+# number is kept and the other reported.
 #
 # --dry-run (the default) writes nothing. Both modes print one JSON line per action on stdout:
 #   {"mode", "action": label-create|create|update|reopen|close|unchanged|conflict|orphan, "ticket",
@@ -48,7 +51,7 @@ PROG=mirror
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 forecast="" repo=""
 while [ $# -gt 0 ]; do
@@ -190,7 +193,7 @@ def record_reasons($t):
 [ $I[] | (.body // "") as $b
   | . + {tid: ([$b | lines | .[] | (capture("^Ticket:[ \t]*(?<id>[^ \t]+)[ \t]*$") | .id)?] | first),
          labels: [.labels[].name], marked: ($b | contains($marker))} ] as $issues
-| [$issues[] | select(.marked and (.author.login | IN($authors[])))] as $mine
+| [$issues[] | select(.author.login | IN($authors[]))] as $mine
 | [$issues[] | select(.marked and (.author.login | IN($authors[]) | not) and .author.is_bot == true)] as $impostors
 | ($T | map(.id)) as $ids
 
