@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Fake `fleet` (@adlc/cli 1.12.0 `fleet`) for offline tests; run.sh calls it through FACTORY_FLEET.
+# Records every call as one JSON object {cwd, argv, dead_end} in $FAKE_FLEET_LOG (required; dead_end
+# is the content of --dead-end-file, or null) and copies the real CLI's shapes without building
+# anything:
+#   run [options]       only the options `adlc fleet run --help` lists at 1.12.0 (records/TB0.md §3
+#                       of specs/factory-step2-v1); any other → "fleet: unknown option" and exit 1.
+#                       Checked as fleet checks them: --max-strikes an integer 1..50,
+#                       --wall-clock-minutes a positive number, --pre-strike-argv a JSON array whose
+#                       argv[0] is absolute, --pre-strike-env a JSON object without
+#                       ADLC_MANIFEST_KEY, --base a revision of the repository in the cwd. A bad one
+#                       → exit 1, reason "preflight".
+#   The outcome is the next word of $FAKE_FLEET_REASONS (a space-separated queue; the position is
+#   kept in $FAKE_FLEET_LOG.n), else $FAKE_FLEET_REASON, else `success`:
+#     success           integration branch fleet/run-<id> = a --no-ff merge of the worker branch;
+#                       exit 0, reason null, merged 1
+#     nomerge           exit 0, reason null, merged 0, integrationBranch null
+#     garbage           not JSON on stdout, exit 1
+#     <reason>          a ticket reason (quota-paused, wall-clock, strikes-exhausted, flail,
+#                       review-unavailable, lock-held, ticket-blocked, mirror-fetch-failed): exit 2,
+#                       the worker branch is kept; any other word is a run-level reason: exit 1
+#   Every call (except garbage) leaves the worker branch fleet/<lowercased id> one commit ahead of
+#   where it was (cut from --base the first time) adding $FAKE_FLEET_FILE (default hello.sh) with
+#   $FAKE_FLEET_CONTENT, appends `.worktrees/` to the cwd's .gitignore as fleet does (a dirty tree),
+#   keeps strikes across calls in .adlc/fleet-status.json (the resume reconciliation) and writes
+#   $FAKE_FLEET_TRANSCRIPT to .adlc/fleet-logs/<id>.log. The transcript text is also put where real
+#   fleet puts free text (tickets[id].reason, warnings[], results) so a caller that forwards those
+#   fields is caught. $FAKE_FLEET_STRIKES strikes are consumed per call (default 1).
+# The JSON document has resultDocument's keys (@adlc/fleet lib/result.mjs at 1.12.0).
+set -euo pipefail
+: "${FAKE_FLEET_LOG:?fake fleet needs FAKE_FLEET_LOG}"
+argv="$(printf '%s\0' "$@" | jq -Rsc 'split("\u0000")[:-1]')"
+dead=""
+prev=""
+for a in "$@"; do [ "$prev" = --dead-end-file ] && dead="$a"; prev="$a"; done
+if [ -n "$dead" ] && [ -f "$dead" ]; then
+  jq -cn --arg cwd "$PWD" --argjson argv "$argv" --rawfile d "$dead" '{cwd: $cwd, argv: $argv, dead_end: $d}' >>"$FAKE_FLEET_LOG"
+else
+  jq -cn --arg cwd "$PWD" --argjson argv "$argv" '{cwd: $cwd, argv: $argv, dead_end: null}' >>"$FAKE_FLEET_LOG"
+fi
+
+[ "${1:-}" = run ] || { echo "fleet: unknown command '${1:-}'" >&2; exit 1; }
+shift
+pre() { jq -cn --arg r "$1" '{fleetRunId: null, exitCode: 1, reason: "preflight", integrationBranch: null, merged: 0,
+         results: {}, strikes: {}, strikesConsumed: 0, review: null, tickets: {}, readPolicy: "host", privateTmp: false,
+         gitSource: "shared", mirror: null, egress: "open", egressAllowlist: [], homeBinds: [], writableRoots: [],
+         warnings: [$r]}'; echo "fleet: $1" >&2; exit 1; }
+tickets="" base=main max=2 json=0 psa="" pse='{}' wall=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run|--json|--i-am-in-a-disposable-container|--no-pr|--no-complete)
+      [ "$1" != --json ] || json=1 ;;
+    --concurrency|--tickets|--base|--adapter|--model|--model-auth-key|--adapter-command|--adapter-args|\
+    --dead-end-file|--max-strikes|--wall-clock-minutes|--charter-file|--pre-strike-argv|--pre-strike-env|\
+    --model-plane-read|--model-plane-read-only|--model-plane-git|--model-plane-git-mirror|--model-plane-egress|\
+    --worker-deps|--model-plane-writable)
+      [ $# -ge 2 ] || pre "option '$1' argument missing"
+      case "$1" in
+        --tickets) tickets="$2" ;;
+        --base) base="$2" ;;
+        --max-strikes) max="$2" ;;
+        --wall-clock-minutes) wall="$2" ;;
+        --pre-strike-argv) psa="$2" ;;
+        --pre-strike-env) pse="$2" ;;
+      esac
+      shift ;;
+    *) echo "fleet: unknown option '$1'" >&2; exit 1 ;;
+  esac
+  shift
+done
+[ "$json" = 1 ] || { echo "fake fleet: only --json output is emulated" >&2; exit 1; }
+[[ "$max" =~ ^[0-9]+$ ]] && [ "$max" -ge 1 ] && [ "$max" -le 50 ] || pre "--max-strikes must be an integer 1..50"
+[ -z "$wall" ] || [[ "$wall" =~ ^[0-9]+(\.[0-9]+)?$ && "$wall" != 0 ]] || pre "--wall-clock-minutes must be a positive number"
+if [ -n "$psa" ]; then
+  jq -e 'type == "array" and length >= 1 and all(.[]; type == "string") and (.[0] | startswith("/"))' <<<"$psa" >/dev/null 2>&1 ||
+    pre "--pre-strike-argv must be a JSON array of strings whose argv[0] is absolute"
+  jq -e 'type == "object" and all(.[]; type == "string") and (has("ADLC_MANIFEST_KEY") | not)' <<<"$pse" >/dev/null 2>&1 ||
+    pre "--pre-strike-env must be a JSON object of strings without ADLC_MANIFEST_KEY"
+fi
+[[ "$tickets" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || pre "this fake takes exactly one --tickets id"
+base_sha="$(git rev-parse -q --verify "$base^{commit}")" || pre "base '$base' is not a revision"
+
+# the outcome
+n=0
+[ ! -f "$FAKE_FLEET_LOG.n" ] || n="$(command cat "$FAKE_FLEET_LOG.n")"
+echo $((n + 1)) >"$FAKE_FLEET_LOG.n"
+read -r -a queue <<<"${FAKE_FLEET_REASONS:-}"
+if [ "${#queue[@]}" -gt "$n" ]; then outcome="${queue[$n]}"; else outcome="${FAKE_FLEET_REASON:-success}"; fi
+[ "$outcome" != garbage ] || { echo "fleet: this is not json"; exit 1; }
+
+export GIT_AUTHOR_NAME=fleet GIT_AUTHOR_EMAIL=fleet@fake GIT_COMMITTER_NAME=fleet GIT_COMMITTER_EMAIL=fleet@fake
+id="$tickets" lid="$(tr '[:upper:]' '[:lower:]' <<<"$tickets")"
+run_id="fake-$((n + 1))"
+transcript="${FAKE_FLEET_TRANSCRIPT:-fake transcript}"
+mkdir -p .adlc/fleet-logs
+printf '%s\n' "$transcript" >>".adlc/fleet-logs/$id.log"
+grep -qxF .worktrees/ .gitignore 2>/dev/null || printf '.worktrees/\n' >>.gitignore
+
+status=.adlc/fleet-status.json
+prior=0
+[ ! -f "$status" ] || prior="$(jq -r --arg id "$id" '.tickets[$id].strikes // 0' "$status")"
+strikes=$((prior + ${FAKE_FLEET_STRIKES:-1}))
+
+worker="refs/heads/fleet/$lid"
+parent="$(git rev-parse -q --verify "$worker" || echo "$base_sha")"
+blob="$(printf '%s\n' "${FAKE_FLEET_CONTENT:-echo hello}" | git hash-object -w --stdin)"
+idx="$(mktemp)"
+GIT_INDEX_FILE="$idx" git read-tree "$parent"
+GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "100755,$blob,${FAKE_FLEET_FILE:-hello.sh}"
+tree="$(GIT_INDEX_FILE="$idx" git write-tree)"
+rm -f "$idx"
+wsha="$(git commit-tree "$tree" -p "$parent" -m "feat($id): fleet worker build")"
+git update-ref "$worker" "$wsha"
+
+state=failed ec=2 reason="$outcome" ib=null merged=0 code="$outcome"
+case "$outcome" in
+  success)
+    isha="$(git commit-tree "$tree" -p "$base_sha" -p "$wsha" -m "Merge branch 'fleet/$lid' into fleet/run-$run_id")"
+    git update-ref "refs/heads/fleet/run-$run_id" "$isha"
+    state=merged ec=0 reason=null ib="\"fleet/run-$run_id\"" merged=1 code=null ;;
+  nomerge) state=merged ec=0 reason=null code=null ;;
+  quota-paused|wall-clock) state=paused ;;
+  strikes-exhausted|flail|review-unavailable|mirror-fetch-failed|lock-held) state=failed ;;
+  ticket-blocked) state=blocked ;;
+  *) ec=1 ;;
+esac
+jq -cn --arg id "$id" --arg st "$state" --argjson s "$strikes" '{tickets: {($id): {state: $st, strikes: $s}}}' >"$status"
+jq -cn --arg run "$run_id" --argjson ec "$ec" --arg r "$reason" --argjson ib "$ib" --argjson m "$merged" \
+       --arg id "$id" --arg st "$state" --argjson s "$strikes" --arg code "$code" --arg t "$transcript" \
+       --argjson consumed "${FAKE_FLEET_STRIKES:-1}" '
+  {fleetRunId: $run, exitCode: $ec, reason: (if $r == "null" then null else $r end), integrationBranch: $ib,
+   merged: $m, results: {($id): {output: $t}}, strikes: {($id): $s}, strikesConsumed: $consumed, review: null,
+   tickets: {($id): {state: $st, strikes: $s, reason: (if $st == "merged" then null else $t end),
+                     reasonCode: (if $code == "null" then null else $code end), review: null}},
+   readPolicy: "host", privateTmp: false, gitSource: "shared", mirror: null, egress: "allowlist",
+   egressAllowlist: ["api.anthropic.com:443"], homeBinds: [], writableRoots: [], warnings: [$t]}'
+exit "$ec"

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Fake `tamperguard` (0.2.0) for offline tests. Records every call as one JSON array of its argv in
+# $FAKE_TAMPERGUARD_LOG (required) and copies the real CLI's measured shapes (records/TB4.md of
+# specs/factory-step2-v1):
+#   [--range RANGE] [--json] [--no-color] [--fail-on tamper|review|never] [path]
+#                   RANGE must resolve in the cwd's repository (`git rev-list`), else an error and
+#                   exit 1. The verdict is $FAKE_TAMPERGUARD_VERDICT: ok (default), review, tamper,
+#                   or error (a traceback-like line on stderr, exit 1). --json prints
+#                   {verdict, score, findings: [{file, rule, severity, detail}]} pretty-printed as the
+#                   real one does; `detail` is $FAKE_TAMPERGUARD_DETAIL (the real one quotes the diff,
+#                   so a caller that forwards it leaks file text). Exit 2 when the verdict is at or
+#                   above --fail-on (default tamper), else 0.
+# There is no --version (as the real CLI): anything unknown exits 2 with argparse's message.
+set -euo pipefail
+: "${FAKE_TAMPERGUARD_LOG:?fake tamperguard needs FAKE_TAMPERGUARD_LOG}"
+for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc . >>"$FAKE_TAMPERGUARD_LOG"
+range="" json=0 fail_on=tamper path=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --range) range="${2:-}"; shift ;;
+    --json) json=1 ;;
+    --no-color) ;;
+    --fail-on) fail_on="${2:-}"; shift
+      case "$fail_on" in tamper|review|never) ;; *) echo "tamperguard: error: argument --fail-on: invalid choice: '$fail_on'" >&2; exit 2 ;; esac ;;
+    -*) echo "tamperguard: error: unrecognized arguments: $1" >&2; exit 2 ;;
+    *) path="$1" ;;
+  esac
+  shift
+done
+if [ -n "$range" ]; then
+  git rev-list "$range" >/dev/null 2>&1 || { echo "tamperguard: git diff failed for range $range" >&2; exit 1; }
+elif [ -n "$path" ]; then
+  [ -f "$path" ] || { echo "tamperguard: no such file: $path" >&2; exit 1; }
+fi
+verdict="${FAKE_TAMPERGUARD_VERDICT:-ok}"
+detail="${FAKE_TAMPERGUARD_DETAIL:-assertions replaced with a vacuous body: assert True}"
+case "$verdict" in
+  ok) score=0 findings='[]' ;;
+  review) score=4 findings="$(jq -cn --arg d "$detail" '[{file: "tests/test_a.py", rule: "assert_weakened", severity: "medium", detail: $d}]')" ;;
+  tamper) score=10 findings="$(jq -cn --arg d "$detail" '[{file: "tests/test_a.py", rule: "body_hollowed", severity: "high", detail: $d}]')" ;;
+  error) echo "Traceback (most recent call last): injected" >&2; exit 1 ;;
+  *) echo "fake tamperguard: unknown FAKE_TAMPERGUARD_VERDICT '$verdict'" >&2; exit 1 ;;
+esac
+if [ "$json" = 1 ]; then
+  jq -n --arg v "$verdict" --argjson s "$score" --argjson f "$findings" '{verdict: $v, score: $s, findings: $f}'
+else
+  printf '%s  score=%s\n' "$([ "$verdict" = ok ] && echo clean || echo "$verdict")" "$score"
+fi
+rank() { case "$1" in ok) echo 0 ;; review) echo 1 ;; tamper) echo 2 ;; never) echo 3 ;; esac; }
+[ "$(rank "$verdict")" -lt "$(rank "$fail_on")" ] || exit 2
+exit 0
