@@ -70,7 +70,7 @@ else is long-lived.
 
 | # | Step | Status |
 |---|---|---|
-| 1 | Clock + janitor, claim protocol, kill switch | **built locally, awaiting first push** (`specs/factory-step1-v1`) |
+| 1 | Clock + janitor, claim protocol, kill switch | **built and pushed; Aaron's kit lines open** (`specs/factory-step1-v1`) |
 | 2 | Join wizard and run loop (vetto, Ralon, dcg, cux) | **built locally, awaiting first join** (`specs/factory-step2-v1`) |
 | 3 | CI gates and merge queue with the `Depends-on:` hold | queued |
 | 4 | Rail author charter, prosecution CLI, verifier wrapper, summoner, digest | queued |

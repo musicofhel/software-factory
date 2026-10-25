@@ -178,10 +178,25 @@ check "fleet printed its --json result document" test -n "$(doc '.exitCode // em
 check "strikes <= 2" test "$(f '.fleet.strikes // 0')" -le 2
 check "fleet's wall clock held (run.sh took $elapsed s; 15 min + the loop's own steps)" test "$elapsed" -le 1200
 
-# The sandbox: fleet refuses to dispatch without one (preflight). Its policy echo must show the model
-# plane on the egress allowlist and the repo-command plane behind bwrap.
-check "fleet's model plane ran on the egress allowlist (adapter hosts only)" \
-  eq "$(doc '"\(.egress) \(.egressAllowlist | sort | join(","))"')" "allowlist api.anthropic.com:443,console.anthropic.com:443,platform.claude.com:443"
+# The sandbox: fleet refuses to dispatch without one (preflight). Once it dispatched, its policy echo
+# must show the bounded model plane with the git mirror on the egress allowlist. When it stopped
+# before any worker (a run-level reason from preflight or the flag checks), the echo is not
+# evidence: no worker ran, the loop built the mirror the bounded argv names, and fleet's own stderr
+# names the cause (a canary that bwrap refused is an enforced sandbox, never an open one).
+if [ "$(doc '.fleetRunId != null')" = true ]; then
+  check "fleet's model plane: bounded reads, the git mirror" eq "$(doc '"\(.readPolicy) \(.privateTmp) \(.gitSource)"')" "bounded true mirror"
+  check "fleet's model plane ran on the egress allowlist (adapter hosts only)" \
+    eq "$(doc '"\(.egress) \(.egressAllowlist | sort | join(","))"')" "allowlist api.anthropic.com:443,console.anthropic.com:443,platform.claude.com:443"
+else
+  cause="$(grep -hE '^(preflight failed|fleet:)' "$FH/run/logs/"*.fleet.err 2>/dev/null | head -n1 || true)"
+  info "fleet stopped before any worker: ${cause:-no cause on its stderr}"
+  check "fleet stopped before any worker: no run id, no strike consumed" eq "$(doc '"\(.fleetRunId) \(.strikesConsumed)"')" "null 0"
+  check "  the loop built the model-plane mirror its bounded argv names" eq "$(f '.actions | index("mirror") != null')" true
+  check "  fleet's stderr names the cause" test -n "$cause"
+  if grep -q 'canary' <<<"$cause"; then
+    check "  the canary failed INSIDE bwrap (enforced, not open)" grep -q 'bwrap: ' <<<"$cause"
+  fi
+fi
 check "fleet did not refuse its sandbox" eq "$(grep -ciE 'sandbox precondition|no sandbox backend' "$S/run.err" "$FH/run/logs/"*.fleet.err 2>/dev/null | awk -F: '{s += $NF} END {print s + 0}')" 0
 
 # ---- 6. the branch for the reason (ADR-0005 decision 11 and run.sh's header) --------------------------
