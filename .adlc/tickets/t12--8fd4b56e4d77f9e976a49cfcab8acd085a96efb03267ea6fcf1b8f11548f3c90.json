@@ -1,0 +1,32 @@
+{
+  "body": "weight: light\ntier: 1\ncharter: C5\n\nLand step-2 ruling Q1 (specs/factory-step2-v1/RULINGS.md): a temporary bwrap shim so fleet 1.12.0's preflight canary can run. Upstream issue https://github.com/voodootikigod/adlc/issues/1266: the canary (`bin/fleet.mjs`, `dispatchCanary`) runs `/bin/sh -c 'echo __fleet_canary_ok__'` in a bubblewrap sandbox that binds no system root, so `/bin/sh` is missing on every bubblewrap host and every `fleet run` stops at `preflight` (specs/factory-step2-v1/records/TB6.md section 3). The fix by hand: adding `--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64` makes the same call print `ok`.\n\nDeliverables:\n- `factory/bin/lib/bwrap-shim` (bash, `set -euo pipefail`, shellcheck clean). It finds the real bwrap by absolute path (never itself, never via the shim's own directory) and `exec`s it. It inserts `--ro-bind <p> <p>` for each member of fleet's own `SYSTEM_ROOTS` (`/usr`, `/lib`, `/lib64`, `/etc/ssl`, `/etc/resolv.conf`, `/etc/hosts`, from `@adlc/fleet` 1.12.0 `lib/bounded-model-plane.mjs`) that exists on the host and is not a symlink, plus `--symlink <target> <p>` for `/bin`, `/sbin`, `/lib`, `/lib64` when they are symlinks on the host (merged-usr). A path is skipped when the argv already binds `/` or that path. The inserted arguments go before fleet's own binds, so fleet's later binds still win.\n- Invariant I12 (specs/factory-step2-followups-v1/SPEC.md): the shim only adds `--ro-bind`/`--symlink` arguments; it never adds a writable bind, never adds or removes a network or namespace flag, never drops or reorders an argument fleet passed.\n- Invariant I13: the shim is active only while the pinned fleet is exactly `1.12.0`; any other pin makes it a pure pass-through (or run.sh does not install it). ADR-0006 names the removal steps.\n- `factory/bin/run.sh` puts the shim's directory first on the PATH it gives fleet only, never on the node's login PATH.\n- `docs/adr/0006-bwrap-shim-for-fleet-1-12-0.md`, status accepted under ruling Q1, citing #1266, with the I13 removal steps; `docs/adr/README.md` lists it.\n- `factory/bin/join.sh` (with `factory/bin/lib/probe.sh`) probes the shim's prerequisites (a real bwrap on PATH and the host paths the shim reads).\n- Fixtures: the four argv shapes fleet 1.12.0's real `buildSandboxArgv` (`lib/sandbox.mjs`) produces (the canary, the repo-command plane, the bounded model plane, the host read policy), captured by calling the real module with `node -e` and stored under `tests/fixtures/bwrap-shim/` with the capture command.\n\nAcceptance criteria:\n1. On each of the four fixture argv shapes, the shim's output argv minus the input argv contains only `--ro-bind`/`--symlink` triples, and the sets of write binds, network flags and namespace flags are identical before and after (I12). Verify: `make test` (tests/test_bwrap_shim.sh).\n2. Idempotence: running the shim's argv transformation on its own output changes nothing. Verify: `make test` (tests/test_bwrap_shim.sh).\n3. Version gate: with any fleet pin other than exactly 1.12.0 the shim passes the argv through unchanged. Verify: `make test` (tests/test_bwrap_shim.sh).\n4. run.sh hands fleet a PATH with the shim's directory first and leaves the node's own PATH unchanged. Verify: `make test` (tests/test_run.sh).\n5. Live: the canary's exact argv through the shim prints `__fleet_canary_ok__`; a write to `/usr` inside it fails; `curl` inside a `--unshare-net` call still fails. Verify: `make live` (tests/live/test_bwrap_shim_live.sh).\n6. join.sh's probe reports the shim's prerequisites. Verify: `make test` (tests/test_join.sh).\n7. shellcheck -S warning clean. Verify: `make lint`.\n\nOut of scope: patching fleet itself or its npm cache; filing anything upstream; any write to GitHub.",
+  "category": "feature",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T16"
+    },
+    {
+      "to": "T14"
+    },
+    {
+      "to": "T15"
+    }
+  ],
+  "id": "T12",
+  "rails": [],
+  "scope": [
+    "factory/bin/lib/bwrap-shim",
+    "factory/bin/lib/probe.sh",
+    "factory/bin/run.sh",
+    "factory/bin/join.sh",
+    "docs/adr/0006-bwrap-shim-for-fleet-1-12-0.md",
+    "docs/adr/README.md",
+    "tests/test_bwrap_shim.sh",
+    "tests/test_run.sh",
+    "tests/test_join.sh",
+    "tests/fixtures/bwrap-shim/**",
+    "tests/live/test_bwrap_shim_live.sh"
+  ],
+  "title": "Add a temporary read-only bwrap shim so fleet 1.12.0's preflight canary can run (ADR-0006)"
+}

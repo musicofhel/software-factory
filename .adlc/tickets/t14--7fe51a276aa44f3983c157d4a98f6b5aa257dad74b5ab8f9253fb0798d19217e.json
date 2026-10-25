@@ -1,0 +1,18 @@
+{
+  "body": "weight: light\ntier: 0\ncharter: C2\n\nLand step-2 ruling Q3 (specs/factory-step2-v1/RULINGS.md): the node sets `needs-desk`, and `factory/bin/mirror.sh` preserves a node-added `needs-desk`. Today `factory/bin/run.sh` adds `needs-desk` on strikes-exhausted, flail, tamper and a real scope failure (ADR-0005 decision 13), but mirror.sh recomputes `ready`/`needs-desk` from the ticket store on every run, so the node's label is lost on the next mirror.\n\nDeliverables:\n- A result-comment marker, its format defined once in a file under `factory/bin/lib/`, that run.sh writes (with the reason) on the Issue whenever it adds `needs-desk`.\n- `factory/bin/mirror.sh` keeps a `needs-desk` label whose Issue carries that marker, and drops it only when the store's state for that ticket changes (a desk edit, i.e. a new ticketHash, or a new claim cycle). A `needs-desk` without the marker is recomputed exactly as before.\n- `factory/RULES.md` states the rule as the claim-protocol exception.\n\nAcceptance criteria:\n1. A node-added `needs-desk` (marker present) survives two consecutive mirror runs with no store change. Verify: `make test` (tests/test_mirror.sh).\n2. After a store edit to that ticket, the next mirror run recomputes the label. Verify: `make test` (tests/test_mirror.sh).\n3. A `needs-desk` label added without the marker is recomputed as before. Verify: `make test` (tests/test_mirror.sh).\n4. run.sh's needs-desk paths write the marker with the reason. Verify: `make test` (tests/test_run.sh).\n5. The rule is in RULES.md. Verify: `grep -n needs-desk factory/RULES.md`.\n6. shellcheck -S warning clean. Verify: `make lint`.\n\nOut of scope: changing which fleet reasons lead to needs-desk; any write to GitHub.",
+  "category": "feature",
+  "duration": 1,
+  "edges": [],
+  "id": "T14",
+  "rails": [],
+  "scope": [
+    "factory/bin/mirror.sh",
+    "factory/bin/lib/desk-marker.sh",
+    "factory/bin/lib/run.sh",
+    "factory/bin/run.sh",
+    "factory/RULES.md",
+    "tests/test_mirror.sh",
+    "tests/test_run.sh"
+  ],
+  "title": "Keep a node-added needs-desk label across mirror runs until the store changes"
+}

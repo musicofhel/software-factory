@@ -1,0 +1,19 @@
+{
+  "body": "weight: light\ntier: 0\ncharter: C3\n\nLand step-2 ruling Q2 (specs/factory-step2-v1/RULINGS.md): move the classic branch-protection rules on `main` into the `main` ruleset, where the factory App's bypass applies, so post-merge's direct push (the App token) is not refused by classic protection. Today `factory/policy/branch-protection.json` holds required reviews (code-owner review, one approval, dismiss stale), required status checks (the seven `gates / *` contexts, strict), `enforce_admins`, no force pushes and no deletions in classic protection, and only the merge queue in the ruleset `main-merge-queue`; `factory/bin/apply-branch-protection.sh` adds the App (FACTORY_APP_ID) as a ruleset bypass actor and prints `# NOTE: not covered by the bypass: classic branch protection on main ...` because a ruleset bypass does not lift classic protection.\n\nDeliverables:\n- `factory/policy/branch-protection.json`: required reviews with code-owner review, required status checks, non-fast-forward and deletion live in the `main` ruleset as ruleset rules; the App is the only bypass actor when FACTORY_APP_ID is set; classic protection keeps nothing the ruleset covers, or is removed entirely if nothing is left. Field names come only from GitHub's REST ruleset schema; the records cite the docs page read.\n- ADR-0004's HALT interim (one code-owner approval to add and to remove factory/HALT) still holds and is restated next to the ruleset.\n- `factory/bin/apply-branch-protection.sh` and tests/test_halt_rules.sh updated; the classic-protection NOTE line is gone because the case no longer exists.\n\nAcceptance criteria:\n1. The dry run prints every API call it would make, the ruleset carrying the moved rules. Verify: `make test` (tests/test_halt_rules.sh).\n2. A second `--apply` against the fake gh after a first one makes no write call. Verify: `make test` (tests/test_halt_rules.sh).\n3. The script refuses (exit 2) a policy file with an unknown field in the ruleset. Verify: `make test` (tests/test_halt_rules.sh).\n4. With FACTORY_APP_ID set, the App is the only bypass actor and no `# NOTE: not covered by the bypass` line is printed. Verify: `make test` (tests/test_halt_rules.sh).\n5. shellcheck -S warning clean. Verify: `make lint`.\n\nOut of scope: applying the policy to the real repository (Aaron's kit); creating the GitHub App; any write to GitHub.",
+  "category": "feature",
+  "duration": 1,
+  "edges": [
+    {
+      "to": "T14"
+    }
+  ],
+  "id": "T13",
+  "rails": [],
+  "scope": [
+    "factory/policy/branch-protection.json",
+    "factory/bin/apply-branch-protection.sh",
+    "docs/adr/0004-halt-two-person-rule.md",
+    "tests/test_halt_rules.sh"
+  ],
+  "title": "Move main's classic branch protection into the ruleset the factory App bypasses"
+}
