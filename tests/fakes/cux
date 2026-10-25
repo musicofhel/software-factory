@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Fake `cux` (inulute/cux v0.4.1) for offline tests. Records every call as one JSON array of its argv
+# in $FAKE_CUX_LOG (when set) and copies the real CLI's measured behaviour (records/TB3.md of
+# specs/factory-step2-v1; cux `cmd/cux/main.go` and `internal/usage/usage.go` at v0.4.1):
+#   --version | version     "cux 0.4.1"
+#   usage show              prints the usage cache. The cache is the file $FAKE_CUX_USAGE: absent
+#                           (or unset) or zero bytes → `{}`, exit 0 (the real CLI with no account);
+#                           not JSON → `cux: usage: parse cache: …` on stderr, exit 1; else the JSON
+#                           re-printed as Go's json.MarshalIndent prints the cache: 2-space indent,
+#                           the two map levels (accounts, then each account's keys) sorted, and a
+#                           window object (one with `utilization`) in the Window struct's field
+#                           order, utilization then resets_at. Trailing arguments are ignored (the
+#                           real one ignores `--help` too).
+#   usage refresh           exits $FAKE_CUX_REFRESH_EXIT (default 0). Like the real one it prints the
+#                           account list on stdout (the e-mails included) and per-account warnings
+#                           on stderr, so a caller that echoes either leaks the keys (I8).
+#                           $FAKE_CUX_REFRESHED, when set, is a file copied over $FAKE_CUX_USAGE
+#                           first: the poll brought new numbers.
+# Anything else exits 2: the real `cux <args>` would launch claude under the wrapper, and a script
+# must never do that by accident.
+set -euo pipefail
+if [ -n "${FAKE_CUX_LOG:-}" ]; then
+  for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc . >>"$FAKE_CUX_LOG"
+fi
+cache="${FAKE_CUX_USAGE:-}"
+
+case "${1:-}:${2:-}" in
+  --version:*|version:*) echo "cux 0.4.1" ;;
+  usage:show)
+    if [ -z "$cache" ] || [ ! -e "$cache" ] || [ ! -s "$cache" ]; then echo '{}'; exit 0; fi
+    if ! out="$(jq --indent 2 -e '
+        def sorted(f): to_entries | sort_by(.key) | map(.value |= f) | from_entries;
+        def window: if type == "object" and has("utilization")
+                    then {utilization} + (if .resets_at != null then {resets_at} else {} end) else . end;
+        if type == "object" then sorted(if type == "object" then sorted(window) else . end) else . end' "$cache" 2>/dev/null)"; then
+      echo "cux: usage: parse cache: invalid character looking for beginning of value" >&2
+      exit 1
+    fi
+    printf '%s\n' "$out" ;;
+  usage:refresh)
+    if [ -n "${FAKE_CUX_REFRESHED:-}" ] && [ -n "$cache" ]; then command cp "$FAKE_CUX_REFRESHED" "$cache"; fi
+    if [ -n "$cache" ] && [ -s "$cache" ]; then
+      jq -r 'keys[] | "  \(.)  (polled)"' "$cache" 2>/dev/null || true
+      jq -r 'keys[] | "warning: usage: \(.): HTTP 429"' "$cache" >&2 2>/dev/null || true
+    fi
+    exit "${FAKE_CUX_REFRESH_EXIT:-0}" ;;
+  *) echo "fake cux: unsupported command: $*" >&2; exit 2 ;;
+esac

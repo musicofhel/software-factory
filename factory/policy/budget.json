@@ -18,6 +18,9 @@
     "quotaCapDefault": 0.4,
     "haltSleepMinutes": 30,
     "nothingClaimableSleepMinutes": 10,
-    "reviewUnavailableSleepMinutes": 30
+    "reviewUnavailableSleepMinutes": 30,
+    "nodeHeartbeatMinutes": 60,
+    "unknownStateSleepMinutes": 10,
+    "quotaStaleMinutes": 30
   }
 }
