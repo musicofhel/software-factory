@@ -22,6 +22,18 @@
                                   "copilot"] },
       "additionalProperties": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" }
     },
+    "review": {
+      "description": "fleet's trusted reviewer as join installed it (ruling Q4). Optional: manifests written before it validate.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "pin", "same_family"],
+      "properties": {
+        "tool":        { "enum": ["adversarial-review"] },
+        "pin":         { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "same_family": { "type": "boolean",
+                         "description": "true when the node has one usable adapter, so the reviewer runs on the builder's model family (a claude-only box); accepted until build-order step 4" }
+      }
+    },
     "quota_tier":      { "enum": ["free", "pro", "max", "team", "unknown"] },
     "quota_cap":       { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.4 },
     "quiet_hours": {

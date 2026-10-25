@@ -29,12 +29,20 @@
 #                  primes $npm_config_cache (~/.npm)/_npx/fake/node_modules/@adlc/cli; init makes R/.adlc
 #   npm install -g [--prefix P] [--cache C] @anthropic-ai/claude-code@<v>
 #                  P/bin/claude at <v> (no --prefix: ~/.npm-global)
+#   npm pack <name>@<v> --pack-destination D [--cache C] [--silent]
+#                  D/<name>-<v>.tgz (a plain tar of package/: package.json, bin/cli.js); C (default
+#                  ~/.npm)/_cacache/fetched-<name>
+#   npm install -g [--prefix P] [--cache C] [--no-audit] [--no-fund] [--ignore-scripts] FILE.tgz
+#                  P/lib/node_modules/<name> from the tarball, P/bin/<name> linked to its cli.js;
+#                  $FAKE_NPM_INSTALL_NOOP=1 → exit 0 having installed nothing
+#   cux --version  "cux 0.4.1"; any other cux call is unsupported (exit 2, logged)
 #   curl -fsSL -o FILE URL
 #                  a *.tar.xz URL gets a tarball holding a `dcg` that prints its version (0.15.3);
-#                  anything else a `cux` binary printing "cux 0.4.1". $FAKE_CURL_FAIL=1 → exit 22
-#   sha256sum -c - / shasum -a 256 -c -
-#                  reads "<sha>  <file>" lines, logs them; "OK", or FAILED and exit 1 when
-#                  $FAKE_SHA_MISMATCH=1
+#                  anything else a copy of this fake, which answers as cux once installed under that
+#                  name. $FAKE_CURL_FAIL=1 → exit 22
+#   sha256sum -c - / shasum -a 256 -c -, sha512sum -c - / shasum -a 512 -c -
+#                  reads "<sha>  <file>" lines, logs {sha_check, file, bits}; "OK", or FAILED and
+#                  exit 1 when $FAKE_SHA_MISMATCH=1 (any sum) or $FAKE_SHA512_MISMATCH=1 (sha512)
 # Any other call exits 2 so the wizard never relies on a verb the fake does not know.
 set -euo pipefail
 me="$(basename "$0")"
@@ -118,13 +126,47 @@ case "$me" in
       *) nope "$@" ;;
     esac ;;
   npm)
+    if [ "${1:-}" = pack ]; then
+      shift; spec="" dest="" cache="$HOME/.npm"
+      while [ $# -gt 0 ]; do
+        case "$1" in --pack-destination) dest="$2"; shift ;; --cache) cache="$2"; shift ;; --silent) ;; -*) nope pack "$@" ;; *) spec="$1" ;; esac
+        shift
+      done
+      [ -n "$spec" ] && [ -n "$dest" ] || nope "pack needs a spec and --pack-destination"
+      name="${spec%@*}" ver="${spec##*@}" d="$(mktemp -d)"
+      mkdir -p "$d/package/bin" "$cache/_cacache"
+      jq -n --arg n "$name" --arg v "$ver" '{name: $n, version: $v, bin: {($n): "bin/cli.js"}}' >"$d/package/package.json"
+      printf '#!/usr/bin/env bash\necho "%s %s (fake)"\n' "$name" "$ver" >"$d/package/bin/cli.js"
+      chmod +x "$d/package/bin/cli.js"
+      tar -cf "$dest/$name-$ver.tgz" -C "$d" package   # plain tar: the closed test PATH has no gzip
+      rm -rf "$d"
+      echo "$spec" >"$cache/_cacache/fetched-$name"
+      echo "$name-$ver.tgz"
+      exit 0
+    fi
     [ "${1:-}" = install ] && [ "${2:-}" = -g ] || nope "$@"
     shift 2; prefix="$HOME/.npm-global" pkg=""
     while [ $# -gt 0 ]; do
-      case "$1" in --prefix) prefix="$2"; shift ;; --cache) shift ;; @anthropic-ai/claude-code@*) pkg="$1" ;; *) nope "$@" ;; esac
+      case "$1" in
+        --prefix) prefix="$2"; shift ;; --cache) shift ;; --no-audit|--no-fund|--ignore-scripts) ;;
+        @anthropic-ai/claude-code@*|/*.tgz) pkg="$1" ;; *) nope "$@" ;;
+      esac
       shift
     done
     [ -n "$pkg" ] || nope "no package"
+    if [[ "$pkg" == *.tgz ]]; then
+      [ -f "$pkg" ] || { echo "fake npm: no such tarball $pkg" >&2; exit 1; }
+      [ "${FAKE_NPM_INSTALL_NOOP:-0}" != 1 ] || exit 0
+      d="$(mktemp -d)"
+      tar -xf "$pkg" -C "$d"
+      name="$(jq -r .name "$d/package/package.json")"
+      mkdir -p "$prefix/lib/node_modules" "$prefix/bin"
+      rm -rf "${prefix:?}/lib/node_modules/$name"
+      mv "$d/package" "$prefix/lib/node_modules/$name"
+      rm -rf "$d"
+      ln -sfn "../lib/node_modules/$name/bin/cli.js" "$prefix/bin/$name"
+      exit 0
+    fi
     mkdir -p "$prefix/bin"
     printf '#!/usr/bin/env bash\ncase "$1" in --version) echo "%s (Claude Code)" ;; auth) echo "{\\"loggedIn\\": true}" ;; esac\n' \
       "${pkg##*@}" >"$prefix/bin/claude"
@@ -143,13 +185,19 @@ case "$me" in
       tar -cJf "$out" -C "$d" dcg
       rm -rf "$d"
     else
-      stub "$out" "cux 0.4.1"
+      command cp "$(readlink -f "$0")" "$out"
     fi ;;
-  sha256sum|shasum)
+  cux) [ "${1:-}" = --version ] || nope "$@"; echo "cux 0.4.1" ;;
+  sha256sum|sha512sum|shasum)
+    bits=256
+    [ "$me" != sha512sum ] || bits=512
+    [ "$me" != shasum ] || [ "${2:-}" != 512 ] || bits=512
     rc=0
     while read -r sum file; do
-      jq -cn --arg s "$sum" --arg f "$file" '{sha_check: $s, file: $f}' >>"${FAKE_JOIN_LOG:-/dev/null}"
-      if [ "${FAKE_SHA_MISMATCH:-0}" = 1 ]; then echo "$file: FAILED"; rc=1; else echo "$file: OK"; fi
+      jq -cn --arg s "$sum" --arg f "$file" --argjson b "$bits" '{sha_check: $s, file: $f, bits: $b}' >>"${FAKE_JOIN_LOG:-/dev/null}"
+      if [ "${FAKE_SHA_MISMATCH:-0}" = 1 ] || { [ "$bits" = 512 ] && [ "${FAKE_SHA512_MISMATCH:-0}" = 1 ]; }; then
+        echo "$file: FAILED"; rc=1
+      else echo "$file: OK"; fi
     done
     exit "$rc" ;;
   *) nope "$@" ;;

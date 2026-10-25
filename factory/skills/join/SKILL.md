@@ -52,6 +52,7 @@ with `ls-remote`). `--apply` writes only inside the clone (the `nodes` commit) a
    | tamperguard | 0.2.0 | `uv tool install tamperguard==0.2.0` with every `UV_*` dir under `$FACTORY_HOME` |
    | dcg | v0.15.3 | release tarball from `Dicklesworthstone/destructive_command_guard`, sha256 pinned in `join.sh`, into `$FACTORY_HOME/bin` |
    | cux | v0.4.1 | release binary from `inulute/cux`, sha256 pinned in `join.sh`, into `$FACTORY_HOME/bin` |
+   | adversarial-review | 2.11.1 | fleet's trusted reviewer (ruling Q4): `npm pack` into a temp dir under `$FACTORY_HOME/tmp`, the tarball's sha512 checked against the npm integrity pinned in `join.sh` (`sha512-LiPc0R5U…`), then `npm install -g --prefix $FACTORY_HOME` of that file and a receipt at `$FACTORY_HOME/receipts/adversarial-review@2.11.1`. A mismatch stops before npm installs anything. Only a copy under `$FACTORY_HOME` with that receipt counts as installed |
    | each usable adapter | `factory/policy/adapters.json` | claude-code: `npm install -g --prefix $FACTORY_HOME @anthropic-ai/claude-code@<pin>`; others have no recipe yet (install by hand) |
 
    ADLC 1.12.0 has no plugin-install command (`adlc --help`), so the wizard installs none.
@@ -61,6 +62,12 @@ with `ls-remote`). `--apply` writes only inside the clone (the `nodes` commit) a
    whether GitHub scopes it is measured at first join) and the self-hosted runner page and
    `./config.sh … --labels factory-node --name <handle>` command. It never creates either.
    `--token-file` stores a `github_pat_…` token at `$FACTORY_HOME/token` (0600).
+   It also prints the line **you** run once for the quota reading (ruling Q5), after
+   `. $FACTORY_HOME/env`: `cux add --no-alias`. Why: the run loop's governor
+   (`factory/bin/lib/governor.sh`) reads `cux usage show` before every claim and never claims on an
+   unknown reading, so with no cux account every slot sleeps `governor.unknownStateSleepMinutes`.
+   `--no-alias` because the factory counts accounts and never names them. The wizard never runs
+   `cux add` and never reads, writes or passes the account's credential.
 4. **Manifest.** `nodes/<handle>.json` (status `joining`), validated against the schema, committed
    on top of `<remote>/nodes` and pushed **without force**. A push that loses the race re-fetches,
    rebuilds and retries (3 attempts). The push is the node's first heartbeat. `--apply` also
@@ -80,8 +87,8 @@ with `ls-remote`). `--apply` writes only inside the clone (the `nodes` commit) a
 - `--dangerously-skip-permissions` (or `defaultMode: bypassPermissions`) in any shell rc, rc
   directory, or Claude Code settings file it can read (user, project, managed). Never vibe mode;
 - no adapter that is installed, authenticated and pinned in `factory/policy/adapters.json`;
-- an install step that cannot run (no cargo, uv, npx, curl, sha256 tool, or no release asset for
-  this OS and arch) for a tool that is not already at its pin;
+- an install step that cannot run (no cargo, uv, npx, npm, curl, sha256 or sha512 tool, or no
+  release asset for this OS and arch) for a tool that is not already at its pin;
 - a classic or app token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`), or anything not `github_pat_…`;
 - an unknown time zone, or a manifest that fails the schema;
 - (`--apply`) a handle another owner already holds on the `nodes` branch.
@@ -93,4 +100,7 @@ A vetto-masked path in `$HOME` that is a symlink (`~/.ssh`, `~/.aws`, `~/.gnupg`
 ## Manifest defaults
 
 `slots` above. `ram_gb` = MemTotal in GiB, rounded. `quota_cap = 0.4`. `quiet_hours` = 09:00–17:00
-in the owner's time zone. `accounts` = 1 (a count only). `status = joining`.
+in the owner's time zone. `accounts` = 1 (a count only). `status = joining`. `review` =
+`{"tool": "adversarial-review", "pin": "2.11.1", "same_family": true}` on a box with one usable
+adapter (claude-only: the reviewer runs on the builder's model family, accepted until build-order
+step 4).

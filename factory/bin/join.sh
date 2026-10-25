@@ -17,13 +17,16 @@
 #                no /usr), or the host is not merged usr (/bin a real directory: fleet 1.12.0's
 #                canary still finds no /bin/sh there).
 #   2. install   the pinned toolchain (vetto 0.6.5, ralon 0.1.7, tamperguard 0.2.0, dcg v0.15.3,
-#                cux v0.4.1, @adlc/cli 1.12.0, the adapter pins). A tool already on PATH at its pin
-#                is skipped; the rest install under $FACTORY_HOME (default ~/.factory): cargo
-#                --root, uv tool dirs, release binaries checked against the sha256 pinned here,
-#                the npx cache. User space only, never sudo.
+#                cux v0.4.1, fleet's reviewer adversarial-review 2.11.1, @adlc/cli 1.12.0, the
+#                adapter pins). A tool already on PATH at its pin is skipped; the rest install under
+#                $FACTORY_HOME (default ~/.factory): cargo --root, uv tool dirs, release binaries
+#                checked against the sha256 pinned here, the reviewer's npm tarball checked against
+#                its pinned npm integrity before npm installs it, the npx cache. User space only,
+#                never sudo.
 #   3. register  prints the fine-grained token and self-hosted runner instructions; it never
 #                creates either. --token-file stores a fine-grained token at $FACTORY_HOME/token
-#                (0600); a classic token is refused.
+#                (0600); a classic token is refused. Prints the `cux add --no-alias` line the
+#                owner runs for the governor's quota reading; join never runs it.
 #   4. manifest  nodes/<handle>.json, validated against factory/nodes/manifest.schema.json,
 #                committed on top of <remote>/nodes and pushed without force (a moved tip is a
 #                compare-and-swap loss: re-fetch, rebuild, retry, 3 attempts). The push is the
@@ -263,7 +266,23 @@ declare -A SHA=(
   [cux-darwin-amd64]=879da79489d64e16d871440f7ac5d175ddcd70589d92b4054a3cb38455702561
   [cux-darwin-arm64]=13073a52499af33ca754773e0c61e79ab062f6a340bad475274b0388b02e56dc
 )
-if [ "$os" = macos ]; then sumcheck="shasum -a 256 -c -"; else sumcheck="sha256sum -c -"; fi
+if [ "$os" = macos ]; then sumcheck="shasum -a 256 -c -" sum512check="shasum -a 512 -c -"
+else sumcheck="sha256sum -c -" sum512check="sha512sum -c -"; fi
+# fleet's trusted prosecutor (ruling Q4): adversarial-review 2.11.1 pinned by its npm integrity, read
+# with `npm view adversarial-review@2.11.1 dist.integrity` on 2026-10-25 (records/TB4.md of
+# specs/factory-step2-followups-v1). The package has no dependencies, so the one tarball is the
+# whole install. ADV_SHA512 is the same digest in hex, the form sha512sum checks (tests/test_join.sh
+# decodes ADV_INTEGRITY and compares). The tarball is checked before npm sees it, npm installs that
+# file (never a registry spec), and the receipt is written only after both; the temp dir goes either way.
+ADV_VERSION=2.11.1
+ADV_INTEGRITY=sha512-LiPc0R5UXJQ/tsUd3yEOVkISYxtbyFlvDlMFPtLW1lcVNhLjOqluDZXaVmYYEb0oONdsSs+xVbAbyWN2e0HCEA==
+ADV_SHA512=2e23dcd11e545c943fb6c51ddf210e564212631b5bc8596f0e53053ed2d6d657153612e33aa96e0d95da56661811bd2838d76c4acfb155b01bc963767b41c210
+ADV_PKG="$FH/lib/node_modules/adversarial-review/package.json"
+ADV_RECEIPT="$FH/receipts/adversarial-review@$ADV_VERSION"
+adv_verified() {  # the reviewer under $FH is at the pin, linked into $FH/bin, with the pinned receipt
+  [ "$(jq -r '.version // empty' "$ADV_PKG" 2>/dev/null)" = "$ADV_VERSION" ] && [ -x "$FH/bin/adversarial-review" ] &&
+    [ "$(command cat "$ADV_RECEIPT" 2>/dev/null)" = "$ADV_INTEGRITY" ]
+}
 qfh="$(q "$FH")"
 
 plan_add() {  # plan_add <tool> <pin> <state> <found> <blocked> <cmd...>
@@ -330,6 +349,20 @@ found="$(version_of cux)"
 plan_add cux 0.4.1 "$(state_of "$found" 0.4.1)" "$found" \
   "$(release_blocked "$cux_asset" curl "${sumcheck%% *}")" \
   "$([ -z "$cux_asset" ] || release_cmd cux "cux-$cux_asset" "https://github.com/inulute/cux/releases/download/v0.4.1/cux-$cux_asset" "")"
+# The reviewer counts only under $FH: a copy elsewhere on PATH has no receipt to check, and the env
+# file puts $FH/bin first, so fleet resolves this one (lib/review-runner.mjs resolveTrustedBin).
+adv_found="" adv_state=missing
+if adv_verified; then adv_found="$ADV_VERSION" adv_state=installed
+elif [ -f "$ADV_PKG" ]; then
+  adv_found="$(jq -r '.version // "unknown"' "$ADV_PKG" 2>/dev/null || echo unknown)" adv_state=drift
+  [ "$adv_found" != "$ADV_VERSION" ] || adv_found="$ADV_VERSION without a verified install"
+fi
+adv_tgz="\"\$d/adversarial-review-$ADV_VERSION.tgz\""
+adv_blocked=""
+if ! has npm; then adv_blocked="npm not found: install Node 18+ (AGENTS.md)"
+elif ! has "${sum512check%% *}"; then adv_blocked="${sum512check%% *} not found (needed to verify the reviewer's npm integrity)"; fi
+plan_add adversarial-review "$ADV_VERSION" "$adv_state" "$adv_found" "$adv_blocked" \
+  "rm -f $(q "$ADV_RECEIPT") && d=\$(mktemp -d $qfh/tmp/adversarial-review.XXXXXX) && trap 'rm -rf \"\$d\"' EXIT && npm pack adversarial-review@$ADV_VERSION --pack-destination \"\$d\" --cache $qfh/npm --silent >/dev/null && printf '%s  %s\\n' $ADV_SHA512 $adv_tgz | $sum512check && npm install -g --prefix $qfh --cache $qfh/npm --no-audit --no-fund --ignore-scripts $adv_tgz && mkdir -p $qfh/receipts && printf '%s\\n' $ADV_INTEGRITY >$(q "$ADV_RECEIPT")"
 # Adapters: each usable one at its adapters.json pin. Only claude-code has a known package.
 while IFS=$'\t' read -r name cli pin found; do
   [ -n "$name" ] || continue
@@ -362,12 +395,18 @@ if [ -n "$token_file" ]; then
     refusal "--token-file does not hold a fine-grained GitHub token (github_pat_…)"
   fi
 fi
-REGISTER="$(jq -cn --arg repo "$REPO" --arg h "$handle" --arg fh "$FH" --argjson given "$([ -n "$token" ] && echo true || echo false)" '
+# The cux line (ruling Q5): the owner runs it; join never runs cux add and never reads, writes or
+# passes the account's credential (cux reads it from the adapter's own login).
+REGISTER="$(jq -cn --arg repo "$REPO" --arg h "$handle" --arg fh "$FH" --argjson given "$([ -n "$token" ] && echo true || echo false)" \
+  --argjson unknown_min "$(budget .governor.unknownStateSleepMinutes)" '
   {token: {url: "https://github.com/settings/personal-access-tokens/new", repository: $repo,
            permissions: {contents: "read and write", metadata: "read"}, expiry_days: 90,
            ref_patterns: ["ticket/**", "nodes/**", "refs/locks/**"], store: "\($fh)/token", given: $given},
    runner: {url: "https://github.com/\($repo)/settings/actions/runners/new", labels: ["factory-node"],
-            command: "./config.sh --url https://github.com/\($repo) --token <registration token from that page> --labels factory-node --name \($h)"}}')"
+            command: "./config.sh --url https://github.com/\($repo) --token <registration token from that page> --labels factory-node --name \($h)"},
+   quota: {command: "cux add --no-alias", after: ". \($fh)/env", run_by: "owner",
+           why: ("the run loop'"'"'s governor (factory/bin/lib/governor.sh) reads `cux usage show` before every claim and never claims on an unknown reading: with no cux account every slot sleeps \($unknown_min) minutes (budget.json governor.unknownStateSleepMinutes) and never claims"),
+           no_alias: "the factory counts accounts and never names them, so no alias is taken from the account display name"}}')"
 if [ "$json" = 0 ]; then
   jq -r '"  a. Fine-grained personal access token: \(.token.url)",
          "     Repository access: only \(.token.repository). Repository permissions: Contents read and write (Metadata read is added).",
@@ -376,7 +415,11 @@ if [ "$json" = 0 ]; then
          "     Store it: re-run with --apply --token-file <file> (kept at \(.token.store), mode 0600).",
          "  b. Self-hosted runner, label factory-node: \(.runner.url)",
          "     \(.runner.command)",
-         "     (in a runner group scoped to this repo when the repo belongs to an organization; --ephemeral if the box can afford it)"' <<<"$REGISTER"
+         "     (in a runner group scoped to this repo when the repo belongs to an organization; --ephemeral if the box can afford it)",
+         "  c. Quota account, run by you after `\(.quota.after)` (the wizard never runs it): \(.quota.command)",
+         "     Why: \(.quota.why).",
+         "     --no-alias: \(.quota.no_alias). cux reads the account from your claude-code login; the wizard never",
+         "     reads, writes or passes that credential."' <<<"$REGISTER"
 fi
 
 # ================================================================================================
@@ -391,11 +434,14 @@ tz="${tz:-UTC}"
 if [ -d /usr/share/zoneinfo ] && [ ! -f "/usr/share/zoneinfo/$tz" ]; then refusal "unknown time zone '$tz' (--tz, e.g. America/New_York)"; fi
 pinned="$(jq -c 'map(select(.usable) | {key: .name, value: .pin}) | from_entries' <<<"$ADAPTERS")"
 fv="$(tr -d '[:space:]' <"$FACTORY_ROOT/factory/VERSION")"
+# review.same_family (ruling Q4): with one usable adapter the reviewer can only run on the builder's
+# model family (a claude-only box); accepted until build-order step 4 adds a second family.
 MANIFEST="$(jq -cn --arg h "$handle" --arg o "$owner" --arg os "$os" --argjson probe "$PROBE" --argjson slots "$SLOTS" \
   --argjson heavy "$HEAVY" --argjson ad "$pinned" --arg tier "$tier" --argjson cap "$cap" --arg tz "$tz" \
-  --arg qs "$qstart" --arg qe "$qend" --argjson acc "$accounts" --arg fv "$fv" --argjson now "$NOW" '
+  --arg qs "$qstart" --arg qe "$qend" --argjson acc "$accounts" --arg fv "$fv" --argjson now "$NOW" --arg adv "$ADV_VERSION" '
   {handle: $h, owner: $o, os: (if $os == "" then null else $os end), cpu: $probe.cpu,
    ram_gb: ($probe.ram_total_kb / 1048576 | round), slots: $slots, heavy_gates: $heavy, adapters: $ad,
+   review: {tool: "adversarial-review", pin: $adv, same_family: ($ad | length <= 1)},
    quota_tier: $tier, quota_cap: $cap, quiet_hours: {tz: $tz, start: $qs, end: $qe}, accounts: $acc,
    factory_version: $fv, last_seen: ($now | todate), status: "joining"}')"
 mtmp="$(mktemp)"
@@ -432,6 +478,7 @@ if [ "$apply" = 1 ]; then
   for t in vetto:0.6.5 ralon:0.1.7 dcg:0.15.3 cux:0.4.1; do
     [ "$(version_of "${t%%:*}")" = "${t#*:}" ] || die "${t%%:*} is not at ${t#*:} after the install"
   done
+  adv_verified || die "adversarial-review is not at $ADV_VERSION with its pinned integrity under $FH after the install"
   while IFS=$'\t' read -r cli pin; do
     [ -n "$cli" ] || continue
     [ "$(version_of "$cli")" = "$pin" ] || die "$cli is not at its pin $pin after the install"

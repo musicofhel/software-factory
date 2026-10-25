@@ -4,7 +4,9 @@
 # and a closed PATH whose tools are the multi-call fake tests/fakes/join/multi plus a few real
 # coreutils. Acceptance 1 (one case per refusal), 2 (slots), 3 (home-diff), 4 (nodes-cas). T12
 # acceptance 6: the probe reports the bwrap shim's prerequisites (case shim-prereqs); the probe root
-# is a merged-usr host unless a case says otherwise.
+# is a merged-usr host unless a case says otherwise. T15: the reviewer pinned by npm integrity and
+# failing closed (case review-pin, AC1), the manifest's review field (case review-field, AC2), the
+# printed cux line and no credential in any argv join hands a tool (case cux-line, AC3).
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -22,7 +24,8 @@ join_setup() {
   export TZ=UTC
   unset FACTORY_HOME FACTORY_HANDLE FACTORY_NOW CLAUDE_CONFIG_DIR FAKE_UNAME_S FAKE_UNAME_M FAKE_BWRAP_EXIT \
         FAKE_CLAUDE_LOGGED_IN FAKE_CLAUDE_VERSION FAKE_SUITE_SECONDS FAKE_SUITE_EXIT FAKE_SHA_MISMATCH FAKE_UID \
-        FAKE_SANDBOX_EXEC_EXIT FAKE_CURL_FAIL npm_config_cache CARGO_HOME UV_TOOL_DIR UV_TOOL_BIN_DIR UV_CACHE_DIR
+        FAKE_SANDBOX_EXEC_EXIT FAKE_CURL_FAIL FAKE_SHA512_MISMATCH FAKE_NPM_INSTALL_NOOP npm_config_cache CARGO_HOME \
+        UV_TOOL_DIR UV_TOOL_BIN_DIR UV_CACHE_DIR
   mkdir -p "$HOME/.claude" "$WORLD/root/proc" "$WORLD/root/etc" "$WORLD/bin" "$WORLD/sys" "$WORLD/tools"
   : >"$FAKE_JOIN_LOG"
   echo 'alias ll="ls -l"' >"$HOME/.bashrc"
@@ -37,7 +40,7 @@ join_setup() {
   git clone -q "$WORLD/origin.git" "$WORLD/clone"
   # The closed PATH: fakes first, then stubs of "installed" tools, then real basics.
   local t
-  for t in uname nproc df sysctl vm_stat bwrap claude codex make cargo uv npx npm curl sha256sum; do
+  for t in uname nproc df sysctl vm_stat bwrap claude codex make cargo uv npx npm curl sha256sum sha512sum; do
     ln -s "$MULTI" "$WORLD/bin/$t"
   done
   for t in bash env git jq sed grep awk cat date mktemp rm mkdir chmod cp mv head tail tr sort find wc \
@@ -59,12 +62,23 @@ installed() {  # installed <tool...>: put every pinned tool on PATH at its pin (
       vetto) v="vetto 0.6.5" ;; ralon) v="ralon 0.1.7" ;; dcg) v="0.15.3" ;; cux) v="cux 0.4.1" ;;
       tamperguard) mkdir -p "$HOME/.local/share/uv/tools/tamperguard"; echo 0.2.0 >"$HOME/.local/share/uv/tools/tamperguard/version"; continue ;;
       adlc) FH_NPX="$HOME/.factory/npm/_npx/x/node_modules/@adlc/cli"; mkdir -p "$FH_NPX"; echo '{"version": "1.12.0"}' >"$FH_NPX/package.json"; continue ;;
+      adv) adv_install 2.11.1 "$ADV_INTEGRITY"; continue ;;
     esac
     printf '#!/usr/bin/env bash\necho "%s"\n' "$v" >"$WORLD/tools/$t"
     chmod +x "$WORLD/tools/$t"
   done
 }
-all_installed() { installed vetto ralon dcg cux tamperguard adlc; mkdir -p "$WORLD/clone/.adlc"; }  # .adlc as main has it
+ADV_INTEGRITY=sha512-LiPc0R5UXJQ/tsUd3yEOVkISYxtbyFlvDlMFPtLW1lcVNhLjOqluDZXaVmYYEb0oONdsSs+xVbAbyWN2e0HCEA==  # ruling Q4
+adv_install() {  # adv_install <version> <receipt|''>: the reviewer under ~/.factory as join's install leaves it
+  local m="$HOME/.factory/lib/node_modules/adversarial-review"
+  mkdir -p "$m/bin" "$HOME/.factory/bin" "$HOME/.factory/receipts"
+  jq -n --arg v "$1" '{name: "adversarial-review", version: $v}' >"$m/package.json"
+  printf '#!/usr/bin/env bash\necho review\n' >"$m/bin/cli.js"; chmod +x "$m/bin/cli.js"
+  ln -sfn ../lib/node_modules/adversarial-review/bin/cli.js "$HOME/.factory/bin/adversarial-review"
+  rm -f "$HOME/.factory/receipts/"*
+  [ -z "$2" ] || printf '%s\n' "$2" >"$HOME/.factory/receipts/adversarial-review@$1"
+}
+all_installed() { installed vetto ralon dcg cux tamperguard adlc adv; mkdir -p "$WORLD/clone/.adlc"; }  # .adlc as main has it
 jn() {  # jn <args>: join.sh in the clone on the closed PATH; sets RC, OUT, ERR
   RC=0
   OUT="$(cd "$WORLD/clone" && PATH="$JPATH" "$JOIN" "$@" 2>"$WORLD/err")" || RC=$?
@@ -95,6 +109,8 @@ case_dry_run_ok() {
   check "--json: manifest valid, dry-run, no refusals" \
     eq "$(jq -c '[.mode, .exit, .refusals, .manifest_errors, .manifest.slots, .manifest.adapters, .manifest.status]' <<<"$OUT")" \
        '["dry-run",0,[],[],5,{"claude-code":"2.1.280"},"joining"]'
+  check "--json: the manifest records the reviewer, same family on a claude-only box" \
+    eq "$(jq -c .manifest.review <<<"$OUT")" '{"tool":"adversarial-review","pin":"2.11.1","same_family":true}'
   check "--json: the probe carries no account data" lacks owner-secret
   check "every plan step installed (dev-box shape)" eq "$(jq -c '[.plan[].state] | unique' <<<"$OUT")" '["installed"]'
 }
@@ -269,7 +285,7 @@ case_plan() {
   jn --handle node-a --no-suite --json
   check "nothing installed: exit 0 (dry run)" eq "$RC" 0
   check "every pinned tool is planned missing" \
-    eq "$(jq -c '[.plan[] | select(.state == "missing") | .tool]' <<<"$OUT")" '["@adlc/cli","adlc init","vetto","ralon","tamperguard","dcg","cux"]'
+    eq "$(jq -c '[.plan[] | select(.state == "missing") | .tool]' <<<"$OUT")" '["@adlc/cli","adlc init","vetto","ralon","tamperguard","dcg","cux","adversarial-review"]'
   local fh="$HOME/.factory"
   check "cargo installs under FACTORY_HOME, locked, at the pin" \
     eq "$(jq -r '.plan[] | select(.tool == "vetto") | .commands[0]' <<<"$OUT")" "CARGO_HOME=$fh/cargo cargo install --locked --root $fh vetto@0.6.5"
@@ -300,10 +316,10 @@ case_home_diff() {
   check "apply: every change in \$HOME is under ~/.factory" eval \
     '[ -z "$(diff <(printf "%s\n" "$h0") <(snapshot "$HOME") | grep "^[<>]" | grep -v "^[<>] [a-z] [0-7]* ./.factory\(/\|$\)")" ]'
   check "apply: the worktree changed only by adlc init (.adlc was missing)" eq "$(git -C "$WORLD/clone" status --porcelain)" "?? .adlc/"
-  check "apply: tools landed in ~/.factory/bin" eval 'for t in vetto ralon dcg cux tamperguard; do [ -x "$HOME/.factory/bin/$t" ] || exit 1; done'
-  check "apply: dcg and cux verified against the pinned sha256" eq \
-    "$(jq -r 'select(.sha_check) | .sha_check' "$FAKE_JOIN_LOG" | tr '\n' ' ')" \
-    "dc7dcec9679f74ac3e6990959771ca0c84168eba658eff64fe9e63f917a84cc4 d336d1f8a6175265977f5a08ce53c20403e13752b90826df1128c29d89401df6 "
+  check "apply: tools landed in ~/.factory/bin" eval 'for t in vetto ralon dcg cux tamperguard adversarial-review; do [ -x "$HOME/.factory/bin/$t" ] || exit 1; done'
+  check "apply: dcg and cux verified against the pinned sha256, the reviewer against its sha512" eq \
+    "$(jq -r 'select(.sha_check) | "\(.bits):\(.sha_check)"' "$FAKE_JOIN_LOG" | tr '\n' ' ')" \
+    "256:dc7dcec9679f74ac3e6990959771ca0c84168eba658eff64fe9e63f917a84cc4 256:d336d1f8a6175265977f5a08ce53c20403e13752b90826df1128c29d89401df6 512:2e23dcd11e545c943fb6c51ddf210e564212631b5bc8596f0e53053ed2d6d657153612e33aa96e0d95da56661811bd2838d76c4acfb155b01bc963767b41c210 "
   check "apply: the token at ~/.factory/token, 0600, never printed" eval \
     '[ "$(stat -c %a "$HOME/.factory/token")" = 600 ] && grep -q ^github_pat_11ABC "$HOME/.factory/token" && lacks 11ABCDEFG0123456789'
   check "apply: ~/.factory is 0700" eq "$(stat -c %a "$HOME/.factory")" 700
@@ -403,6 +419,14 @@ case_validator() {
   bad "no adapters" '.adapters = {}' "manifest.adapters: fewer than 1 properties"
   bad "date-time" '.last_seen = "yesterday"' 'manifest.last_seen: "yesterday" is not a date-time'
   bad "quota_cap 0" '.quota_cap = 0' "manifest.quota_cap: 0 <= exclusiveMinimum 0"
+  bad "review.same_family not a boolean" '.review.same_family = "yes"' "manifest.review.same_family: expected boolean, got string"
+  bad "review.tool another reviewer" '.review.tool = "llm-panel"' 'manifest.review.tool: "llm-panel" is not one of "adversarial-review"'
+  bad "review without a pin" 'del(.review.pin)' "manifest.review: missing pin"
+  bad "review with an extra field" '.review.provider = "claude"' "manifest.review: unexpected property provider"
+  bad "review.pin not a version" '.review.pin = "latest"' 'manifest.review.pin: "latest" does not match'
+  jq 'del(.review)' "$ex" >"$WORLD/m.json"
+  jn --validate "$WORLD/m.json"
+  check "a manifest written before the review field still validates" eq "$RC" 0
   jq '.adapters = {"gemini": "1.0.0", "copilot": "1.2.3"}' "$ex" >"$WORLD/m.json"
   jn --validate "$WORLD/m.json"
   check "every fleet adapter name in adapters.json is accepted" eq "$RC" 0
@@ -468,9 +492,133 @@ case_shim_prereqs() {
   check "macOS: no shim" eq "$(jq -c '.probe.sandbox.shim' <<<"$OUT")" null
 }
 
+case_review_pin() {
+  join_setup; all_installed
+  local fh="$HOME/.factory" hex integ m cmd tip0
+  hex="$(sed -n 's/^ADV_SHA512=//p' "$JOIN")" integ="$(sed -n 's/^ADV_INTEGRITY=//p' "$JOIN")"
+  check "join pins the ruling's integrity" eq "$integ" "$ADV_INTEGRITY"
+  check "  and ADV_SHA512 is that integrity in hex" eq "$hex" "$(printf '%s' "${integ#sha512-}" | base64 -d | od -An -tx1 -v | tr -d ' \n')"
+  jn --handle node-a --no-suite --json
+  check "a verified install under ~/.factory is installed: exit 0" \
+    eq "$(jq -c '[.exit, (.plan[] | select(.tool == "adversarial-review") | .pin, .state, .found)]' <<<"$OUT")" '[0,"2.11.1","installed","2.11.1"]'
+
+  rm -rf "${fh:?}/lib" "$fh/bin/adversarial-review" "$fh/receipts"
+  jn --handle node-a --no-suite --json
+  cmd="$(jq -r '.plan[] | select(.tool == "adversarial-review") | .commands[0]' <<<"$OUT")"
+  check "absent: planned missing, one command" eq "$(jq -c '[.plan[] | select(.tool == "adversarial-review") | .state, (.commands | length)]' <<<"$OUT")" '["missing",1]'
+  check "  the command, in full" eq "$cmd" \
+    "rm -f $fh/receipts/adversarial-review@2.11.1 && d=\$(mktemp -d $fh/tmp/adversarial-review.XXXXXX) && trap 'rm -rf \"\$d\"' EXIT && npm pack adversarial-review@2.11.1 --pack-destination \"\$d\" --cache $fh/npm --silent >/dev/null && printf '%s  %s\n' $hex \"\$d/adversarial-review-2.11.1.tgz\" | sha512sum -c - && npm install -g --prefix $fh --cache $fh/npm --no-audit --no-fund --ignore-scripts \"\$d/adversarial-review-2.11.1.tgz\" && mkdir -p $fh/receipts && printf '%s\n' $ADV_INTEGRITY >$fh/receipts/adversarial-review@2.11.1"
+  check "  no sudo, no npx, no registry spec handed to npm install" eval '! grep -qE "sudo|npx|npm install[^&]*adversarial-review@" <<<"$cmd"'
+  check "  the dry run ran no npm" eval '! jq -e "select(.tool == \"npm\")" "$FAKE_JOIN_LOG" >/dev/null'
+  FAKE_UNAME_S=Darwin FAKE_UNAME_M=arm64 jn --handle node-a --no-suite --json
+  check "  macOS checks it with shasum -a 512" eval 'jq -r ".plan[] | select(.tool == \"adversarial-review\") | .commands[0]" <<<"$OUT" | grep -qF "| shasum -a 512 -c - && npm install"'
+
+  # AC1: a tarball whose sha512 is not the pin fails closed.
+  tip0="$(git -C "$WORLD/origin.git" rev-parse nodes)"
+  : >"$FAKE_JOIN_LOG"
+  export FAKE_SHA512_MISMATCH=1
+  jn --handle node-a --apply --no-suite
+  check "a mismatching integrity: --apply exits 1" eq "$RC" 1
+  check "  names the failed step" has_err "install step failed: rm -f $fh/receipts/adversarial-review@2.11.1"
+  check "  the pinned digest was checked against the packed tarball" \
+    eq "$(jq -r 'select(.bits == 512) | "\(.sha_check) \(.file | test("/tmp/adversarial-review\\.[^/]+/adversarial-review-2\\.11\\.1\\.tgz$"))"' "$FAKE_JOIN_LOG")" "$hex true"
+  check "  npm never installed it" eval '! jq -e "select(.tool == \"npm\" and .argv[0] == \"install\")" "$FAKE_JOIN_LOG" >/dev/null'
+  check "  nothing installed or recorded: no package, no bin link, no receipt" \
+    eval '[ ! -e "$fh/lib/node_modules/adversarial-review" ] && [ ! -e "$fh/bin/adversarial-review" ] && [ -z "$(ls -A "$fh/receipts" 2>/dev/null)" ]'
+  check "  no manifest pushed" eq "$(git -C "$WORLD/origin.git" rev-parse nodes)" "$tip0"
+  check "  and its temp dir is gone" eq "$(ls -A "$fh/tmp")" ""
+  unset FAKE_SHA512_MISMATCH
+  jn --handle node-a --no-suite --json
+  check "  the next dry run still plans it missing" eq "$(jq -r '.plan[] | select(.tool == "adversarial-review") | .state' <<<"$OUT")" missing
+
+  FAKE_NPM_INSTALL_NOOP=1 jn --handle node-a --apply --no-suite
+  check "npm exits 0 but installs nothing: --apply exits 1 after its own check" \
+    eval '[ "$RC" = 1 ] && has_err "adversarial-review is not at 2.11.1 with its pinned integrity under $fh after the install"'
+  : >"$FAKE_JOIN_LOG"
+  jn --handle node-a --apply --no-suite
+  check "a matching integrity: --apply exits 0" eq "$RC" 0
+  check "  npm installed the very tarball that was checked" \
+    eq "$(jq -r 'select(.tool == "npm" and .argv[0] == "install") | .argv[-1]' "$FAKE_JOIN_LOG")" "$(jq -r 'select(.bits == 512) | .file' "$FAKE_JOIN_LOG")"
+  check "  under ~/.factory: package at the pin, bin linked, receipt = the integrity" \
+    eq "$(jq -r .version "$fh/lib/node_modules/adversarial-review/package.json") $([ -x "$fh/bin/adversarial-review" ] && echo linked) $(command cat "$fh/receipts/adversarial-review@2.11.1")" "2.11.1 linked $ADV_INTEGRITY"
+  check "  the npm cache is ~/.factory/npm and no temp dir is left" \
+    eval '[ -e "$fh/npm/_cacache/fetched-adversarial-review" ] && [ -z "$(ls -A "$fh/tmp")" ] && [ ! -e "$HOME/.npm" ]'
+  jn --handle node-a --no-suite --json
+  check "  the next dry run: installed" eq "$(jq -r '.plan[] | select(.tool == "adversarial-review") | .state' <<<"$OUT")" installed
+
+  rm "$fh/receipts/adversarial-review@2.11.1"
+  jn --handle node-a --no-suite --json
+  check "2.11.1 with no receipt: drift, reinstalled" \
+    eq "$(jq -c '.plan[] | select(.tool == "adversarial-review") | [.state, .found]' <<<"$OUT")" '["drift","2.11.1 without a verified install"]'
+  adv_install 2.11.1 sha512-AAAA
+  jn --handle node-a --no-suite --json
+  check "a receipt naming another integrity: drift" eq "$(jq -r '.plan[] | select(.tool == "adversarial-review") | .state' <<<"$OUT")" drift
+  adv_install 2.10.0 "$ADV_INTEGRITY"
+  jn --handle node-a --no-suite --json
+  check "another version: drift, found 2.10.0" eq "$(jq -c '.plan[] | select(.tool == "adversarial-review") | [.state, .found]' <<<"$OUT")" '["drift","2.10.0"]'
+  rm -rf "${fh:?}/lib" "$fh/bin/adversarial-review" "$fh/receipts"
+  printf '#!/usr/bin/env bash\necho review\n' >"$WORLD/tools/adversarial-review"; chmod +x "$WORLD/tools/adversarial-review"
+  jn --handle node-a --no-suite --json
+  check "a copy elsewhere on PATH does not count (no receipt to check): missing" \
+    eq "$(jq -r '.plan[] | select(.tool == "adversarial-review") | .state' <<<"$OUT")" missing
+
+  rm "$WORLD/bin/sha512sum"
+  jn --handle node-a --no-suite
+  check "no sha512sum: refused, named" eval '[ "$RC" = 2 ] && has_err "install adversarial-review 2.11.1: sha512sum not found (needed to verify the reviewer'"'"'s npm integrity)"'
+  rm "$WORLD/bin/npm"
+  jn --handle node-a --no-suite
+  check "no npm: refused, named" eval '[ "$RC" = 2 ] && has_err "install adversarial-review 2.11.1: npm not found"'
+  adv_install 2.11.1 "$ADV_INTEGRITY"
+  jn --handle node-a --no-suite
+  check "no npm but the reviewer verified at its pin: not refused" eq "$RC" 0
+}
+
+case_review_field() {
+  join_setup; all_installed
+  jn --handle node-a --apply --no-suite --json
+  check "apply: exit 0" eq "$RC" 0
+  git -C "$WORLD/origin.git" show nodes:nodes/node-a.json >"$WORLD/pushed.json"
+  check "the pushed manifest records the reviewer and same_family" \
+    eq "$(jq -c .review "$WORLD/pushed.json")" '{"tool":"adversarial-review","pin":"2.11.1","same_family":true}'
+  check "  and validates against the schema" eval 'PATH="$JPATH" "$JOIN" --validate "$WORLD/pushed.json" >/dev/null'
+  check "the schema's review pin is join's pin" eq "$(sed -n 's/^ADV_VERSION=//p' "$JOIN")" "$(jq -r .review.pin "$WORLD/pushed.json")"
+}
+
+case_cux_line() {
+  join_setup
+  local fh="$HOME/.factory" cred0
+  printf '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-CREDSECRET", "refreshToken": "sk-ant-ort01-CREDSECRET"}}\n' >"$HOME/.claude/.credentials.json"
+  cred0="$(snapshot "$HOME/.claude")"
+  jn --handle node-a --no-suite
+  check "the register step prints the cux line, who runs it, and why" eval \
+    'grep -qF "  c. Quota account, run by you after \`. $fh/env\` (the wizard never runs it): cux add --no-alias" <<<"$OUT" &&
+     grep -qF "Why: the run loop'"'"'s governor (factory/bin/lib/governor.sh) reads \`cux usage show\` before every claim and never claims on an unknown reading: with no cux account every slot sleeps 10 minutes" <<<"$OUT" &&
+     grep -qF -- "--no-alias: the factory counts accounts and never names them" <<<"$OUT"'
+  check "  it sits in step 3, before the manifest" eval 'sed -n "/^== 3\/5/,/^== 4\/5/p" <<<"$OUT" | grep -qF "cux add --no-alias"'
+  jn --handle node-a --no-suite --json
+  check "--json: register.quota carries the exact command" \
+    eq "$(jq -c '.register.quota | [.command, .after, .run_by]' <<<"$OUT")" "[\"cux add --no-alias\",\". $fh/env\",\"owner\"]"
+  check "  the sleep it names is budget.json's" eval \
+    'jq -r .register.quota.why <<<"$OUT" | grep -qF "sleeps $(jq .governor.unknownStateSleepMinutes "$REPO_ROOT/factory/policy/budget.json") minutes"'
+
+  # --apply from nothing installs the real-shaped cux (a copy of the fake that logs every call).
+  printf 'github_pat_%s\n' 11ABCDEFG0123456789_abcdefghijklmnop >"$WORLD/pat"
+  : >"$FAKE_JOIN_LOG"
+  jn --handle node-a --apply --no-suite --token-file "$WORLD/pat"
+  check "apply: exit 0" eq "$RC" 0
+  check "  cux was installed and called only for its version (never cux add)" \
+    eq "$(jq -sc '[.[] | select(.tool == "cux") | .argv] | unique' "$FAKE_JOIN_LOG")" '[["--version"]]'
+  check "  no tool join ran got a credential in its argv (token, key, password, secret, credential)" eval \
+    '! jq -r ".argv[]?" "$FAKE_JOIN_LOG" | grep -qiE "token|passw|secret|api[-_]?key|credential|github_pat_|sk-ant-"'
+  check "  the token never reached an argv or the output" eval '! grep -q 11ABCDEFG0123456789 "$FAKE_JOIN_LOG" && lacks 11ABCDEFG0123456789'
+  check "  the claude credential: never printed, file untouched" \
+    eq "$(lacks CREDSECRET && [ "$(snapshot "$HOME/.claude")" = "$cred0" ] && echo yes)" yes
+  check "  no cux store was created" eval '[ ! -e "$HOME/.config/cux" ] && [ ! -e "$HOME/.cux" ] && [ -z "$(find "$fh" -path "*cux*" ! -path "$fh/bin/cux" ! -path "$fh/tmp/cux*" -print -quit)" ]'
+}
+
 for c in dry-run-ok slots refuse-no-sandbox refuse-macos-sandbox refuse-skip-permissions-rc \
          refuse-skip-permissions-settings refuse-no-adapter refuse-schema refuse-other heavy-gates plan \
-         home-diff nodes-cas no-nodes-branch validator usage shim-prereqs; do
+         home-diff nodes-cas no-nodes-branch validator usage shim-prereqs review-pin review-field cux-line; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

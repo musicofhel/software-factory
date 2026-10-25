@@ -7,6 +7,7 @@
   "slots": 3,
   "heavy_gates": false,
   "adapters": { "claude-code": "2.1.280" },
+  "review": { "tool": "adversarial-review", "pin": "2.11.1", "same_family": true },
   "quota_tier": "pro",
   "quota_cap": 0.4,
   "quiet_hours": { "tz": "America/New_York", "start": "09:00", "end": "17:00" },

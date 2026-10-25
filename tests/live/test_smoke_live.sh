@@ -16,11 +16,14 @@
 #              w:light). The repo slug is fixture/smoke and the scratch HOME holds no gh login.
 #   4. join    `join.sh --handle dev-box --apply --remote origin` from a clone of the fixture
 #              (--no-suite; no quiet hours; quota cap 0.95, because this box's one account is also
-#              the account of whoever runs the smoke).
-#   5. quota   `cux add` of the logged-in account into the scratch HOME's cux store (join.sh does
-#              not run it), then `cux usage refresh`.
-#   6. review  fleet's trusted prosecutor, adversarial-review 2.11.1 from npm with its integrity
-#              pinned, installed under the scratch dir (join.sh does not install it; ADR-0005).
+#              the account of whoever runs the smoke). join installs fleet's trusted prosecutor,
+#              adversarial-review 2.11.1, under the scratch FACTORY_HOME, checked against its pinned
+#              npm integrity (ruling Q4, T15); the smoke installs no reviewer of its own.
+#   5. quota   the `cux add` line join printed in its register step (ruling Q5; join never runs
+#              it), run here as the owner would, into the scratch HOME's cux store; then
+#              `cux usage refresh`.
+#   6. review  fleet resolves the reviewer join installed on the orchestrator PATH ($FACTORY_HOME/bin
+#              first, from join's env file).
 #   7. run     `run.sh --slot 1 --apply --once --json` with the real vetto, ralon, tamperguard, cux
 #              and `npx -y @adlc/cli@1.12.0 fleet`, adapter claude-code, at most 2 strikes in 15 min.
 #
@@ -110,7 +113,7 @@ chmod +x "$S/bin/gh"
 printf '{"labels":["ready","needs-desk","in-progress","w:light","w:heavy"],"issues":[]}\n' >"$S/issues.json"
 : >"$S/gh.log"
 while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(CLAUDECODE|CLAUDE_CODE_|ANTHROPIC_|ADLC_|GH_|GITHUB_|XDG_|GIT_|FACTORY_|FAKE_)' || true)
-export HOME="$NH" FACTORY_HOME="$FH" FACTORY_REPO=fixture/smoke PATH="$S/bin:$S/review/node_modules/.bin:$PATH"
+export HOME="$NH" FACTORY_HOME="$FH" FACTORY_REPO=fixture/smoke PATH="$S/bin:$PATH"
 export FAKE_GH_GIT="$O" FAKE_GH_ISSUES="$S/issues.json" FAKE_GH_LOG="$S/gh.log" FAKE_GH_REPO=fixture/smoke FAKE_GH_USER=dev-box
 fakegh_issue 1 "$(($(date +%s) - 3600))" ready,w:light "T-smoke: Add hello.sh that prints hello, with a test" \
   "$(printf '<!-- mirrored by factory/bin/mirror.sh -->\nTicket: T-smoke\n\n%s\n' "$body")" musicofhel
@@ -132,19 +135,20 @@ check "nodes/dev-box.json is on the fixture's nodes tip, a fast-forward" \
 info "join plan: $(jq -r '[.plan[] | "\(.tool) \(.pin) \(.state)"] | join("; ")' "$S/join.json")"
 info "manifest: $(jq -c '{handle, slots, heavy_gates, adapters, quota_cap, quiet_hours}' "$FH/manifest.json")"
 
-# ---- 4. quota and the prosecutor ----------------------------------------------------------------------
-echo "  4. cux account and adversarial-review $ADV_VERSION"
+# ---- 4. quota and the prosecutor, both from join ------------------------------------------------------
+echo "  4. the cux line join printed, and join's adversarial-review $ADV_VERSION"
 # shellcheck source=/dev/null  # written by join.sh --apply
 . "$FH/env"
-check "cux add (the logged-in account, into the scratch HOME's store)" quiet cux add --no-alias
+qline="$(jq -r '.register.quota.command // empty' "$S/join.json")"
+check "join printed the cux line for the owner" eq "$qline" "cux add --no-alias"
+read -ra qargv <<<"$qline"
+check "the owner runs join's cux line (the logged-in account, into the scratch HOME's store)" quiet "${qargv[@]}"
 quiet cux usage refresh || true
 info "cux usage: $(cux usage show | jq -c '[.[] | {five_hour: .five_hour.utilization, seven_day: .seven_day.utilization}]')"
-rc=0
-npm install --prefix "$S/review" --no-audit --no-fund --ignore-scripts "adversarial-review@$ADV_VERSION" >"$S/review.log" 2>&1 || rc=$?
-check "adversarial-review $ADV_VERSION installs, integrity as pinned" \
-  eq "$rc $(jq -r '.packages["node_modules/adversarial-review"] | "\(.version) \(.integrity)"' "$S/review/package-lock.json")" \
-  "0 $ADV_VERSION $ADV_INTEGRITY"
-check "fleet will resolve it on the orchestrator PATH" eq "$(command -v adversarial-review)" "$S/review/node_modules/.bin/adversarial-review"
+check "join installed adversarial-review $ADV_VERSION under FACTORY_HOME with the pinned integrity" \
+  eq "$(jq -r .version "$FH/lib/node_modules/adversarial-review/package.json" 2>/dev/null) $(command cat "$FH/receipts/adversarial-review@$ADV_VERSION" 2>/dev/null)" \
+  "$ADV_VERSION $ADV_INTEGRITY"
+check "fleet will resolve join's reviewer on the orchestrator PATH" eq "$(command -v adversarial-review)" "$FH/bin/adversarial-review"
 
 # ---- 5. the run loop ------------------------------------------------------------------------------------
 echo "  5. run.sh --slot 1 --apply --once (real vetto, ralon, fleet; claude-code)"
