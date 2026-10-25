@@ -67,6 +67,7 @@ case_lock_render() {
   check "a ticket with no rails still protects factory/policy/** (ralon refuses an empty lock)" \
     eq "$(sed -nE 's/^  - (.*)$/\1/p' <<<"$OUT" | jq -sc .)" '["factory/policy/**",".worktrees/*/factory/policy/**"]'
   local g
+  # shellcheck disable=SC2088 # a literal ~ is the input under test
   for g in '../escape/**' 'src/../../x' '/etc/passwd' '~/.ssh/**' '!src/keep' 'C:/x' 'src\\x' '' '   ' '.' './'; do
     rails "$(jq -cn --arg g "$g" '[$g, "ok/**"]')"
     render T9
@@ -129,6 +130,7 @@ case_adapters_schema() {
 
 case_vetto_policies() {
   pol_setup
+  # shellcheck disable=SC2034 # read inside the eval below
   local known='^(metadata|security|filesystem|secrets|display_only_deny|environment|network|unix_sockets|net_ports|limits|cgroup|process)$' f
   for f in build agent; do
     check "$f.toml: only tables vetto 0.6.5 parses" eval '! toml_tables "$POLICY/$f.toml" | grep -vqE "$known"'
@@ -142,6 +144,43 @@ case_vetto_policies() {
     eq "$(toml_get "$POLICY/agent.toml" network allow | jq -c 'sort')" "$CLAUDE_EGRESS"
   check "the fake vetto accepts both files and runs the command" \
     eval 'vetto --profile strict --policy "$POLICY/build.toml" -- touch "$WORLD/b" || true; vetto --profile strict --agent claude --policy "$POLICY/agent.toml" -- touch "$WORLD/a" || true; [ -f "$WORLD/b" ] && [ -f "$WORLD/a" ]'
+}
+
+case_vetto_net() {
+  pol_setup
+  local NET="$BIN/lib/vetto-net.sh" f="$WORLD/p.toml"
+  # shellcheck disable=SC2034  # ERR is read inside the eval strings passed to check
+  vnet() { RC=0; OUT="$("$NET" "$@" 2>"$WORLD/err")" || RC=$?; ERR="$(command cat "$WORLD/err")"; }
+  vnet "$POLICY/agent.toml"
+  check "agent.toml renders strict: with fleet's claude-code egressHosts, in file order" \
+    eq "$OUT" "strict:$(jq -r 'join(",")' <<<"$CLAUDE_EGRESS")"
+  vnet "$POLICY/build.toml"
+  check "build.toml renders off" eq "$OUT" off
+  vnet "$POLICY/agent.toml" --json
+  check "--json: policy, mode, allow, net" eq "$(jq -c '[.mode, (.allow | length), (.net | startswith("strict:"))]' <<<"$OUT")" '["strict",3,true]'
+  printf '[network]\nmode = "allowlist"  # c\nallow = ["a.example", "b.example"]\n[limits]\nmode = "x"\n' >"$f"
+  vnet "$f"
+  check "allowlist: hosts joined; a mode key in another table is not read" eq "$OUT" allowlist:a.example,b.example
+  local body
+  while IFS='|' read -r body why; do
+    printf '%b' "$body" >"$f"
+    vnet "$f"
+    check "refused, exit 2: $why" eval '[ "$RC" = 2 ] && [ -z "$OUT" ] && [ -n "$ERR" ]'
+  done <<'EOF_CASES'
+[network]\nmode = "offf"\n|an unknown mode (vetto would accept it)
+[metadata]\nname = "x"\n|no [network] table
+[network]\nallow = ["a:443"]\n|no mode
+[network]\nmode = "strict"\n|strict with no allow list
+[network]\nmode = "strict"\nallow = []\n|strict with an empty allow list
+[network]\nmode = "strict"\nallow = ["api.anthropic.com"]\n|strict with an entry that has no port
+[network]\nmode = "strict"\nallow = ["a:443,evil:443"]\n|an entry with a comma (would add a host to the CLI list)
+[network]\nmode = "allowlist"\nallow = ["a.example:443"]\n|allowlist with a port
+[network]\nmode = "off"\nallow = ["a:443"]\n|off with allow entries
+[network]\nmode = "strict"\nallow = [\n  "a:443",\n]\n|a multi-line array (not read, so refused rather than half-read)
+[network]\nmode = 3\n|a mode that is not a string
+EOF_CASES
+  vnet "$WORLD/missing.toml"
+  check "a missing file: exit 1" eq "$RC" 1
 }
 
 case_dcg_config() {
@@ -206,7 +245,7 @@ case_fakes() {
 }
 
 echo "test_policy"
-for c in lock-render lock-apply adapters-schema vetto-policies dcg-config fakes; do
+for c in lock-render lock-apply adapters-schema vetto-policies vetto-net dcg-config fakes; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

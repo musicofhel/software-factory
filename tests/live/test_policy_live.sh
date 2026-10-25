@@ -55,6 +55,7 @@ sandboxed() {
 CURL='curl -sS -o /dev/null --max-time 15 -w'
 
 code_outside() { curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "$1" 2>/dev/null || true; }
+# shellcheck disable=SC2034 # read inside the eval below
 reach_ex="$(code_outside https://example.com/)" reach_api="$(code_outside https://api.anthropic.com/)"
 check "outside any sandbox this host reaches example.com and api.anthropic.com (else a deny proves nothing)" \
   eval '[ "${reach_ex:-000}" != 000 ] && [ "${reach_api:-000}" != 000 ]'
@@ -70,13 +71,24 @@ check "build.toml: a write inside the worktree lands" test -f "$P/in.txt"
 check "build.toml: a write outside the worktree is denied" eval '[ ! -e "$O/out.txt" ] && grep -q "out.txt: Permission denied" "$S/build.out"'
 check "build.toml: a write to the dependency cache lands" test -f "$H/.factory/cache/c.txt"
 
-# AC4: agent.toml allows the adapter's API host and denies any other.
-rc="$(sandboxed "$S/agent.out" --profile strict --agent claude --policy "$POLICY/agent.toml" --tui none -- /bin/sh -c "
-  echo RAN; $CURL 'API=%{http_code}\n' https://api.anthropic.com/; $CURL 'EXAMPLE=%{http_code}\n' https://example.com/")"
-info "agent.toml session: vetto exit $rc"
+# AC4: agent.toml allows the adapter's API host and denies any other. github.com and
+# registry.npmjs.org are on vetto's built-in --agent claude allowlist, so they prove the file's list
+# is the one enforced; example.com is on neither. --net comes from the file (vetto-net.sh): without
+# it --agent claude replaces the file's [network] table (the INFO line after the checks).
+AGENT_NET="$("$BIN/lib/vetto-net.sh" "$POLICY/agent.toml")"
+probe='echo RAN'
+for u in API=https://api.anthropic.com/ GITHUB=https://github.com/ NPM=https://registry.npmjs.org/ EXAMPLE=https://example.com/; do
+  probe+="; $CURL '${u%%=*}=%{http_code}\\n' ${u#*=}"
+done
+rc="$(sandboxed "$S/agent.out" --profile strict --agent claude --policy "$POLICY/agent.toml" --net "$AGENT_NET" --tui none -- /bin/sh -c "$probe")"
+info "agent.toml session (--net $AGENT_NET): vetto exit $rc"
 check "agent.toml: the command ran inside the sandbox" grep -qx RAN "$S/agent.out"
 check "agent.toml: https://api.anthropic.com is reached (an HTTP status, not 000)" eval 'grep -qE "^API=[1-5][0-9][0-9]$" "$S/agent.out"'
-check "agent.toml: https://example.com is denied (000; the relay refuses the CONNECT)" grep -qx EXAMPLE=000 "$S/agent.out"
+for h in GITHUB:github.com NPM:registry.npmjs.org EXAMPLE:example.com; do
+  check "agent.toml: https://${h#*:} is denied (000)" grep -qx "${h%%:*}=000" "$S/agent.out"
+done
+sandboxed "$S/agent-nonet.out" --profile strict --agent claude --policy "$POLICY/agent.toml" --tui none -- /bin/sh -c "$probe" >/dev/null
+info "agent.toml under --agent claude WITHOUT --net: github.com $(sed -n 's/^GITHUB=//p' "$S/agent-nonet.out"), registry.npmjs.org $(sed -n 's/^NPM=//p' "$S/agent-nonet.out") (vetto's agent allowlist replaces the file's)"
 
 # AC5: ralon denies a write to a rail path and allows a non-rail path, under a rendered lock.
 export FAKE_ADLC_LOG="$S/adlc.log" FAKE_ADLC_TICKETS='[{"id":"T-live","title":"live","rails":["rails/**"]}]'

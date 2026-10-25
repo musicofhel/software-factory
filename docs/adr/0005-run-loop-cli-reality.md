@@ -55,35 +55,96 @@ Live-run prerequisites fleet 1.12.0 names that the sketch does not: a `fleet.gat
 in worker worktrees. The sandbox precondition itself is met on the dev box since bwrap 0.9.0 was
 installed (`detectBackend()` → `bubblewrap`, `resolveSandboxForRun({})` → `refused: false`).
 
-## Decision (proposed)
+## Decision (proposed; decision 2 rewritten by the T6 amendment below)
 
-The run loop codes to the real CLIs:
+The run loop codes to the real CLIs. **vetto does not wrap fleet** (measured in T6: fleet's bwrap
+cannot start inside vetto 0.6.5), so the outer call is ralon around fleet:
 
 ```
-ralon run -C <lockdir> -- \
-  vetto --policy factory/policy/agent.toml --net allowlist:<adapter API hosts> [--ci] -- \
-    fleet run --tickets <id> --concurrency 1 --no-pr --no-complete --adapter <adapter> \
-      --max-strikes <n> --wall-clock-minutes <m> \
-      --pre-strike-argv '["<abs path>/factory/bin/quota-gate.sh"]' --pre-strike-env '{"PATH":…,"HOME":…}' \
-      --model-plane-egress allowlist [--worker-deps <abs node_modules> only when the ticket is Node] --json
+ralon run -C <worktree> -- \
+  fleet run --tickets <id> --concurrency 1 --no-pr --no-complete --adapter <adapter> \
+    --max-strikes <n> --wall-clock-minutes <m> \
+    --pre-strike-argv '["<abs path>/factory/bin/quota-gate.sh"]' --pre-strike-env '{"PATH":…,"HOME":…}' \
+    --model-plane-egress allowlist [--worker-deps <abs node_modules> only when the ticket is Node] --json
+```
+
+and vetto wraps only the commands the loop runs itself, from the worktree root, on the ticket branch:
+
+```
+vetto --profile strict --policy factory/policy/build.toml --tui none -- <build/test step>
+vetto --profile strict --agent claude --policy factory/policy/agent.toml \
+      --net "$(factory/bin/lib/vetto-net.sh factory/policy/agent.toml)" --tui none -- <model-turn command>
 ```
 
 1. **ralon**: `factory/bin/lib/ralon-lock.sh` renders `agent.lock` at the root of the ticket's worktree
    (`<lockdir>` = that worktree), not `.ralon/<id>.lock`: patterns are relative to the lock and `..` is
    refused, so a lock under `.ralon/` could not name a repo path. The file is kept out of `git status`
    through `info/exclude` so fleet's dirty-tree check does not trip. Because fleet cuts its worktrees
-   beneath its own cwd, each rail glob is rendered both as itself and under `.worktrees/*/`. T6 proves
-   the exact placement live.
-2. **vetto**: policy files go through `--policy`; network goes through `--net` (plus `[network]` in the
-   file where vetto accepts it). The outer vetto runs with the agent policy because the model turns need
-   egress; the build/test "deny all network" half is fleet's own bwrap repo-command plane, and
-   `build.toml` is used by vetto where the loop runs a build step itself (the local tamperguard/test
-   pass). Whether bwrap nests inside vetto's sandbox on this kernel is a live proof for T6/T11; if it
-   does not, this ADR gains the measured answer before T9 codes it.
+   beneath its own cwd, each rail glob is rendered both as itself and under `.worktrees/*/`. T6 proved
+   the placement live; the `.worktrees/*/` form covers only worktrees that exist when ralon starts
+   (amendment, ralon 3).
+2. **vetto** (rewritten by T6): vetto wraps the loop's own steps, never fleet. The build/test
+   "deny all network" half inside a fleet run is fleet's own bwrap repo-command plane
+   (`--unshare-net`); the model plane is fleet's `--model-plane-egress allowlist` (the adapter's
+   `egressHosts`, the same three hosts `agent.toml` lists). `build.toml` wraps a build or test step
+   the loop runs itself (the local tamperguard/test pass after `merged`); `agent.toml` wraps a
+   model-turn command the loop runs itself, with `--net` rendered from the file because
+   `--agent claude` otherwise replaces the file's network table. The loop never branches on vetto's
+   exit status (always 125 in the full tier); it reads the command's own output or effects.
 3. **quota**: the pre-strike command is an absolute factory script that reads `cux usage show` and
    exits non-zero when every account is at or above `quota_cap`; the governor (T8) reads the same JSON.
 4. **reasons**: the loop's `case` keys on `reason`; success is `exitCode 0 && reason == null`. Every
    reason outside the five the sketch names takes the "anything else" branch.
+
+## Amendment 2026-10-24: T6 measurements (vetto 0.6.5, ralon 0.1.7, dcg 0.15.3)
+
+Commands and output: `specs/factory-step2-v1/records/TB1.md`; the live proofs re-run with `make live`
+(`tests/live/test_policy_live.sh`).
+
+vetto 0.6.5:
+1. **Exit status is 125 after every full-tier session**, whatever the command returned (`exit 0`
+   and `exit 3` both give 125): `src/sandbox/linux/mod.rs:309` `child_exit` ignores its code. 0.6.5
+   is the newest release on crates.io (2026-10-11).
+2. **`--profile strict` is required.** A `--policy` layer cannot lower the CLI's base profile, and
+   `extends = "strict"` under `--profile strict` is "policy inheritance cycle" (125). The default
+   profile adds writable /tmp, ~/.cache and /run/user.
+3. `$PROJECT` is vetto's **working directory**, not the git top level: run it from the worktree root.
+4. A cwd under /tmp fails silently (125, no message): strict mounts a private tmpfs on /tmp.
+5. A write root that does not exist is dropped with a warning: create `$HOME/.factory/cache` first.
+6. A policy file's `[network]` is enforced (build.toml: example.com → no connection; agent.toml
+   without `--agent`: github.com, registry.npmjs.org, example.com → no connection, api.anthropic.com
+   → 404, platform.claude.com → 200, plain http to api.anthropic.com → 501). **But `--agent claude`
+   replaces it** with vetto's built-in agent allowlist (github.com and registry.npmjs.org → 200 under
+   agent.toml + `--agent claude`), and an explicit `--net` replaces both (`--net off` → no DNS).
+   `factory/bin/lib/vetto-net.sh` renders `--net` from the file so the file stays the one list.
+   `--dry-run`'s `net:` line does not show the file's table (it shows `off`, or the agent preset).
+7. A typo'd network mode (`"offf"`) is accepted silently and the command runs; an unknown table or
+   key fails closed (125, "Security policy load failure", the command never runs). `vetto-net.sh`
+   and `tests/test_policy.sh` pin the mode values.
+8. `--agent claude` adds ~/.claude and related roots, and a git guard that refuses `main`/`master`.
+9. **bwrap does not nest inside vetto**: "Can't read /proc/sys/kernel/overflowuid"; allowing that
+   read only moves the failure to "Failed to create NETLINK_ROUTE socket". fleet's repo-command plane
+   uses `--unshare-net` (`@adlc/fleet lib/sandbox.mjs:157`), so fleet cannot run inside vetto.
+10. **On this box the real HOME fails closed**: `~/.aws` is a symlink to a directory on `/mnt/c`, and
+    vetto's mask binds /dev/null over it ("Not a directory", 125). Any symlink-to-directory at a
+    masked secret path reproduces it. A vetto defect; the join wizard (T7) must probe for it.
+
+ralon 0.1.7:
+1. `ralon run` passes the command's status through (`exit 7` → 7); no lock, an empty lock or a bad
+   pattern → 2; `ralon check` → 1 for a protected path; agent.lock protects itself.
+2. bwrap nests inside ralon (works), so `ralon run -C <wt> -- fleet run …` is viable.
+3. **A worktree created after ralon starts is not protected** (mount and landlock backends alike):
+   `.worktrees/*/…` covers only worktrees present at start. fleet cuts its worker worktree during
+   the run, so rails inside it rest on fleet's own scope/control-file checks and the CI rails gate
+   (step 3). T9 must not claim ralon covers fleet's worker worktree.
+4. ralon silently strips a leading `/` from a pattern (`/rail/**` matches as `rail/**`), so the
+   renderer refuses absolute globs itself. On WSL ralon warns that `/mnt/wslg/distro/…` is a second,
+   unrestricted path to the project.
+
+dcg 0.15.3: a config that fails to load prints only "Warning: Failed to load config" and runs on
+defaults (even with `--robot`); a partial `[interactive]` table fails the load; unknown keys are
+ignored silently. The live test asserts the warning is absent. `echo git push` and `gh pr view` are
+denied too (accepted over-block).
 
 ## Consequences
 
@@ -94,4 +155,8 @@ ralon run -C <lockdir> -- \
   writable roots instead.
 - A live run needs `fleet.gate` and a trusted `adversarial-review`; both are T11's to provide or to name
   as the cause when the smoke ends in a reason other than success.
+- vetto's sandbox covers the loop's own steps only; inside a fleet run the sandbox is fleet's bwrap
+  planes, which TB0 measured as `refused: false` on this box. Rails inside fleet's worker worktree
+  are not ralon-enforced (amendment, ralon 3).
+- Nothing keys on vetto's exit status; every vetto call needs a result marker in the output.
 - Accepting this ADR is the desk's call once T6 and T9 have proven the decision live.

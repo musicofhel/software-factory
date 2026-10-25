@@ -7,14 +7,18 @@
 #
 # Invoke it from the worktree root:
 #
-#   vetto --profile strict --agent claude --policy factory/policy/agent.toml --tui none -- <cmd>
+#   vetto --profile strict --agent claude --policy factory/policy/agent.toml \
+#         --net "$(factory/bin/lib/vetto-net.sh factory/policy/agent.toml)" --tui none -- <cmd>
 #
 # - `--agent claude` adds vetto's compatibility roots for Claude Code (~/.claude, ~/.claude.json,
 #   ~/.config/claude*, ~/.local/share/claude, npm/bun caches); without it the strict profile masks
 #   ~/.claude and the adapter cannot read its own login. It also arms vetto's git guard: vetto
 #   refuses to start on main or master, so run it on the ticket branch.
-# - No --net flag: the [network] table below is the network policy. An explicit --net replaces it
-#   (measured: `--net off` on top of this file resolves no host at all).
+# - The --net flag is required. `--agent claude` replaces this file's [network] table with vetto's
+#   built-in agent allowlist (measured: github.com and registry.npmjs.org answer 200 under this file
+#   plus --agent claude). An explicit --net replaces both, so vetto-net.sh renders it from the
+#   table below, which stays the one place the egress list is written. Without --agent, the table
+#   alone is enforced (github.com, registry.npmjs.org, example.com: no connection).
 # - Same caveats as build.toml: --profile strict is required, no worktree under /tmp, and vetto
 #   0.6.5's exit status is always 125 in the full tier.
 # - Does not wrap fleet: fleet's own bwrap sandbox cannot start inside vetto 0.6.5 (bwrap needs
