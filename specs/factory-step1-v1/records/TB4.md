@@ -79,7 +79,7 @@ Measured this session in a throwaway clone (`git clone ~/software-factory /tmp/t
 | `$A gate-manifest show --json \| jq -c '{e:(.entries\|length),s:.skipped}'` | `{"e":1,"s":[]}` |
 | `$A merge-forecast --json` | exit 0, `waves [["T1","T5"],["T2"],["T3"],["T4"]]`, `mergeOrder ["T1","T5","T2","T3","T4"]`, `firstWaveWidth 2`, `certifiedWidth 2`, `gateFailures []` |
 
-Measured in the first session, in a throwaway copy (`/tmp/tb4-adlc`, since deleted) and not re-run in this one:
+Measured in the first session, in a throwaway copy (`/tmp/tb4-adlc`) and not re-run in this one:
 `ticket list` includes completed tickets, and only `ticket show` has `.ticket.completed`. `ticket complete T5
 --write --authorize --json` prints the plan JSON, then `{"applied":true,…}`. Re-completing is a no-op
 (`changedFields: []`) but appends another manifest entry, which is why post-merge skips completed tickets.
