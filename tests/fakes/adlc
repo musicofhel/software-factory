@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Fake `adlc` (the pinned @adlc/cli) for offline tests. Scripts that call adlc honour FACTORY_ADLC
+# (default `npx -y @adlc/cli@1.12.0`); tests point it here. tests/fakes/lib.sh sets the log.
+#
+# Records every call as one JSON array of its argv in $FAKE_ADLC_LOG (required) and answers:
+#   ticket list --json        $FAKE_ADLC_TICKETS (a JSON array, default [])
+#   merge-forecast --json ... $FAKE_ADLC_FORECAST (a JSON object, default: every listed ticket in
+#                             one wave, mergeOrder = sorted ids, certifiedWidth = their count)
+#   FAKE_ADLC_FAIL            ERE; a call whose joined argv matches exits 1 with nothing on stdout
+# Anything else exits 2 so a script never relies on a verb the fake does not know.
+set -euo pipefail
+: "${FAKE_ADLC_LOG:?fake adlc needs FAKE_ADLC_LOG}"
+for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc . >>"$FAKE_ADLC_LOG"
+if [ -n "${FAKE_ADLC_FAIL:-}" ] && [[ "$*" =~ $FAKE_ADLC_FAIL ]]; then
+  echo "adlc: injected failure" >&2; exit 1
+fi
+tickets="${FAKE_ADLC_TICKETS:-[]}"
+case "${1:-} ${2:-}" in
+  "ticket list")
+    [ "${3:-}" = --json ] || { echo "fake adlc: ticket list needs --json" >&2; exit 2; }
+    jq -c . <<<"$tickets" ;;
+  "merge-forecast --json"|"merge-forecast "*)
+    [[ " $* " == *" --json "* ]] || { echo "fake adlc: merge-forecast needs --json" >&2; exit 2; }
+    if [ -n "${FAKE_ADLC_FORECAST:-}" ]; then jq -c . <<<"$FAKE_ADLC_FORECAST"
+    else jq -c '[.[].id] | sort | {pairs: [], waves: [.], mergeOrder: ., firstWaveWidth: length,
+                                   certifiedWidth: length, warnings: [], gateFailures: []}' <<<"$tickets"
+    fi ;;
+  *) echo "fake adlc: unsupported command: $*" >&2; exit 2 ;;
+esac

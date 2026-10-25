@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fake mirror (factory/bin/mirror.sh) for offline tests. Scripts that call the mirror honour
+# FACTORY_MIRROR (default factory/bin/mirror.sh); tests point it here.
+#
+# Records every call as one JSON object per line in $FAKE_MIRROR_LOG (required):
+#   {"argv": [...], "forecast": <the JSON of the --forecast FILE, or null>}
+#   FAKE_MIRROR_FAIL=1   exit 1 after recording (the labels were not recomputed)
+set -euo pipefail
+: "${FAKE_MIRROR_LOG:?fake mirror needs FAKE_MIRROR_LOG}"
+argv="$(for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc .)"
+forecast=null
+while [ $# -gt 0 ]; do
+  if [ "$1" = --forecast ]; then forecast="$(jq -c . "${2:?--forecast needs a file}")"; shift; fi
+  shift
+done
+jq -cn --argjson argv "$argv" --argjson f "$forecast" '{argv: $argv, forecast: $f}' >>"$FAKE_MIRROR_LOG"
+if [ "${FAKE_MIRROR_FAIL:-0}" = 1 ]; then echo "mirror: injected failure" >&2; exit 1; fi

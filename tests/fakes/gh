@@ -30,9 +30,13 @@
 #        A ?query on the path is ignored. --input FILE|- sends a JSON body (as gh does).
 #        Like gh: -f/-F fields (key[]=v arrays, -F typed), POST by default when fields are given,
 #        --jq on success, error body on stdout + "gh: <msg> (HTTP <code>)" on stderr, exit 1.
-# issue: list (--label repeatable = AND, --state, --limit default 30, --json fields, newest first),
+# issue: list (--label repeatable = AND, --state, --limit default 30, --json fields, newest first;
+#        state is answered OPEN/CLOSED and a missing body as "", as gh does),
 #        edit (--add/--remove-assignee, --add/--remove-label; unknown repo labels fail),
 #        comment (--body | --body-file). --repo is required: a test never falls back to a remote.
+# pr:    list (--state open|closed|merged|all, default open; --head <branch>; --limit default 30;
+#        --json fields; newest first) on the "pulls" array of FAKE_GH_ISSUES: {number, headRefName,
+#        state: OPEN|CLOSED|MERGED, createdAt}.
 set -euo pipefail
 
 REPO="${FAKE_GH_REPO:-test/repo}"
@@ -304,7 +308,7 @@ issue() {
           | select($state == "all" or .state == $state)
           | select([.labels[].name] as $have | all($want[]; IN($have[]))) ]
         | sort_by(.createdAt) | reverse | .[:$limit]
-        | map(with_entries(select(.key | IN($f[]))))' "$FAKE_GH_ISSUES" ;;
+        | map({body: ""} + . | .state |= ascii_upcase | with_entries(select(.key | IN($f[]))))' "$FAKE_GH_ISSUES" ;;
     edit|comment)
       [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any(.issues[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
         fail "GraphQL: Could not resolve to an issue or pull request with the number of $n."
@@ -327,8 +331,38 @@ issue() {
   esac
 }
 
+pr() {
+  : "${FAKE_GH_ISSUES:?fake gh pr needs FAKE_GH_ISSUES}"
+  local sub="${1:-}"; shift || true
+  local repo="" state=open limit=30 fields="" head=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -R|--repo) repo="$2"; shift ;;
+      -s|--state) state="$2"; shift ;;
+      -L|--limit) limit="$2"; shift ;;
+      -H|--head) head="$2"; shift ;;
+      --json) fields="$2"; shift ;;
+      *) fail "fake gh pr $sub: unsupported argument $1" ;;
+    esac
+    shift
+  done
+  [ -n "$repo" ] || fail "fake gh pr: --repo is required (tests never infer the repo from a remote)"
+  [ "$repo" = "$REPO" ] || fail "GraphQL: Could not resolve to a Repository with the name '$repo'."
+  [ "$sub" = list ] || fail "fake gh pr: unsupported subcommand '$sub'"
+  [ -n "$fields" ] || fail "fake gh pr list: needs --json"
+  case "$state" in open|closed|merged|all) ;; *) fail "invalid argument \"$state\" for \"-s, --state\" flag" ;; esac
+  jq -c --arg state "$state" --arg head "$head" --argjson limit "$limit" \
+        --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" '
+    [ (.pulls // [])[]
+      | select($state == "all" or (.state | ascii_downcase) == $state)
+      | select($head == "" or .headRefName == $head) ]
+    | sort_by(.createdAt) | reverse | .[:$limit]
+    | map(with_entries(select(.key | IN($f[]))))' "$FAKE_GH_ISSUES"
+}
+
 case "${1:-}" in
   api) shift; api "$@" ;;
   issue) shift; issue "$@" ;;
+  pr) shift; pr "$@" ;;
   *) fail "fake gh: unsupported command '${1:-}'" ;;
 esac

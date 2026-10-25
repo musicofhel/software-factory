@@ -3,8 +3,11 @@
 #
 #   fakegh_setup                 fresh temp world: a bare origin with `main` and `nodes`, an empty
 #                                issue store, an empty settings store (no protection, no rulesets),
-#                                a call log, the fakes (gh, curl) first on PATH, the clock unpinned
-#   fakegh_issue <n> <created-epoch> <labels,csv> [title]
+#                                call logs, the fakes (gh, curl, adlc, mirror) first on PATH, the
+#                                clock unpinned
+#   fakegh_issue <n> <created-epoch> <labels,csv> [title] [body]
+#   fakegh_close <n>             close Issue n
+#   fakegh_pr <n> <head-branch> [OPEN|CLOSED|MERGED] [created-epoch]
 #   fakegh_lock <n> <handle> <commit-epoch> [run_id] [slots]
 #                                a lock ref as another node would leave it (same commit shape as
 #                                factory/bin/lib/lock.sh writes)
@@ -30,7 +33,9 @@ fakegh_setup() {
   export FAKE_GH_REPO=test/repo FACTORY_REPO=test/repo FAKE_GH_USER=fake-user
   export PATH="$FAKES_DIR:$PATH"
   unset FAKE_GH_NOW FAKE_GH_FAIL FAKE_GH_RACE_REFS FAKE_CURL_FAIL DISCORD_WEBHOOK SUMMONER_TO GITHUB_EVENT_PATH FACTORY_NOW FACTORY_HANDLE FACTORY_SLOTS \
-        FACTORY_RUN_ID FACTORY_MANIFEST FACTORY_CAPACITY
+        FACTORY_RUN_ID FACTORY_MANIFEST FACTORY_CAPACITY FACTORY_ADLC FACTORY_MIRROR RUNNER_ENVIRONMENT \
+        FAKE_ADLC_TICKETS FAKE_ADLC_FORECAST FAKE_ADLC_FAIL FAKE_MIRROR_FAIL JANITOR_PREVIEW_HOOK JANITOR_REVOKE_HOOK
+  export FAKE_ADLC_LOG="$WORLD/adlc.log" FAKE_MIRROR_LOG="$WORLD/mirror.log"
   git init -q --bare "$FAKE_GH_GIT"
   local blob tree commit
   blob="$(printf 'nodes registry\n' | git -C "$FAKE_GH_GIT" hash-object -w --stdin)"
@@ -43,6 +48,8 @@ fakegh_setup() {
   printf '{"protection":{},"rulesets":[],"next_id":1}\n' >"$FAKE_GH_SETTINGS"
   : >"$FAKE_GH_LOG"
   : >"$FAKE_CURL_LOG"
+  : >"$FAKE_ADLC_LOG"
+  : >"$FAKE_MIRROR_LOG"
 }
 
 _fakegh_commit() {  # _fakegh_commit <tree> <epoch> <message> [parent]
@@ -55,10 +62,23 @@ _fakegh_commit() {  # _fakegh_commit <tree> <epoch> <message> [parent]
 
 fakegh_issue() {
   local tmp; tmp="$(mktemp)"
-  jq --argjson n "$1" --argjson at "$2" --arg l "$3" --arg t "${4:-issue $1}" \
-    '.issues += [{number: $n, title: $t, state: "open", createdAt: ($at | todate),
+  jq --argjson n "$1" --argjson at "$2" --arg l "$3" --arg t "${4:-issue $1}" --arg b "${5:-}" \
+    '.issues += [{number: $n, title: $t, body: $b, state: "open", createdAt: ($at | todate),
                   labels: ($l | split(",") | map(select(. != "")) | map({name: .})),
                   assignees: [], comments: []}]' "$FAKE_GH_ISSUES" >"$tmp"
+  mv "$tmp" "$FAKE_GH_ISSUES"
+}
+
+fakegh_close() {
+  local tmp; tmp="$(mktemp)"
+  jq --argjson n "$1" '(.issues[] | select(.number == $n)).state = "closed"' "$FAKE_GH_ISSUES" >"$tmp"
+  mv "$tmp" "$FAKE_GH_ISSUES"
+}
+
+fakegh_pr() {
+  local tmp; tmp="$(mktemp)"
+  jq --argjson n "$1" --arg h "$2" --arg s "${3:-OPEN}" --argjson at "${4:-1761300000}" \
+    '.pulls += [{number: $n, headRefName: $h, state: $s, createdAt: ($at | todate)}]' "$FAKE_GH_ISSUES" >"$tmp"
   mv "$tmp" "$FAKE_GH_ISSUES"
 }
 
