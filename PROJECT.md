@@ -49,8 +49,8 @@ tickets.
 
 ## License
 
-**MIT**, proposed. The spec says the license is chosen here before the first merge; the
-repo owner confirms it (or changes it) before the first push. Node owners DCO-sign agent
+**MIT**, confirmed by the repo owner on 2026-10-25 (specs/factory-step1-v1/RULINGS.md, Q1).
+The spec says the license is chosen here before the first merge. Node owners DCO-sign agent
 commits (`Signed-off-by:`), and every agent commit carries `Assisted-by:` so the project's
 AI-contribution disclosure is machine-checkable.
 

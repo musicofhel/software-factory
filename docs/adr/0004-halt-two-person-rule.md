@@ -1,6 +1,6 @@
 # ADR-0004: GitHub cannot express "zero approvals to add factory/HALT, two to remove it"
 
-- Status: proposed (the interim below is what ships; the options are Aaron's to pick)
+- Status: accepted 2026-10-25 (option A now, option D at build order 3; RULINGS.md Q2)
 - Date: 2026-10-24
 - Deciders: @musicofhel
 
@@ -61,6 +61,13 @@ Measured on 2026-10-24 (the commands are in `specs/factory-step1-v1/records/TB2.
 
 The loop recommends **A now and B + C once the organization exists**. B + C is the only
 combination that gives the spec's exact asymmetry. D can stand in for B on a user-owned repo.
+
+## Ruling (2026-10-25)
+
+Aaron picked **A now, D at build order 3** (specs/factory-step1-v1/RULINGS.md, Q2). The interim
+stands: one code-owner approval to add HALT and one to remove it. Build order 3 adds the required
+check `gates / halt-guard`, which fails a PR deleting `factory/HALT` without two approvals. B and
+C stay open for when an organization with two or more owners exists.
 
 ## Consequences
 
