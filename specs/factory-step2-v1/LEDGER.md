@@ -1,7 +1,7 @@
 STATUS: IN_PROGRESS
 
 - [x] TB0: Register, tickets T6–T11, and the pinned tools on this box — `0391ae1`: register re-measured (bwrap needs a bound root; landlock via vetto doctor ABI 7); vetto 0.6.5, ralon 0.1.7, tamperguard 0.2.0, dcg v0.15.3, cux v0.4.1 installed user-space + pinned; fleet sandbox now MET (bubblewrap, refused=false), dry-run exit 0; ADR-0005 proposed (ralon -C/agent.lock, vetto --policy, no cux status --json, success reason=null, absolute pre-strike argv); T6–T11 created (+edges T6→T10, T9→T10 for merge-forecast co-change), doctor ok, coldstart gaps empty, merge-forecast exit 0; make test/lint exit 0 (records/TB0.md)
-- [ ] TB1: Node policy: sandbox profiles, rails lock, destructive-command hook, adapter pins (ticket T6) — PARTIAL (`8a724ce`, soft gate): files + renderer + fakes + tests written, test_policy PASS, live 1 test bug fixed unverified; records/TB1.md, ADR-0005 amendment, README, gate re-runs remain (HANDOFF)
+- [x] TB1: Node policy: sandbox profiles, rails lock, destructive-command hook, adapter pins (ticket T6) — `8a724ce` + `1cb7275`: build.toml/agent.toml/dcg.toml/adapters.json written against the pinned CLIs; ralon-lock.sh renders `<wt>/agent.lock`; version-check reads adapters.json (unpinned/unlisted → 2); new vetto-net.sh (`--agent claude` replaces a policy file's network table, so `--net` is rendered from agent.toml); ADR-0005 decision 2 rewritten (bwrap does not nest in vetto → `ralon run -C <wt> -- fleet run`, vetto wraps only the loop's own steps) + measurements; make test 10 PASS, make lint 0, make live PASS (records/TB1.md)
 - [ ] TB2: Join wizard (ticket T7)
 - [ ] TB3: Budget governor (ticket T8)
 - [ ] TB4: Run loop and /factory:run (ticket T9)
