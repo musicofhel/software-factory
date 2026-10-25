@@ -29,9 +29,10 @@
 #                (a link to lib/bwrap-shim, which adds fleet's missing system roots read-only) and
 #                `fleet-pin`. Only fleet's PATH changes, never the loop's or ralon's (ADR-0006, #1266)
 #   case on fleet's reason (success = exitCode 0, reason null, a fleet/run-* branch, merged >= 1):
-#     success                       tamperguard (under vetto + build.toml) then scope-check. Both
-#                                   pass → push ticket/<id>/<handle>, open the PR, comment; the
-#                                   lock stays (SPEC-v0.2 releases it at merge). tamper or a real
+#     success                       tamperguard (under vetto + the claim's render of build.toml,
+#                                   $FACTORY_HOME/run/policy/<run id>.build.toml, lib/policy-render.sh)
+#                                   then scope-check. Both pass → push ticket/<id>/<handle>, open the
+#                                   PR, comment; the lock stays (released at merge). tamper or a real
 #                                   scope failure → comment, label needs-desk, release, no push. scope-check
 #                                   "not built" (step 3's stub) → record scope-check-not-built, keep
 #                                   a LOCAL ticket branch, release, no push, stop the slot (exit 2)
@@ -74,8 +75,10 @@ PROG=run
 . "$(dirname "$0")/lib/run.sh"
 # shellcheck source=factory/bin/lib/desk-marker.sh
 . "$(dirname "$0")/lib/desk-marker.sh"
+# shellcheck source=factory/bin/lib/policy-render.sh
+. "$(dirname "$0")/lib/policy-render.sh"
 
-usage() { sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -350,16 +353,27 @@ on_success() {
   local tip tg_out tg verdict score findings src=0 serr
   tip="$(git -C "$CLONE" rev-parse -q --verify "$(jq -r .integrationBranch <<<"$DOC")^{commit}" || true)"
   [ -n "$tip" ] || { REASON=integration-branch-missing; outcome released; finish_release 1 0 1; return; }
-  # tamperguard over the whole ticket diff, under vetto + build.toml (ADR-0005 decision 2). vetto
-  # exits 125 whatever happened, so the result is the rc file the command itself writes.
-  rm -f "$WT/.factory-run/tamperguard.json" "$WT/.factory-run/tamperguard.rc"
-  (cd "$WT" && vetto --profile strict --policy "$FACTORY_ROOT/factory/policy/build.toml" --tui none -- \
-     bash -c 'tamperguard --range "$1" --json >"$2" 2>"$3"; echo "$?" >"$4"' tamperguard "$BASE..$tip" \
-     .factory-run/tamperguard.json .factory-run/tamperguard.err .factory-run/tamperguard.rc) \
-     >>"$LOGBASE.vetto.log" 2>&1 || true
+  # tamperguard over the whole ticket diff, under vetto and this claim's render of build.toml
+  # (ADR-0005 decision 8 as amended by T17; lib/policy-render.sh). A root that cannot be derived
+  # fails closed: the step never runs under a policy that lacks it.
+  local policy="$RUN_DIR/policy/$RUN_ID.build.toml" roots r
+  local -a root=()
+  if roots="$(policy_roots "$WT" "$FH" 2>"$LOGBASE.tamperguard.err")"; then
+    while IFS= read -r r; do root+=("$r"); done <<<"$roots"
+  fi
+  if [ ${#root[@]} = 0 ] || ! mkdir -p "$RUN_DIR/policy" ||
+     ! policy_render "$FACTORY_ROOT/factory/policy/build.toml" "$policy" "${root[@]}" 2>>"$LOGBASE.tamperguard.err"; then
+    act policy-render-failed
+    REASON=tamperguard-error; outcome released; finish_release 1 0 1; return
+  fi
+  act policy-render
+  # vetto exits 125 whatever happened, so the result is the rc file the command itself writes.
+  policy_tamperguard "$WT" "$policy" "$BASE..$tip" >>"$LOGBASE.vetto.log" 2>&1
   act tamperguard
-  # the findings quote the diff: they stay on the node, in the run's log (the worktree goes)
+  # the findings quote the diff and the stderr may too: they stay on the node, in the run's log
+  # (the worktree goes)
   command cp -f "$WT/.factory-run/tamperguard.json" "$LOGBASE.tamperguard.json" 2>/dev/null || true
+  command cp -f "$WT/.factory-run/tamperguard.err" "$LOGBASE.tamperguard.err" 2>/dev/null || : >"$LOGBASE.tamperguard.err"
   tg="$(command cat "$WT/.factory-run/tamperguard.rc" 2>/dev/null || echo none)"
   tg_out="$(jq -c 'select(type == "object")' "$WT/.factory-run/tamperguard.json" 2>/dev/null | head -n1 || true)"
   [ -n "$tg_out" ] || tg_out='{}'

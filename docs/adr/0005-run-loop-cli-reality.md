@@ -236,6 +236,48 @@ Measured gaps and open points (none blocks T9):
 6. Killing a loop mid-fleet leaves the lock held with no slot state; the janitor's stale-lock duty
    (24 h) or `/factory:release` frees it.
 
+## Amendment 2026-10-25: T17, decision 8 under the rendered policy
+
+The T16 live smoke built the toy ticket and then stopped fail-closed at `tamperguard-error`
+(`specs/factory-step2-followups-v1/records/TB5.md` §4.3). Under `--policy factory/policy/build.toml`,
+strict vetto cannot exec tamperguard's uv tool or its interpreter (rc 126). It also cannot read a linked
+worktree's git dir, which lives in the clone's `.git` (rc 0, "empty diff, nothing to scan", no JSON).
+Ruling Q1 of `specs/factory-step2-followups-v1/RULINGS.md` answers this with a per-claim policy:
+
+1. **Decision 8 now runs under the rendered policy.** For each claim, run.sh writes
+   `$FACTORY_HOME/run/policy/<run id>.build.toml`, a copy of build.toml with extra absolute
+   `allow_read` roots, and runs the step under it (`factory/bin/lib/policy-render.sh`:
+   `policy_roots`, `policy_render`, `policy_tamperguard`). The render is kept beside the run's logs
+   and is outside `/tmp`. build.toml is the template, and no ticket edits it (I15: it is every
+   ticket's rail).
+2. **The roots are measured from what the step resolves, not from a layout:**
+   - the worktree's common git dir (`git rev-parse --git-common-dir`, resolved);
+   - `$FACTORY_HOME/bin` and `$FACTORY_HOME/uv` when they exist;
+   - the install root of `tamperguard` as PATH resolves it (`readlink -f`, `<root>/bin/<exe>` →
+     `<root>`);
+   - the install root of the interpreter its `#!` line names (`readlink -f`).
+
+   A root that falls inside another root is dropped. On a joined node, `$FACTORY_HOME/uv` holds both
+   the tool and its python (join.sh's `UV_TOOL_DIR`, `UV_PYTHON_INSTALL_DIR`). On the dev box, which
+   has a user-level uv tool, the roots are the clone's `.git`,
+   `~/.local/share/uv/tools/tamperguard` and `~/.local/share/uv/python/cpython-3.14.3-linux-x86_64-gnu`.
+   All three are load-bearing: dropping any one gives rc 126 or no JSON
+   (`specs/factory-run-calls-v1/records/TB1.md`). The interpreter's resolved install root alone
+   covers the version link (`cpython-3.14` → `cpython-3.14.3`), because Landlock checks the file
+   that is opened, not the links walked to reach it.
+3. **I14.** The render differs from the template only by extra absolute `allow_read` entries. Each
+   entry is an existing directory, and none is `$HOME` or a directory above it. The render adds no
+   write root, never changes `[network]`, and leaves every other line as it is. `policy_render`
+   refuses any other input and writes nothing. A root that cannot be derived (no git dir, no tool on
+   PATH, no `#!` line, or an interpreter that does not resolve) ends the claim as `tamperguard-error`
+   (action `policy-render-failed`) before vetto starts. The step never runs without its roots.
+4. **tamperguard's stderr is kept** in `$LOGBASE.tamperguard.err`, beside its JSON. A render
+   failure's reason is written there too. Both stay on the node (I8).
+5. **The real HOME on the dev box**: the render does not help there. vetto still exits 125 before
+   the command runs (amendment T6 item 10, the `~/.aws` symlink), so the step fails closed. The live
+   proof (`tests/live/test_render_live.sh`, ruling Q2 of `specs/factory-run-calls-v1/RULINGS.md`)
+   runs vetto under a scratch HOME, with the render's roots pointing at the real uv dirs.
+
 ## Consequences
 
 - SPEC-v0.2's sketch is wrong in five spellings (ralon `--lock`, vetto `--profile`, `cux status --json`,

@@ -10,7 +10,12 @@
 # governor's verdicts, the dry run, slot guards and the fakes themselves. T12 acceptance 4: the bwrap
 # shim on fleet's PATH only, and only at fleet pin 1.12.0 (case bwrap-shim). T14 acceptance 4: every
 # needs-desk path comments the reason with the needs-desk marker before the label (desk_case,
-# tamper, resume-cap, desk-marker).
+# tamper, resume-cap, desk-marker). T17: tamperguard's policy is the claim's render of build.toml,
+# which differs from the template only by existing absolute allow_read roots (I14; cases
+# policy-render, policy-render-lib), a missing interpreter fails closed before the step (case
+# policy-missing-root), and tamperguard's stderr is kept in the claim's log base (case tamper).
+# tamperguard is laid out as a uv tool (fake_uv): its own install dir, and a python reached through a
+# version link, as on a real node.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -83,6 +88,17 @@ EOF
   fakegh_issue 1 $((T0 - 86400)) ready,w:light "T-run: add hello.sh" \
     "$(printf '<!-- mirrored by factory/bin/mirror.sh -->\nTicket: T-run\nTicket-Hash: hash-T-run\n\nBuild hello.sh. %s\n' "$MARK")"
   WT="$WORLD/clone/.worktrees/T-run"
+  fake_uv "$WORLD/uv"
+}
+fake_uv() {  # fake_uv <dir>: tamperguard as uv installs it under <dir>, and $WORLD/bin/tamperguard → it
+  local u="$1"
+  mkdir -p "$u/python/cpython-9.9.9-fake/bin" "$u/tools/tamperguard/bin"
+  command cp "$(readlink -f "$(command -v bash)")" "$u/python/cpython-9.9.9-fake/bin/python9.9"   # the "interpreter"
+  ln -sfn cpython-9.9.9-fake "$u/python/cpython-9.9-fake"
+  ln -sf "$u/python/cpython-9.9-fake/bin/python9.9" "$u/tools/tamperguard/bin/python"
+  printf '#!%s\nexec "%s/tamperguard" "$@"\n' "$u/tools/tamperguard/bin/python" "$FAKES_DIR" >"$u/tools/tamperguard/bin/tamperguard"
+  chmod +x "$u/tools/tamperguard/bin/tamperguard"
+  ln -sf "$u/tools/tamperguard/bin/tamperguard" "$WORLD/bin/tamperguard"
 }
 under_cap() {
   printf '{"a@example.invalid": {"polled_at": "%s", "five_hour": {"utilization": 10, "resets_at": "%s"}, "seven_day": {"utilization": 20, "resets_at": "%s"}}}\n' \
@@ -178,6 +194,108 @@ case_tamper() {
   run_setup; passing_scope; export FAKE_TAMPERGUARD_VERDICT=error
   loop --once
   check "tamperguard itself fails: exit 1 (no false green), nothing pushed" eq "$RC:$(field .reason):$(pushed)" 1:tamperguard-error:
+  check "  its stderr is kept in the claim's log base, next to its JSON" \
+    grep -qxF 'Traceback (most recent call last): injected' "$FACTORY_HOME/run/logs/$(field .run_id).tamperguard.err"
+}
+
+toml_flat() {  # toml_flat <file>: one `[table] key = value` line per assignment; comments and blanks dropped
+  awk '/^[[:space:]]*(#|$)/ { next }
+       /^[[:space:]]*\[/ { t = $0; sub(/[[:space:]]*(#.*)?$/, "", t); sub(/^[[:space:]]+/, "", t); next }
+       { k = $0; sub(/[[:space:]]*=.*/, "", k); sub(/^[[:space:]]+/, "", k)
+         v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); print t " " k " = " v }' "$1"
+}
+allow_read() { toml_flat "$1" | sed -n 's/^\[filesystem\] allow_read = //p'; }
+i14() {  # i14 <render> <extra root>...: the render differs from build.toml only by these allow_read roots
+  local tpl="$REPO_ROOT/factory/policy/build.toml" r t extra home
+  t="$(allow_read "$tpl")"
+  check "I14: every table and key but [filesystem] allow_read is the template's" \
+    eq "$(toml_flat "$1" | grep -v '^\[filesystem\] allow_read = ')" "$(toml_flat "$tpl" | grep -v '^\[filesystem\] allow_read = ')"
+  check "  [network] unchanged, allow_write unchanged" \
+    eq "$(toml_flat "$1" | grep -E '^\[network\]|allow_write')" "$(printf '%s\n' '[filesystem] allow_write = ["$PROJECT", "$HOME/.factory/cache"]' '[network] mode = "off"')"
+  check "  allow_read starts with the template's own entries" eq "$(allow_read "$1" | jq -c --argjson t "$t" '.[0:($t | length)] == $t')" true
+  extra="$(allow_read "$1" | jq -r --argjson t "$t" '.[($t | length):][]')"
+  check "  the extra roots are exactly the step's" eq "$extra" "$(printf '%s\n' "${@:2}")"
+  home="$(cd "$HOME" && pwd -P)"
+  while IFS= read -r r; do
+    check "  $r: absolute, an existing directory, not \$HOME or above it" \
+      eval '[[ "$r" == /* ]] && [ -d "$r" ] && [[ "$home/" != "${r%/}/"* ]]'
+  done <<<"$extra"
+}
+
+case_policy_render() {
+  run_setup
+  passing_scope
+  loop --once
+  local render g u
+  render="$FACTORY_HOME/run/policy/$(field .run_id).build.toml"
+  g="$(cd "$WORLD/clone/.git" && pwd -P)"; u="$(cd "$WORLD/uv" && pwd -P)"
+  check "the claim's render is kept under \$FACTORY_HOME/run/policy/<run id>.build.toml, and vetto read it" \
+    eq "$(test -f "$render" && echo kept) $(jq -r '.[3]' "$FAKE_VETTO_LOG")" "kept $render"
+  check "  the step ran under it: built" eq "$RC $(field .outcome) $(field '.actions | index("policy-render") < index("tamperguard")')" "0 built true"
+  i14 "$render" "$g" "$u/tools/tamperguard" "$u/python/cpython-9.9.9-fake"
+  # a joined node: tamperguard under $FACTORY_HOME/uv (join.sh's UV_TOOL_DIR, UV_PYTHON_INSTALL_DIR),
+  # its link in $FACTORY_HOME/bin. The tool and python roots fall inside $FACTORY_HOME/uv and are dropped.
+  run_setup
+  passing_scope
+  mkdir -p "$FACTORY_HOME/bin"
+  fake_uv "$FACTORY_HOME/uv"
+  rm -rf "$WORLD/uv"
+  loop --once
+  render="$FACTORY_HOME/run/policy/$(field .run_id).build.toml"
+  check "joined-node layout: built" eq "$RC $(field .outcome)" "0 built"
+  i14 "$render" "$(cd "$WORLD/clone/.git" && pwd -P)" "$(cd "$FACTORY_HOME/bin" && pwd -P)" "$(cd "$FACTORY_HOME/uv" && pwd -P)"
+}
+
+case_policy_missing_root() {
+  run_setup
+  passing_scope
+  rm -rf "$WORLD/uv/python/cpython-9.9.9-fake"   # the version link now dangles
+  loop --once
+  check "tamperguard's interpreter dir is gone: exit 1, tamperguard-error (no false green)" \
+    eq "$RC $(field '"\(.outcome) \(.reason)"')" "1 released tamperguard-error"
+  check "  the render failed and the step never ran" \
+    eq "$(field '[.actions[] | select(test("^(policy-render|policy-render-failed|tamperguard)$"))] | join(",")')" policy-render-failed
+  check "  no vetto session, no tamperguard call, no render" \
+    eq "$(wc -l <"$FAKE_VETTO_LOG" | tr -d ' ') $(wc -l <"$FAKE_TAMPERGUARD_LOG" | tr -d ' ') $(ls "$FACTORY_HOME/run/policy" 2>/dev/null | wc -l | tr -d ' ')" "0 0 0"
+  check "  the reason is in the claim's tamperguard.err" \
+    grep -qF "policy-render: interpreter $WORLD/uv/tools/tamperguard/bin/python does not resolve to an executable" \
+      "$FACTORY_HOME/run/logs/$(field .run_id).tamperguard.err"
+  check "  scope-check never ran, nothing pushed, the lock released" \
+    eq "$(test -e "$WORLD/scope.log" && echo ran)|$(pushed)|$(lock)" "||"
+}
+
+case_policy_render_lib() {
+  run_setup
+  # shellcheck source=factory/bin/lib/policy-render.sh
+  . "$BIN/lib/policy-render.sh"
+  local tpl="$REPO_ROOT/factory/policy/build.toml" out="$WORLD/out.toml" d="$WORLD/d1" rc r
+  mkdir -p "$d"
+  policy_render "$tpl" "$out" "$d" "$d"
+  check "policy_render: a root given twice is rendered once" eq "$(allow_read "$out")" "$(jq -cn --arg d "$d" '["$HOME/.factory/cache", $d]')"
+  for r in "$HOME" / "$HOME/.." relative "$WORLD/none"; do
+    rm -f "$out"; rc=0; policy_render "$tpl" "$out" "$d" "$r" 2>/dev/null || rc=$?
+    check "  root '$r' is refused, nothing written" eq "$rc $(test -e "$out" && echo written)" "1 "
+  done
+  printf '[filesystem]\nallow_read = [\n  "$HOME/x",\n]\n' >"$WORLD/multi.toml"
+  printf '[metadata]\nallow_read = ["x"]\n[filesystem]\nallow_write = ["$PROJECT"]\n' >"$WORLD/elsewhere.toml"
+  for r in multi elsewhere; do
+    rm -f "$out"; rc=0; policy_render "$WORLD/$r.toml" "$out" "$d" 2>/dev/null || rc=$?
+    check "  a template whose [filesystem] has no one-line allow_read ($r) is refused" eq "$rc $(test -e "$out" && echo written)" "1 "
+  done
+  mkdir -p "$WORLD/py/bin" "$WORLD/tools/a/bin" "$WORLD/tools/b/bin"
+  command cp "$(readlink -f "$(command -v bash)")" "$WORLD/py/bin/fakepy"
+  printf '#!/usr/bin/env fakepy\n' >"$WORLD/tools/a/bin/tg-env"
+  printf 'echo no interpreter line\n' >"$WORLD/tools/b/bin/tg-none"
+  chmod +x "$WORLD/tools/a/bin/tg-env" "$WORLD/tools/b/bin/tg-none"
+  r="$(PATH="$WORLD/tools/a/bin:$WORLD/py/bin:$PATH" policy_roots "$WORLD/clone" "$WORLD/no-fh" tg-env)"
+  check "policy_roots: #!/usr/bin/env <name> resolves the interpreter through PATH" \
+    eq "$r" "$(printf '%s\n' "$(cd "$WORLD/clone/.git" && pwd -P)" "$(cd "$WORLD/tools/a" && pwd -P)" "$(cd "$WORLD/py" && pwd -P)")"
+  rc=0; PATH="$WORLD/tools/b/bin:$PATH" policy_roots "$WORLD/clone" "$WORLD/no-fh" tg-none >/dev/null 2>&1 || rc=$?
+  check "  a tool with no #! line fails" eq "$rc" 1
+  rc=0; PATH="$WORLD/tools/a/bin:$WORLD/py/bin:$PATH" policy_roots "$WORLD/not-a-repo" "$WORLD/no-fh" tg-env >/dev/null 2>&1 || rc=$?
+  check "  no git dir fails" eq "$rc" 1
+  rc=0; policy_roots "$WORLD/clone" "$WORLD/no-fh" no-such-tool-5e1f >/dev/null 2>&1 || rc=$?
+  check "  a tool not on PATH fails" eq "$rc" 1
 }
 
 pause_case() {  # pause_case <reason> <expected sleep>
@@ -391,8 +509,8 @@ case_argv() {
   check "  its PATH starts with \$FACTORY_HOME/bin and reaches jq and cux" \
     eq "$(jq -r '.PATH | split(":") | .[0]' <<<"$ps") $(PATH="$(jq -r .PATH <<<"$ps")" command -v jq cux | wc -l | tr -d ' ')" "$FACTORY_HOME/bin 2"
   check "  no --dead-end-file on a fresh claim" eq "$(jq '.argv | index("--dead-end-file")' "$FAKE_FLEET_LOG")" null
-  check "vetto wraps the loop's own tamperguard step with build.toml" \
-    eq "$(jq -c '.[0:7]' "$FAKE_VETTO_LOG")" "$(jq -cn --arg p "$REPO_ROOT/factory/policy/build.toml" '["--profile", "strict", "--policy", $p, "--tui", "none", "--"]')"
+  check "vetto wraps the loop's own tamperguard step with the claim's render of build.toml" \
+    eq "$(jq -c '.[0:7]' "$FAKE_VETTO_LOG")" "$(jq -cn --arg p "$FACTORY_HOME/run/policy/$(field .run_id).build.toml" '["--profile", "strict", "--policy", $p, "--tui", "none", "--"]')"
   check "  and never wraps fleet" eq "$(jq -s 'map(select(any(.[]; test("fleet")))) | length' "$FAKE_VETTO_LOG")" 0
   check "tamperguard: --range <base>..<integration tip> --json" \
     eq "$(jq -c '.' "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$(field .base.sha)..$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^")" '["--range", $r, "--json"]')"
@@ -626,7 +744,7 @@ case_bwrap_shim() {
   check "no pin at all: no shim" eq "$(field .bwrap_shim) $(test -e "$SHIM_DIR" && echo shim)" "false "
 }
 
-for c in ${CASES:-success scope-stub tamper quota-paused wall-clock resume-in-place resume-cap lock-lost \
+for c in ${CASES:-success scope-stub tamper policy-render policy-missing-root policy-render-lib quota-paused wall-clock resume-in-place resume-cap lock-lost \
                   strikes-exhausted flail desk-marker review-unavailable anything-else argv resume no-transcript once \
                   governor dry-run guards fakes bwrap-shim}; do
   run_case "$c"
