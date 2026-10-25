@@ -159,6 +159,8 @@ ralon run -C <clone>/.worktrees/<id> -- npx -y @adlc/cli@1.12.0 fleet run --tick
   --max-strikes <weights.W.maxStrikes> --wall-clock-minutes <weights.W.wallClockMinutes> \
   --pre-strike-argv '["<FACTORY_ROOT>/factory/bin/quota-gate.sh"]' \
   --pre-strike-env '{"PATH":"$FACTORY_HOME/bin:…","HOME":…,"FACTORY_MANIFEST":…}' \
+  --model-plane-read bounded --model-plane-git mirror \
+  --model-plane-git-mirror $FACTORY_HOME/run/mirrors/<run id>.git \
   --model-plane-egress allowlist [--dead-end-file <wt>/.factory-run/dead-end.md] --json
 ```
 
@@ -200,6 +202,21 @@ T9 decisions beyond decisions 1–4:
     carries no ticket text. Token counts are `null`: fleet 1.12.0's result document has none.
 13. **Labels**: the loop adds `needs-desk` on `strikes-exhausted`, `flail`, `tamper` and a real scope
     failure, as the TB4 row says. See open point 1.
+
+14. **The bounded model plane (found by the T11 live smoke, 2026-10-25).** The first argv passed
+    `--model-plane-egress allowlist` alone; real fleet 1.12.0 answered `dispatch-refused` with
+    `fleet: --model-plane-egress allowlist requires --model-plane-read bounded` (`lib/config.mjs`:
+    with host reads the sandbox networks openly, so fleet refuses to report an allowlist it does not
+    enforce). Bounded reads in turn require `--model-plane-git mirror` and an absolute
+    `--model-plane-git-mirror` (a shared-git worktree's `.git` points outside the plane), and mirror
+    mode requires concurrency 1. The loop now builds one disposable bare mirror per claim before each
+    fleet call: `git init --bare --template=` (no hooks, config = the three init keys, all on
+    `git-mirror.mjs`'s allowlist) at `$FACTORY_HOME/run/mirrors/<run id>.git`, then a fetch of the
+    base sha into its only branch `base`, with no remote. It is kept across a pause (the identical
+    argv names it; fleet re-checks it is pristine), and removed with the worktree. A mirror that
+    cannot be built → reason `mirror-failed`, release, comment, stop the slot. The fake `fleet` now
+    applies config.mjs's model-plane checks (→ `dispatch-refused`) and `assertBareMirror`
+    (→ `pipeline-error`), so the coupling is under test.
 
 Measured gaps and open points (none blocks T9):
 

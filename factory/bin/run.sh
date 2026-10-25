@@ -19,8 +19,11 @@
 #   fleet        ralon run -C <wt> -- fleet run --tickets <id> --concurrency 1 --no-pr --no-complete
 #                --base <sha> --adapter <a> --max-strikes <n> --wall-clock-minutes <m>
 #                --pre-strike-argv '["<abs>/factory/bin/quota-gate.sh"]' --pre-strike-env <json>
+#                --model-plane-read bounded --model-plane-git mirror --model-plane-git-mirror <m>
 #                --model-plane-egress allowlist [--dead-end-file <f>] --json   (vetto cannot wrap
-#                fleet: ADR-0005 decision 2; it wraps the loop's own tamperguard step)
+#                fleet: ADR-0005 decision 2; it wraps the loop's own tamperguard step). <m> is a
+#                disposable bare mirror, $FACTORY_HOME/run/mirrors/<run id>.git, holding only the
+#                base commit (fleet's allowlist egress needs bounded reads, which need it; ADR-0005)
 #   case on fleet's reason (success = exitCode 0, reason null, a fleet/run-* branch, merged >= 1):
 #     success                       tamperguard (under vetto + build.toml) then scope-check. Both
 #                                   pass → push ticket/<id>/<handle>, open the PR, comment; the
@@ -39,7 +42,8 @@
 #     anything else (run-level: preflight, quarantined, ..., or unreadable output)
 #                                   release, comment the reason, stop the slot (exit 1): fleet says
 #                                   these need a human, and re-claiming would repeat them
-#   then the worktree is removed (except while paused).
+#   then the worktree and its mirror are removed (except while paused). A mirror that cannot be
+#   built → reason mirror-failed, release, comment, stop the slot (exit 1).
 #
 # A nap is at most governor.nodeHeartbeatMinutes; then the governor is asked again. A paused claim's
 # lock is heartbeated (heartbeat.sh) when claim.heartbeatMinutes have passed. One JSON line per
@@ -60,7 +64,7 @@ PROG=run
 # shellcheck source=factory/bin/lib/run.sh
 . "$(dirname "$0")/lib/run.sh"
 
-usage() { sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -238,7 +242,19 @@ wt_remove() {
   git -C "$CLONE" branch -D "fleet/$(tr '[:upper:]' '[:lower:]' <<<"$TICKET")" >/dev/null 2>&1 || true
   ib="$(jq -r '.integrationBranch // empty' <<<"${DOC:-null}" 2>/dev/null || true)"
   if [[ "$ib" =~ ^fleet/run-[A-Za-z0-9._-]+$ ]]; then git -C "$CLONE" branch -D "$ib" >/dev/null 2>&1 || true; fi
+  [ -z "$RUN_ID" ] || rm -rf "$(mirror_path)"
   act worktree-remove
+}
+mirror_path() { printf '%s/mirrors/%s.git\n' "$RUN_DIR" "$RUN_ID"; }
+mirror_make() {  # fleet's model-plane git mirror: bare, no template (no hooks), one branch at the base, no remote
+  local m; m="$(mirror_path)"
+  [ ! -d "$m" ] || return 0
+  mkdir -p "$(dirname "$m")"
+  if git init -q --bare --template= "$m" 2>>"$LOGBASE.err" &&
+     git -C "$m" fetch -q --no-tags "$CLONE" "$BASE:refs/heads/base" 2>>"$LOGBASE.err"; then
+    act mirror; return 0
+  fi
+  rm -rf "$m"; return 1
 }
 wt_make() {
   local exclude
@@ -274,14 +290,16 @@ fleet_argv() {
   local -a a=(run --tickets "$TICKET" --concurrency 1 --no-pr --no-complete --base "$BASE" --adapter "$ADAPTER"
               --max-strikes "$MAX_STRIKES" --wall-clock-minutes "$WALL_MIN"
               --pre-strike-argv "$(jq -cn --arg p "$B/quota-gate.sh" '[$p]')" --pre-strike-env "$pse"
+              --model-plane-read bounded --model-plane-git mirror --model-plane-git-mirror "$(mirror_path)"
               --model-plane-egress allowlist)
   [ -z "$LAPSED" ] || a+=(--dead-end-file "$WT/.factory-run/dead-end.md")
   a+=(--json)
   printf '%s\0' "${a[@]}" | jq -Rsc 'split("\u0000")[:-1]'
 }
-run_fleet() {  # sets DOC (fleet's --json document, or empty)
+run_fleet() {  # sets DOC (fleet's --json document, or empty); 1 = no mirror, fleet not run
   local -a argv=()
   local frc=0
+  mirror_make || return 1
   while IFS= read -r -d '' x; do argv+=("$x"); done < <(jq -j '.[] | . + "\u0000"' <<<"$FLEET_ARGV")
   act fleet-run
   (cd "$WT" && ralon run -C "$WT" -- "${FLEET[@]}" "${argv[@]}") >"$LOGBASE.fleet.json" 2>>"$LOGBASE.fleet.err" || frc=$?
@@ -444,7 +462,8 @@ iteration() {
     act resume
     if [ ! -d "$WT" ]; then REASON=worktree-missing; outcome released; finish_release 1 0 1; return; fi
     LOGBASE="$RUN_DIR/logs/$RUN_ID"
-    run_fleet; dispatch; return
+    if ! run_fleet; then REASON=mirror-failed; outcome released; finish_release 1 0 1; return; fi
+    dispatch; return
   fi
 
   RUN_ID="$HANDLE-s$slot-$now-$$"
@@ -479,7 +498,8 @@ iteration() {
   act ralon-lock
   FLEET_ARGV="$(fleet_argv)"
   rec --argjson ms "$MAX_STRIKES" --argjson wm "$WALL_MIN" '.budget = {max_strikes: $ms, wall_clock_minutes: $wm}'
-  run_fleet; dispatch
+  if ! run_fleet; then REASON=mirror-failed; outcome released; finish_release 1 0 1; return; fi
+  dispatch
 }
 
 ITER=0

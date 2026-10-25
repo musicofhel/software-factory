@@ -294,6 +294,13 @@ case_anything_else() {
   loop --once
   check "a reason that is not a code is never forwarded: 'unrecognized'" eq "$RC $(field .reason)" "1 unrecognized"
   check "  and the comment says so" grep -qF 'reason `unrecognized`' <<<"$(last_comment)"
+  run_setup
+  mkdir -p "$FACTORY_HOME/run"; : >"$FACTORY_HOME/run/mirrors"
+  loop --once
+  check "the model-plane mirror cannot be built: exit 1, reason mirror-failed, fleet not run" \
+    eq "$RC $(field .reason) $(fleet_calls)" "1 mirror-failed 0"
+  check "  released, the comment names it, the worktree is gone" \
+    eq "$(lock)$(grep -c 'reason `mirror-failed`' <<<"$(last_comment)") $(test -e "$WT" && echo kept)" "1 "
 }
 
 case_argv() {
@@ -311,8 +318,15 @@ case_argv() {
   check "  the rest of ralon's argv is fleet's" eq "$(jq -c '.[5:]' "$FAKE_RALON_LOG")" "$(jq -c .argv "$FAKE_FLEET_LOG")"
   check "fleet runs in the worktree" eq "$(jq -r .cwd "$FAKE_FLEET_LOG")" "$wt"
   check "fleet's argv: ADR-0005's real flags, in order" \
-    eq "$(jq -c '.argv | del(.[16], .[18])' "$FAKE_FLEET_LOG")" \
-       '["run","--tickets","T-run","--concurrency","1","--no-pr","--no-complete","--base","'"$(git -C "$WORLD/clone" rev-parse origin/main)"'","--adapter","claude-code","--max-strikes","2","--wall-clock-minutes","45","--pre-strike-argv","--pre-strike-env","--model-plane-egress","allowlist","--json"]'
+    eq "$(jq -c '.argv | del(.[16], .[18], .[24])' "$FAKE_FLEET_LOG")" \
+       '["run","--tickets","T-run","--concurrency","1","--no-pr","--no-complete","--base","'"$(git -C "$WORLD/clone" rev-parse origin/main)"'","--adapter","claude-code","--max-strikes","2","--wall-clock-minutes","45","--pre-strike-argv","--pre-strike-env","--model-plane-read","bounded","--model-plane-git","mirror","--model-plane-git-mirror","--model-plane-egress","allowlist","--json"]'
+  check "  the model-plane mirror is \$FACTORY_HOME/run/mirrors/<run id>.git" \
+    eq "$(jq -r '.argv[24]' "$FAKE_FLEET_LOG")" "$FACTORY_HOME/run/mirrors/$(field .run_id).git"
+  check "  fleet accepted it (bare, one base branch, no remote, no hook) and echoed the bounded plane" \
+    eq "$(jq -c '[.readPolicy, .privateTmp, .gitSource, .egress]' "$FACTORY_HOME/run/logs/$(field .run_id).fleet.json")" \
+       '["bounded",true,"mirror","allowlist"]'
+  check "  the mirror was built before fleet and removed with the worktree" \
+    eq "$(field '.actions | (index("mirror") < index("fleet-run")) and (index("worktree-remove") != null)') $(test -e "$(jq -r '.argv[24]' "$FAKE_FLEET_LOG")" && echo kept)" "true "
   check "  --pre-strike-argv is the absolute quota gate" eq "$(jq -r '.argv[16]' "$FAKE_FLEET_LOG")" "[\"$BIN/quota-gate.sh\"]"
   ps="$(jq -r '.argv[18]' "$FAKE_FLEET_LOG")"
   check "  --pre-strike-env carries PATH, HOME, FACTORY_MANIFEST (and FACTORY_NOW when pinned)" \
@@ -456,6 +470,30 @@ case_fakes() {
   check "  a relative pre-strike argv[0] → exit 1, reason preflight" eq "$rc $(jq -r .reason <<<"$doc")" "1 preflight"
   rc=0; doc="$(cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 --max-strikes 51 --json 2>/dev/null)" || rc=$?
   check "  --max-strikes 51 → preflight" eq "$rc $(jq -r .reason <<<"$doc")" "1 preflight"
+  rc=0; doc="$(cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 --model-plane-egress allowlist --json 2>"$WORLD/fk.err")" || rc=$?
+  check "  allowlist egress without bounded reads → exit 1, dispatch-refused, config.mjs's message" \
+    eq "$rc $(jq -r .reason <<<"$doc") $(command cat "$WORLD/fk.err")" \
+       "1 dispatch-refused fleet: --model-plane-egress allowlist requires --model-plane-read bounded"
+  rc=0; (cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 --model-plane-read bounded --model-plane-egress allowlist --json >/dev/null 2>&1) || rc=$?
+  check "  bounded reads without the git mirror → exit 1" eq "$rc" 1
+  rc=0; (cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 --model-plane-read bounded --model-plane-git mirror --model-plane-git-mirror rel.git --json >/dev/null 2>&1) || rc=$?
+  check "  a relative mirror path → exit 1" eq "$rc" 1
+  rc=0; (cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 --wall-clock-minutes 1.5 --json >/dev/null 2>&1) || rc=$?
+  check "  --wall-clock-minutes 1.5 → exit 1 (a positive integer, as config.mjs)" eq "$rc" 1
+  local -a mp=(--model-plane-read bounded --model-plane-git mirror --model-plane-git-mirror "$WORLD/m.git" --model-plane-egress allowlist)
+  git clone -q --bare "$FAKE_GH_GIT" "$WORLD/m.git"
+  rc=0; doc="$(cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 "${mp[@]}" --json 2>/dev/null)" || rc=$?
+  check "  a bare clone as the mirror (remote.origin.* in its config) → exit 1, pipeline-error (assertBareMirror)" eq "$rc $(jq -r .reason <<<"$doc")" "1 pipeline-error"
+  rm -rf "$WORLD/m.git"; git init -q --bare --template= "$WORLD/m.git"
+  git -C "$WORLD/m.git" fetch -q "$FAKE_GH_GIT" main:refs/heads/base main:refs/heads/other
+  rc=0; (cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 "${mp[@]}" --json >/dev/null 2>&1) || rc=$?
+  check "  a mirror with two base branches → exit 1" eq "$rc" 1
+  git -C "$WORLD/m.git" update-ref -d refs/heads/other; git -C "$WORLD/m.git" config core.hooksPath /tmp
+  rc=0; (cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 "${mp[@]}" --json >/dev/null 2>&1) || rc=$?
+  check "  a mirror whose config carries a key outside the allowlist → exit 1" eq "$rc" 1
+  git -C "$WORLD/m.git" config --unset core.hooksPath; mkdir -p "$WORLD/m.git/hooks"; : >"$WORLD/m.git/hooks/post-checkout"
+  rc=0; (cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 "${mp[@]}" --json >/dev/null 2>&1) || rc=$?
+  check "  a mirror with a live hook → exit 1" eq "$rc" 1
   rc=0; doc="$(cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 --base main --json)" || rc=$?
   check "  success: exit 0, reason null, fleet/run-*, merged 1" \
     eq "$rc $(jq -c '[.reason, .integrationBranch, .merged]' <<<"$doc")" '0 [null,"fleet/run-fake-1",1]'
@@ -477,6 +515,10 @@ case_fakes() {
   check "  an unresolvable range → exit 1" eq "$rc" 1
   rc=0; (cd "$wt" && "$FAKES_DIR/tamperguard" --version >/dev/null 2>&1) || rc=$?
   check "  no --version (as the real 0.2.0) → exit 2" eq "$rc" 2
+  rm -f "$WORLD/m.git/hooks/post-checkout"
+  rc=0; doc="$(cd "$wt" && "$FAKES_DIR/fleet" run --tickets T1 "${mp[@]}" --json 2>/dev/null)" || rc=$?
+  check "fake fleet: a pristine mirror → the run goes on, the document echoes the plane" \
+    eq "$rc $(jq -c '[.readPolicy, .gitSource, .mirror == "'"$WORLD/m.git"'", .egress]' <<<"$doc")" '0 ["bounded","mirror",true,"allowlist"]'
 }
 
 for c in ${CASES:-success scope-stub tamper quota-paused wall-clock resume-in-place resume-cap lock-lost \

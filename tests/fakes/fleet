@@ -10,6 +10,16 @@
 #                       argv[0] is absolute, --pre-strike-env a JSON object without
 #                       ADLC_MANIFEST_KEY, --base a revision of the repository in the cwd. A bad one
 #                       → exit 1, reason "preflight".
+#                       The model-plane flags are checked as lib/config.mjs checks them (the errors
+#                       joined by "; " → exit 1, reason "dispatch-refused", as the real CLI answered
+#                       the T11 smoke): --wall-clock-minutes a positive integer, --model-plane-read
+#                       host|bounded, --model-plane-git shared|mirror, --model-plane-egress
+#                       open|allowlist; allowlist and mirror each require bounded, bounded requires
+#                       mirror, mirror requires an absolute --model-plane-git-mirror (and that flag
+#                       requires mirror) and --concurrency 1. In mirror mode the mirror must pass
+#                       git-mirror.mjs assertBareMirror (bare, only allowlisted config keys, exactly
+#                       one non-fleet/* branch, no remotes, no live hooks), else exit 1, reason
+#                       "pipeline-error"; the build itself still happens in the cwd's repository.
 #   The outcome is the next word of $FAKE_FLEET_REASONS (a space-separated queue; the position is
 #   kept in $FAKE_FLEET_LOG.n), else $FAKE_FLEET_REASON, else `success`:
 #     success           integration branch fleet/run-<id> = a --no-ff merge of the worker branch;
@@ -45,7 +55,11 @@ pre() { jq -cn --arg r "$1" '{fleetRunId: null, exitCode: 1, reason: "preflight"
          results: {}, strikes: {}, strikesConsumed: 0, review: null, tickets: {}, readPolicy: "host", privateTmp: false,
          gitSource: "shared", mirror: null, egress: "open", egressAllowlist: [], homeBinds: [], writableRoots: [],
          warnings: [$r]}'; echo "fleet: $1" >&2; exit 1; }
-tickets="" base=main max=2 json=0 psa="" pse='{}' wall=""
+refused() { jq -cn '{fleetRunId: null, exitCode: 1, reason: "dispatch-refused", integrationBranch: null, merged: 0,
+         results: {}, strikes: {}, strikesConsumed: 0, review: null, tickets: {}, readPolicy: "host", privateTmp: false,
+         gitSource: "shared", mirror: null, egress: "open", egressAllowlist: [], homeBinds: [], writableRoots: [],
+         warnings: []}'; echo "fleet: $1" >&2; exit 1; }
+tickets="" base=main max=2 json=0 psa="" pse='{}' wall="" conc=1 read="" git="" mirror="" egress=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run|--json|--i-am-in-a-disposable-container|--no-pr|--no-complete)
@@ -62,6 +76,11 @@ while [ $# -gt 0 ]; do
         --wall-clock-minutes) wall="$2" ;;
         --pre-strike-argv) psa="$2" ;;
         --pre-strike-env) pse="$2" ;;
+        --concurrency) conc="$2" ;;
+        --model-plane-read) read="$2" ;;
+        --model-plane-git) git="$2" ;;
+        --model-plane-git-mirror) mirror="$2" ;;
+        --model-plane-egress) egress="$2" ;;
       esac
       shift ;;
     *) echo "fleet: unknown option '$1'" >&2; exit 1 ;;
@@ -70,7 +89,22 @@ while [ $# -gt 0 ]; do
 done
 [ "$json" = 1 ] || { echo "fake fleet: only --json output is emulated" >&2; exit 1; }
 [[ "$max" =~ ^[0-9]+$ ]] && [ "$max" -ge 1 ] && [ "$max" -le 50 ] || pre "--max-strikes must be an integer 1..50"
-[ -z "$wall" ] || [[ "$wall" =~ ^[0-9]+(\.[0-9]+)?$ && "$wall" != 0 ]] || pre "--wall-clock-minutes must be a positive number"
+errs=()
+[ -z "$wall" ] || [[ "$wall" =~ ^[1-9][0-9]*$ ]] || errs+=("--wall-clock-minutes must be a positive integer")
+[ -z "$read" ] || [[ "$read" =~ ^(host|bounded)$ ]] || errs+=("--model-plane-read must be one of host|bounded")
+[ -z "$git" ] || [[ "$git" =~ ^(shared|mirror)$ ]] || errs+=("--model-plane-git must be one of shared|mirror")
+[ "$read" != bounded ] || [ "$git" = mirror ] ||
+  errs+=("--model-plane-read bounded requires --model-plane-git mirror (a shared-git worktree cannot reach its .git inside the plane)")
+if [ "$git" = mirror ]; then
+  [ "$read" = bounded ] || errs+=("--model-plane-git mirror requires --model-plane-read bounded")
+  [[ "$mirror" == /* ]] || errs+=("--model-plane-git mirror requires --model-plane-git-mirror <absolute bare repo path>")
+elif [ -n "$mirror" ]; then
+  errs+=("--model-plane-git-mirror is only meaningful with --model-plane-git mirror")
+fi
+[ -z "$egress" ] || [[ "$egress" =~ ^(open|allowlist)$ ]] || errs+=("--model-plane-egress must be one of open|allowlist")
+[ "$egress" != allowlist ] || [ "$read" = bounded ] || errs+=("--model-plane-egress allowlist requires --model-plane-read bounded")
+[ "${#errs[@]}" = 0 ] || { msg="$(printf '%s; ' "${errs[@]}")"; refused "${msg%; }"; }
+[ "$git" != mirror ] || [ "$conc" = 1 ] || refused "--model-plane-git mirror requires concurrency 1 (one writable mirror per worker)"
 if [ -n "$psa" ]; then
   jq -e 'type == "array" and length >= 1 and all(.[]; type == "string") and (.[0] | startswith("/"))' <<<"$psa" >/dev/null 2>&1 ||
     pre "--pre-strike-argv must be a JSON array of strings whose argv[0] is absolute"
@@ -79,6 +113,27 @@ if [ -n "$psa" ]; then
 fi
 [[ "$tickets" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || pre "this fake takes exactly one --tickets id"
 base_sha="$(git rev-parse -q --verify "$base^{commit}")" || pre "base '$base' is not a revision"
+if [ "$git" = mirror ]; then  # git-mirror.mjs assertBareMirror, at worktree creation
+  bad=""
+  if [ ! -d "$mirror" ]; then bad="is not a git repository"
+  elif git config --file "$mirror/config" --list --name-only 2>/dev/null | tr '[:upper:]' '[:lower:]' |
+       grep -qvxE 'core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)'; then
+    bad="is poisoned: config carries a key outside the allowlist"
+  elif [ "$(git -C "$mirror" rev-parse --is-bare-repository 2>/dev/null)" != true ]; then bad="is not a bare repository"
+  elif [ "$(git -C "$mirror" for-each-ref --format='%(refname:lstrip=2)' refs/heads/ | grep -cv '^fleet/')" != 1 ]; then
+    bad="must carry exactly one base branch"
+  elif [ -n "$(git -C "$mirror" remote)" ]; then bad="carries remotes"
+  else
+    for h in "$mirror"/hooks/*; do [ ! -e "$h" ] || [[ "$h" == *.sample ]] || bad="carries hooks"; done
+  fi
+  if [ -n "$bad" ]; then
+    jq -cn --arg m "$mirror" '{fleetRunId: "fake-mirror", exitCode: 1, reason: "pipeline-error", integrationBranch: null,
+      merged: 0, results: {}, strikes: {}, strikesConsumed: 0, review: null, tickets: {}, readPolicy: "bounded",
+      privateTmp: true, gitSource: "mirror", mirror: $m, egress: "allowlist", egressAllowlist: [], homeBinds: [],
+      writableRoots: [], warnings: []}'
+    echo "fleet: mirror $mirror $bad" >&2; exit 1
+  fi
+fi
 
 # the outcome
 n=0
@@ -127,11 +182,13 @@ esac
 jq -cn --arg id "$id" --arg st "$state" --argjson s "$strikes" '{tickets: {($id): {state: $st, strikes: $s}}}' >"$status"
 jq -cn --arg run "$run_id" --argjson ec "$ec" --arg r "$reason" --argjson ib "$ib" --argjson m "$merged" \
        --arg id "$id" --arg st "$state" --argjson s "$strikes" --arg code "$code" --arg t "$transcript" \
-       --argjson consumed "${FAKE_FLEET_STRIKES:-1}" '
+       --argjson consumed "${FAKE_FLEET_STRIKES:-1}" --arg read "${read:-host}" --arg git "${git:-shared}" \
+       --arg mirror "$mirror" --arg egress "${egress:-open}" '
   {fleetRunId: $run, exitCode: $ec, reason: (if $r == "null" then null else $r end), integrationBranch: $ib,
    merged: $m, results: {($id): {output: $t}}, strikes: {($id): $s}, strikesConsumed: $consumed, review: null,
    tickets: {($id): {state: $st, strikes: $s, reason: (if $st == "merged" then null else $t end),
                      reasonCode: (if $code == "null" then null else $code end), review: null}},
-   readPolicy: "host", privateTmp: false, gitSource: "shared", mirror: null, egress: "allowlist",
-   egressAllowlist: ["api.anthropic.com:443"], homeBinds: [], writableRoots: [], warnings: [$t]}'
+   readPolicy: $read, privateTmp: ($read == "bounded"), gitSource: $git, mirror: (if $mirror == "" then null else $mirror end),
+   egress: $egress,
+   egressAllowlist: (if $egress == "allowlist" then ["api.anthropic.com:443"] else [] end), homeBinds: [], writableRoots: [], warnings: [$t]}'
 exit "$ec"
