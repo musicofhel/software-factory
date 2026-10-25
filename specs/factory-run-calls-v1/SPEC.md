@@ -49,7 +49,10 @@ view`). If a fleet past 1.12.0 has shipped, record it and change nothing else (r
 spec's). Create T17 (per-run policy), T18 (rail convention + check), T19 (smoke + close-out) through
 `adlc ticket create … --write` with the ADR-0002 header block, verification-method acceptance criteria,
 scope globs, **`rails: ["factory/policy/**"]` on each** (ruling Q2, before T18's check exists), edges
-T17→T19 and T18→T19; doctor ok; coldstart gaps empty; merge-forecast exit 0. Commit `Ticket: scaffold`.
+T17→T19 and T18→T19 (plus T17→T18, measured in session 1); doctor ok; coldstart gaps empty; merge-forecast exit 0. Commit `Ticket: scaffold`.
+**Amended 2026-10-25 by ruling Q1 (RULINGS.md):** rails freeze the store, so write T19 first (no flag), then
+T18 and T17 with `--allow-unsigned`; T18's draft scope gains `factory/bin/post-merge.sh` and
+`tests/test_post_merge.sh` before it is written (re-prove the drafts in a fresh scratch clone).
 
 ### TB1 — The rendered per-run policy (ticket T17; ruling Q1)
 DoD: run.sh renders, per claim, a copy of `factory/policy/build.toml` into the claim's run dir (outside
@@ -63,8 +66,9 @@ rendered policy, with I14. `tests/test_run.sh` (fakes): the render differs from 
 `allow_read` entries (I14, a jq/awk diff on the parsed tables), every entry exists, no `$HOME` root,
 `[network]` unchanged; a missing interpreter dir fails closed (`tamperguard-error`, never a run without
 the root); stderr kept. `make live` (`tests/live/`): under the real vetto, a render for a linked worktree
-gives tamperguard rc 0 and a JSON verdict with the real `$HOME` (this closes the register's "not
-measured" line; record which python dir it was). Commit `Ticket: T17`. `records/TB1.md`.
+gives tamperguard rc 0 and a JSON verdict under a scratch `$HOME` whose render points at the real uv tool
+and python dirs (ruling Q2: vetto cannot start under this box's real `$HOME`, `~/.aws` symlink, ADR-0005
+T6 item 10; record that it fails closed there and which python dir was used). Commit `Ticket: T17`. `records/TB1.md`.
 
 ### TB2 — The default rail and the check (ticket T18; ruling Q2)
 DoD: the desk's ticket convention (where ADR-0002's header block and factory/RULES.md describe ticket
@@ -72,7 +76,8 @@ content) states that every ticket declares at least `factory/policy/**` in `rail
 ticket whose `rails` is empty or missing: mirror.sh's ready conditions gain `rails` (no rails → no
 `ready`, `needs-desk` with the reason `rails: none declared`), and the ticket checks behind `make
 tickets` (or the existing desk check; cite which) fail on it. Completed tickets are never relabeled for
-it (T1–T16 stay as they are). Tests: an open ticket with `rails: []` gets `needs-desk` with the reason;
+it (T1–T16 stay as they are). **Ruling Q1:** post-merge.sh passes `--allow-unsigned` to `adlc ticket
+complete --write --authorize`, with a test (fake adlc refuses a railed store's write without it). Tests: an open ticket with `rails: []` gets `needs-desk` with the reason;
 with the rail it can be `ready`; a completed ticket without rails is untouched; the fake adlc carries
 `rails` through `ticket show`. Commit `Ticket: T18`. `records/TB2.md`.
 

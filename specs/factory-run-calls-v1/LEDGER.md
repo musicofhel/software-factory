@@ -1,4 +1,4 @@
-STATUS: BLOCKED — Q1: rails on T17–T19 freeze main's ticket store (ADLC_MANIFEST_KEY or --allow-unsigned); see HANDOFF Q1, Q2
+STATUS: IN_PROGRESS
 
 # LEDGER — factory-run-calls-v1
 
