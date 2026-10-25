@@ -146,6 +146,79 @@ defaults (even with `--robot`); a partial `[interactive]` table fails the load; 
 ignored silently. The live test asserts the warning is absent. `echo git push` and `gh pr view` are
 denied too (accepted over-block).
 
+## Amendment 2026-10-25: T9, the run loop as built (`factory/bin/run.sh`)
+
+Cases: `tests/test_run.sh` (20); commands and output: `specs/factory-step2-v1/records/TB4.md`.
+
+The outer call, as coded (the fake `fleet` refuses any option 1.12.0 lacks, so the argv is checked
+against the real flag set):
+
+```
+ralon run -C <clone>/.worktrees/<id> -- npx -y @adlc/cli@1.12.0 fleet run --tickets <id> \
+  --concurrency 1 --no-pr --no-complete --base <sha> --adapter <adapter> \
+  --max-strikes <weights.W.maxStrikes> --wall-clock-minutes <weights.W.wallClockMinutes> \
+  --pre-strike-argv '["<FACTORY_ROOT>/factory/bin/quota-gate.sh"]' \
+  --pre-strike-env '{"PATH":"$FACTORY_HOME/bin:…","HOME":…,"FACTORY_MANIFEST":…}' \
+  --model-plane-egress allowlist [--dead-end-file <wt>/.factory-run/dead-end.md] --json
+```
+
+T9 decisions beyond decisions 1–4:
+
+5. **`--base <sha>`.** fleet's base defaults to the local `main` ref, which a node's clone does not
+   keep current. The loop fetches and passes the exact sha it cut the worktree at.
+6. **The lapsed-branch resume** (SPEC-v0.2 "worktree from the lapsed `ticket/<id>/*` branch, dead-end
+   material appended"): the worktree starts at the newest `origin/ticket/<id>/*` by committer date.
+   "Appended to the ticket" is fleet's `--dead-end-file`, because `.adlc/tickets.json` is desk-only
+   (AGENTS.md). The file carries the branch name, its record-commit trailers, its commit subjects and
+   the files it touched, never file contents. It sits in `<wt>/.factory-run/`, which `info/exclude`
+   keeps out of `git status`.
+7. **The node's own pause/resume**: on `quota-paused` or `wall-clock` the loop saves the exact fleet
+   argv in `$FACTORY_HOME/run/slot-N.json`, keeps the worktree and the lock, and re-runs the identical
+   argv in the same worktree on the next iteration (fleet's resume reconciliation). At most 3 resumes
+   per claim; the 4th pause is handled as `strikes-exhausted`.
+8. **vetto around tamperguard only**: `vetto --profile strict --policy factory/policy/build.toml --tui
+   none -- bash -c 'tamperguard --range B..TIP --json >f; echo $? >rc'`, from the worktree root. The
+   verdict is the rc file plus the JSON, never vetto's 125 (decision 2).
+9. **Every push ends in an empty record commit** (`git commit-tree` on fleet's tip) carrying the I6
+   trailers (`Assisted-by`, `Ticket`, `Node`, `Signed-off-by` = `git var GIT_COMMITTER_IDENT`) plus
+   `Factory-Outcome`, `Fleet-Reason`, `Fleet-Strikes`, `Fleet-Run`. The push is
+   `--force-with-lease` against the fetched value of this node's own `ticket/<id>/<handle>`.
+10. **scope-check is step 3's stub** (exit 2, "not built"). On success the loop records
+    `scope-check-not-built`, keeps the work on a LOCAL `ticket/<id>/<handle>`, releases the lock and
+    stops the slot (exit 2). It pushes nothing: a push would claim a gate passed that does not exist
+    (I5). The call is `scope-check.sh --ticket <id> --base <sha> --head <sha>`; step 3 owns the real
+    interface.
+11. **Reason routing beyond the sketch**: `lock-held`, `ticket-blocked`, `mirror-fetch-failed` →
+    release, comment, nap `nothingClaimableSleepMinutes` (no hot loop). Run-level reasons
+    (`preflight`, `quarantined`, `dispatch-refused`, `resume-refused`, `pr-open-failed`,
+    `pipeline-error`), unreadable output, `exitCode 0` without a merge, and the loop's own failures
+    (worktree, rails lock, ticket unresolved) → release, comment, **stop the slot (exit 1)**: fleet's
+    `result.mjs` says these need a human and a re-claim would repeat them.
+12. **I8**: fleet's `reason` is sent only when it matches `^[a-z][a-z0-9-]{0,47}$`, else as
+    `unrecognized`. `tickets[].reason`, `warnings`, `results` and tamperguard's `detail` (which
+    quotes the diff) stay in `$FACTORY_HOME/run/logs/`. PR title `<id>: built by <handle> (issue #n)`
+    carries no ticket text. Token counts are `null`: fleet 1.12.0's result document has none.
+13. **Labels**: the loop adds `needs-desk` on `strikes-exhausted`, `flail`, `tamper` and a real scope
+    failure, as the TB4 row says. See open point 1.
+
+Measured gaps and open points (none blocks T9):
+
+1. SPEC-v0.2 contradicts itself: the run-loop sketch says "label Issue needs-desk", the claim
+   protocol says "No node ever edits labels other than adding in-progress", and mirror.sh recomputes
+   `ready`/`needs-desk` from the store on every run, so the node's label can be flipped back. A
+   ruling for the desk (TB6 close-out carries it as a question).
+2. fleet's own commits (`feat(<id>): fleet worker build`, its integration merges) carry no I6
+   trailers; only the loop's record commit does. Step 3's commit-check needs a rule for them (for
+   example "the branch tip's trailers cover the range").
+3. claim.sh has no skip list: a ticket that ended in `lock-held` or `ticket-blocked` is
+   re-claimable after the 10-minute nap.
+4. While scope-check is a stub the success path never pushes, so the first live smoke (T11) ends in
+   `scope-check-not-built` at best.
+5. ralon covers `<wt>/agent.lock`'s rails in the loop's worktree only; fleet's worker worktree is cut
+   after ralon starts and is not covered (amendment above, ralon 3).
+6. Killing a loop mid-fleet leaves the lock held with no slot state; the janitor's stale-lock duty
+   (24 h) or `/factory:release` frees it.
+
 ## Consequences
 
 - SPEC-v0.2's sketch is wrong in five spellings (ralon `--lock`, vetto `--profile`, `cux status --json`,

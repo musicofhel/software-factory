@@ -245,7 +245,7 @@ wt_make() {
   WT="$CLONE/.worktrees/$TICKET"
   LAPSED="$(git -C "$CLONE" for-each-ref --sort=-committerdate --count=1 --format='%(refname)' "refs/remotes/origin/ticket/$TICKET/")"
   if [ -n "$LAPSED" ]; then BASE_KIND=lapsed; BASE="$(git -C "$CLONE" rev-parse "$LAPSED^{commit}")"
-  else BASE_KIND=origin-main; BASE="$(git -C "$CLONE" rev-parse refs/remotes/origin/main^{commit})"; fi
+  else BASE_KIND=origin-main; BASE="$(git -C "$CLONE" rev-parse "refs/remotes/origin/main^{commit}")"; fi
   rec --arg b "$BASE" --arg k "$BASE_KIND" --arg l "${LAPSED#refs/remotes/origin/}" \
     '.base = {kind: $k, sha: $b} + (if $l == "" then {} else {lapsed: $l} end)'
   if [ -e "$WT" ]; then wt_remove; fi
@@ -308,6 +308,8 @@ on_success() {
      .factory-run/tamperguard.json .factory-run/tamperguard.err .factory-run/tamperguard.rc) \
      >>"$LOGBASE.vetto.log" 2>&1 || true
   act tamperguard
+  # the findings quote the diff: they stay on the node, in the run's log (the worktree goes)
+  command cp -f "$WT/.factory-run/tamperguard.json" "$LOGBASE.tamperguard.json" 2>/dev/null || true
   tg="$(command cat "$WT/.factory-run/tamperguard.rc" 2>/dev/null || echo none)"
   tg_out="$(jq -c 'select(type == "object")' "$WT/.factory-run/tamperguard.json" 2>/dev/null | head -n1 || true)"
   [ -n "$tg_out" ] || tg_out='{}'

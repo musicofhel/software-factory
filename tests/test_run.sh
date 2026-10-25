@@ -87,10 +87,9 @@ passing_scope() {  # a built scope-check that passes (step 3's real one will rep
   chmod +x "$WORLD/bin/scope-pass"
   export FACTORY_SCOPE_CHECK="$WORLD/bin/scope-pass"
 }
-loop() {  # loop <args>: run.sh --slot 1 --apply --json in the clone; sets RC, OUT (stdout), ERR, LAST (last line)
+loop() {  # loop <args>: run.sh --slot 1 --apply --json in the clone; sets RC, OUT (stdout), LAST (last line); stderr in $WORLD/err
   RC=0
   OUT="$(cd "$WORLD/clone" && "$RUN" --slot 1 --apply --json "$@" 2>"$WORLD/err")" || RC=$?
-  ERR="$(command cat "$WORLD/err")"
   LAST="$(tail -n1 <<<"$OUT")"
 }
 field() { jq -r "$1" <<<"$LAST"; }
@@ -157,13 +156,15 @@ case_tamper() {
   loop --once
   check "tamperguard says tamper: exit 0, the loop goes on" eq "$RC" 0
   check "  outcome desk, reason tamper" eq "$(field '"\(.outcome) \(.reason)"')" "desk tamper"
-  check "  verdict, score and finding count only" eq "$(field -c .tamperguard)" '{"verdict":"tamper","score":10,"findings":1}'
+  check "  verdict, score and finding count only" eq "$(jq -c .tamperguard <<<"$LAST")" '{"verdict":"tamper","score":10,"findings":1}'
   check "  scope-check never ran" test ! -e "$WORLD/scope.log"
   check "  nothing pushed" test -z "$(pushed)"
   check "  labeled needs-desk" eq "$(labels)" in-progress,needs-desk,ready,w:light
   check "  the lock is released" test -z "$(lock)"
   check "  the comment says nothing was pushed" grep -qF 'Nothing pushed.' <<<"$(last_comment)"
-  check "  no finding text left the node" no_mark "$FAKE_GH_ISSUES" "$FACTORY_HOME/run/ledger.jsonl" <<<"$OUT"
+  jq -r '.issues[].comments[].body' "$FAKE_GH_ISSUES" >"$WORLD/comments.txt"; printf '%s\n' "$OUT" >"$WORLD/stdout.txt"
+  check "  no finding text left the node (comments, ledger, stdout)" \
+    no_mark "$WORLD/comments.txt" "$FACTORY_HOME/run/ledger.jsonl" "$WORLD/stdout.txt"
   export FAKE_TAMPERGUARD_VERDICT=error
   run_setup; passing_scope; export FAKE_TAMPERGUARD_VERDICT=error
   loop --once
@@ -173,7 +174,6 @@ case_tamper() {
 pause_case() {  # pause_case <reason> <expected sleep>
   run_setup
   export FAKE_FLEET_REASON="$1"
-  local lock0
   loop --once
   check "$1: exit 0" eq "$RC" 0
   check "  outcome paused, reason $1" eq "$(field '"\(.outcome) \(.reason)"')" "paused $1"
@@ -215,8 +215,7 @@ case_resume_in_place() {
 case_resume_cap() {
   run_setup
   export FAKE_FLEET_REASON=wall-clock
-  local i
-  for i in 1 2 3; do loop --once; done
+  for _ in 1 2 3; do loop --once; done
   check "three wall-clock pauses: still paused" eq "$(field .outcome) $(jq -r .resumes "$FACTORY_HOME/run/slot-1.json")" "paused 3"
   loop --once
   check "the fourth is handled as strikes-exhausted: desk" eq "$(field '"\(.outcome) \(.reason)"')" "desk wall-clock"
@@ -300,6 +299,10 @@ case_anything_else() {
 case_argv() {
   run_setup
   passing_scope
+  # a ralon shim keeps a copy of the lock ralon reads (the worktree is gone after the iteration)
+  printf '#!/usr/bin/env bash\n[ "$1 $2" = "run -C" ] && command cp "$3/agent.lock" "%s/seen.lock"\nexec "%s/ralon" "$@"\n' \
+    "$WORLD" "$FAKES_DIR" >"$WORLD/bin/ralon"
+  chmod +x "$WORLD/bin/ralon"
   loop --once
   local wt ps
   wt="$(cd "$WORLD/clone" && pwd -P)/.worktrees/T-run"
@@ -308,7 +311,7 @@ case_argv() {
   check "  the rest of ralon's argv is fleet's" eq "$(jq -c '.[5:]' "$FAKE_RALON_LOG")" "$(jq -c .argv "$FAKE_FLEET_LOG")"
   check "fleet runs in the worktree" eq "$(jq -r .cwd "$FAKE_FLEET_LOG")" "$wt"
   check "fleet's argv: ADR-0005's real flags, in order" \
-    eq "$(jq -c '.argv | [.[0:20][], .[20:22][0], .[22:][]] | del(.[17], .[19])' "$FAKE_FLEET_LOG")" \
+    eq "$(jq -c '.argv | del(.[16], .[18])' "$FAKE_FLEET_LOG")" \
        '["run","--tickets","T-run","--concurrency","1","--no-pr","--no-complete","--base","'"$(git -C "$WORLD/clone" rev-parse origin/main)"'","--adapter","claude-code","--max-strikes","2","--wall-clock-minutes","45","--pre-strike-argv","--pre-strike-env","--model-plane-egress","allowlist","--json"]'
   check "  --pre-strike-argv is the absolute quota gate" eq "$(jq -r '.argv[16]' "$FAKE_FLEET_LOG")" "[\"$BIN/quota-gate.sh\"]"
   ps="$(jq -r '.argv[18]' "$FAKE_FLEET_LOG")"
@@ -322,8 +325,9 @@ case_argv() {
   check "  and never wraps fleet" eq "$(jq -s 'map(select(any(.[]; test("fleet")))) | length' "$FAKE_VETTO_LOG")" 0
   check "tamperguard: --range <base>..<integration tip> --json" \
     eq "$(jq -c '.' "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$(field .base.sha)..$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^")" '["--range", $r, "--json"]')"
-  check "the rails lock was rendered for the ticket (ralon-lock.sh)" grep -qF 'tests/rail/**' "$FAKE_ADLC_LOG.lock" 2>/dev/null || \
-    check "the rails lock was rendered for the ticket (ralon-lock.sh)" eq "$(jq -sc 'map(select(.[0:2] == ["ticket", "show"])) | .[0][2]' "$FAKE_ADLC_LOG")" '"T-run"'
+  check "the rails lock was rendered from the ticket (ralon-lock.sh → adlc ticket show)" \
+    eq "$(jq -sc 'map(select(.[0:2] == ["ticket", "show"]))' "$FAKE_ADLC_LOG")" '[["ticket","show","T-run","--json"]]'
+  check "  ralon found <worktree>/agent.lock with the ticket's rail" grep -qxE '[[:space:]]+- "?tests/rail/\*\*"?' "$WORLD/seen.lock"
 }
 
 case_resume() {
@@ -341,7 +345,7 @@ case_resume() {
   git -C "$FAKE_GH_GIT" update-ref refs/heads/ticket/T-run/older-node "$work"
   export FAKE_FLEET_REASON=strikes-exhausted
   loop --once
-  check "a lapsed ticket/T-run/* branch: the worktree base is the newest one" eq "$(field -c .base)" \
+  check "a lapsed ticket/T-run/* branch: the worktree base is the newest one" eq "$(jq -c .base <<<"$LAST")" \
     "$(jq -cn --arg s "$rec" '{kind: "lapsed", sha: $s, lapsed: "ticket/T-run/old-node"}')"
   check "  fleet's --base is that branch" eq "$(jq -r '.argv[(.argv | index("--base")) + 1]' "$FAKE_FLEET_LOG")" "$rec"
   check "  --dead-end-file is passed, absolute, inside the worktree" \
@@ -356,9 +360,8 @@ case_resume() {
 
 case_no_transcript() {
   run_setup; passing_scope
-  loop --once; local o1="$OUT"
+  loop --once
   check "the marker reached the node (so the grep below is not vacuous): fleet's log" grep -qF "$MARK" "$FACTORY_HOME"/run/logs/*.fleet.json
-  local origin_msgs gh_log ledger
   collect() {
     git -C "$FAKE_GH_GIT" log --format=%B --all >>"$WORLD/outbound.txt"
     command cat "$FAKE_GH_LOG" "$FACTORY_HOME/run/ledger.jsonl" >>"$WORLD/outbound.txt"
@@ -377,8 +380,7 @@ case_no_transcript() {
   run_setup; passing_scope; export FAKE_TAMPERGUARD_VERDICT=tamper
   loop --once; : >"$WORLD/outbound.txt"; collect
   check "tamper: no finding text in any outbound payload" no_mark "$WORLD/outbound.txt"
-  check "  (tamperguard did print it, locally)" grep -qF "$MARK" "$WT/.factory-run/tamperguard.json" 2>/dev/null || \
-    check "  (tamperguard did print it, locally)" eq "$(jq -r '.[0]' "$FAKE_TAMPERGUARD_LOG")" --range
+  check "  (tamperguard did print it, into the node-local log)" grep -qF "$MARK" "$FACTORY_HOME"/run/logs/*
 }
 
 case_once() {
@@ -436,11 +438,11 @@ case_guards() {
   loop --once
   check "a dead holder's slot mutex is broken: the loop runs" eq "$RC $(field .outcome)" "0 built"
   check "  and the mutex is dropped at exit" test ! -e "$FACTORY_HOME/run/slot-1.mutex"
-  RC=0; (cd "$WORLD/clone" && FACTORY_MANIFEST= FACTORY_HOME="$WORLD/none" "$RUN" --slot 1 --apply --once >/dev/null 2>&1) || RC=$?
+  RC=0; (cd "$WORLD/clone" && FACTORY_MANIFEST='' FACTORY_HOME="$WORLD/none" "$RUN" --slot 1 --apply --once >/dev/null 2>&1) || RC=$?
   check "no manifest and no \$FACTORY_HOME/env: exit 1" eq "$RC" 1
   mkdir -p "$WORLD/fh2"; printf 'export FACTORY_MANIFEST=%q\n' "$FACTORY_MANIFEST" >"$WORLD/fh2/env"
   fakegh_close 1
-  RC=0; OUT="$(cd "$WORLD/clone" && FACTORY_MANIFEST= FACTORY_HOME="$WORLD/fh2" "$RUN" --slot 1 --apply --once --json 2>/dev/null)" || RC=$?
+  RC=0; OUT="$(cd "$WORLD/clone" && FACTORY_MANIFEST='' FACTORY_HOME="$WORLD/fh2" "$RUN" --slot 1 --apply --once --json 2>/dev/null)" || RC=$?
   check "  \$FACTORY_HOME/env (join.sh writes it) is sourced: exit 0" eq "$RC $(jq -r .outcome <<<"$OUT")" "0 nothing-claimable"
 }
 
