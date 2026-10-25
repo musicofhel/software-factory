@@ -322,10 +322,16 @@ EOF
   unset FAKE_MIRROR_FAIL
   jan --apply
   check "next run retries and saves" eq "$RC $(on_nodes janitor/state.json | jq -c .open_set)" '0 ["T1"]'
+  export FAKE_ADLC_TICKETS='[{"id":"T1"},{"id":"T3"}]' FAKE_ADLC_FORECAST_EXIT=2
+  jan --apply
+  check "forecast exit 2 (a gate failed, forecast printed): still recomputed and saved" \
+    eq "$RC $(pick '.action == "ready-recompute"' 'map([.forecast_exit, .result])') $(on_nodes janitor/state.json | jq -c .open_set)" \
+       '0 [[2,"done"]] ["T1","T3"]'
+  unset FAKE_ADLC_FORECAST_EXIT
   export FAKE_ADLC_FAIL=merge-forecast FAKE_ADLC_TICKETS='[]'
   jan --apply
   check "forecast fails: exit 1, set not saved, mirror not called" \
-    eq "$RC $(on_nodes janitor/state.json | jq -c .open_set) $(jq -s length "$FAKE_MIRROR_LOG")" '1 ["T1"] 2'
+    eq "$RC $(on_nodes janitor/state.json | jq -c .open_set) $(jq -s length "$FAKE_MIRROR_LOG")" '1 ["T1","T3"] 3'
 }
 
 # Everything fires at once. --dry-run (and no flag) must leave every ref and tree byte-identical,
@@ -415,18 +421,92 @@ EOF
   check "no comment" eq "$(comments 70)" '[]'
 }
 
+# Each hook alone: an unset hook makes the run red by itself, whatever else succeeded.
 case_hooks_unconfigured() {
-  jan_setup <<EOF
-node gone $((NOW - 8 * D)) active
-preview p1 $((NOW - 1))
-EOF
-  unset JANITOR_REVOKE_HOOK JANITOR_PREVIEW_HOOK
+  local spec
+  spec="node gone $((NOW - 8 * D)) active
+preview p1 $((NOW - 1))"
+  jan_setup <<<"$spec"
+  unset JANITOR_REVOKE_HOOK
   jan --apply
-  check "exit 1: a human must notice" eq "$RC" 1
-  check "both lines say unconfigured" \
-    eq "$(pick '.result == "unconfigured"' 'map(.action)')" '["preview-teardown","revoke-token"]'
+  check "no revoke hook: exit 1, a human must notice" eq "$RC" 1
+  check "no revoke hook: revoke-token unconfigured, the teardown done" \
+    eq "$(pick '.action | test("revoke|preview")' 'map([.action, .result])')" '[["preview-teardown","done"],["revoke-token","unconfigured"]]'
   check "the node is still archived (one red run, not one every hour)" eval 'on_nodes archive/nodes/gone.json >/dev/null'
+  jan_setup <<<"$spec"
+  unset JANITOR_PREVIEW_HOOK
+  jan --apply
+  check "no preview hook: exit 1" eq "$RC" 1
+  check "no preview hook: preview-teardown unconfigured, the revoke done" \
+    eq "$(pick '.action | test("revoke|preview")' 'map([.action, .result])')" '[["preview-teardown","unconfigured"],["revoke-token","done"]]'
   check "the preview record is kept" eq "$(git -C "$FAKE_GH_GIT" ls-tree --name-only nodes previews/)" previews/p1.json
+}
+
+# race_hook <once|always>: when the janitor's fetch writes refs/janitor/nodes in the ci checkout,
+# a commit lands on the origin's nodes branch first (once: beta's heartbeat, prebuilt in
+# $WORLD/beat; always: a fresh empty commit every time), so the janitor's fast-forward is rejected.
+race_hook() {
+  printf '#!/usr/bin/env bash
+[ "$1" = committed ] || exit 0
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+hit=0
+while read -r _ new ref; do [ "$ref" = refs/janitor/nodes ] && [ "${new//0/}" ] && hit=1; done
+[ "$hit" = 1 ] || exit 0
+o="%s"; w="%s"
+echo x >>"$w/races"
+' \
+    "$FAKE_GH_GIT" "$WORLD" >"$WORLD/ci/.git/hooks/reference-transaction"
+  if [ "$1" = once ]; then
+    printf '[ "$(wc -l <"$w/races")" = 1 ] || exit 0
+git -C "$o" update-ref refs/heads/nodes "$(command cat "$w/beat")"
+'
+  else
+    printf 'tip="$(git -C "$o" rev-parse nodes)"
+git -C "$o" update-ref refs/heads/nodes "$(git -C "$o" commit-tree "$tip^{tree}" -p "$tip" -m beat)"
+'
+  fi >>"$WORLD/ci/.git/hooks/reference-transaction"
+  chmod +x "$WORLD/ci/.git/hooks/reference-transaction"
+}
+
+# The nodes branch moves between the read and the push: the janitor re-reads, re-plans and retries.
+# When it never lands, no node changed state, so nothing acts on a transition (NODES_OK).
+case_nodes_race() {
+  local spec tip idx blob
+  spec="node beta $((NOW - 30 * H)) active
+node gamma $((NOW - 30 * H)) active
+lock 5 beta $((NOW - H))
+lock 6 gamma $((NOW - H))"
+  jan_setup <<<"$spec"
+  for n in 5 6; do fakegh_issue "$n" "$((NOW - 3 * D))" ready,in-progress; done
+  tip="$(fakegh_ref refs/heads/nodes)"; idx="$WORLD/beat-index"
+  blob="$(on_nodes nodes/beta.json | jq --argjson now "$NOW" '.last_seen = ($now | todate)' | git -C "$FAKE_GH_GIT" hash-object -w --stdin)"
+  GIT_INDEX_FILE="$idx" git -C "$FAKE_GH_GIT" read-tree "$tip"
+  GIT_INDEX_FILE="$idx" git -C "$FAKE_GH_GIT" update-index --cacheinfo "100644,$blob,nodes/beta.json"
+  git -C "$FAKE_GH_GIT" commit-tree "$(GIT_INDEX_FILE="$idx" git -C "$FAKE_GH_GIT" write-tree)" -p "$tip" -m "heartbeat beta" >"$WORLD/beat"
+  race_hook once
+  jan --apply
+  check "raced once, then re-read on the retry" eq "$(wc -l <"$WORLD/races")" 2
+  check "exit 0" eq "$RC" 0
+  check "the janitor's commit sits on top of the heartbeat" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-parse nodes^)" "$(command cat "$WORLD/beat")"
+  check "re-planned: beta heartbeated, so it stays active and keeps its lock" \
+    eval '[ "$(on_nodes nodes/beta.json | jq -r .status)" = active ] && has_ref refs/locks/issue-5'
+  check "gamma went stale and its lock was released" \
+    eval '[ "$(on_nodes nodes/gamma.json | jq -r .status)" = stale ] && no_ref refs/locks/issue-6'
+  check "lines: only gamma's transition and release" \
+    eq "$(pick '.action | test("node-|lock")' 'map([.action, (.handle // .issue), .result])')" \
+       '[["node-stale","gamma","done"],["release-lock",6,"done"]]'
+
+  jan_setup <<<"$spec"
+  for n in 5 6; do fakegh_issue "$n" "$((NOW - 3 * D))" ready,in-progress; done
+  race_hook always
+  jan --apply
+  check "always moving: three attempts" eq "$(wc -l <"$WORLD/races")" 3
+  check "exit 1, the nodes commit failed" eq "$RC $(pick '.action == "nodes-commit"' 'map(.result)')" '1 ["failed"]'
+  check "the transitions are reported failed" eq "$(pick '.action == "node-stale"' 'map(.result) | unique')" '["failed"]'
+  check "nothing acts on a transition that did not land: both locks kept, no comment" \
+    eval 'has_ref refs/locks/issue-5 && has_ref refs/locks/issue-6 && [ "$(comments 5)$(comments 6)" = "[][]" ]'
+  check "no release line" eq "$(lines '.action == "release-lock"')" 0
 }
 
 # The fakes' new verbs: gh pr list, gh issue list state/body as gh answers them, adlc, mirror.
@@ -453,6 +533,8 @@ case_fake_semantics() {
     eq "$(adlc merge-forecast --json | jq -c '[.mergeOrder, .waves, .certifiedWidth]')" '[["T1","T2"],[["T1","T2"]],2]'
   check "adlc logs argv" eq "$(jq -sc 'map(.[0])' "$FAKE_ADLC_LOG")" '["ticket","merge-forecast"]'
   check "adlc refuses an unknown verb" eval '! adlc ticket complete T1 2>/dev/null'
+  check "FAKE_ADLC_FORECAST_EXIT: prints the forecast, then exits with it" \
+    eval '[ "$(FAKE_ADLC_FORECAST_EXIT=2 adlc merge-forecast --json | jq -c .mergeOrder; echo "${PIPESTATUS[0]}")" = $'"'"'["T1","T2"]\n2'"'"' ]'
   check "FAKE_ADLC_FAIL fails a matching call" eval '! FAKE_ADLC_FAIL=forecast adlc merge-forecast --json >/dev/null 2>&1'
   printf '{"mergeOrder":["T9"]}' >"$WORLD/f.json"
   mirror --apply --forecast "$WORLD/f.json"
@@ -462,7 +544,7 @@ case_fake_semantics() {
 
 echo "test_janitor"
 for c in stale-lock stale-node over-slots fresh-branch-kept no-pr-48h branch-sweep node-lifecycle preview-ttl \
-         ready-recompute dry-run-inert refuses-off-hosted lease-race hooks-unconfigured fake-semantics; do
+         ready-recompute dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

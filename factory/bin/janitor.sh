@@ -262,7 +262,7 @@ ready_pass() {
       merge_order: .mergeOrder, certified_width: .certifiedWidth, forecast_exit: $rc}' "$ffile")"
   if [ "$apply" = 0 ]; then emit "$line" planned; return 0; fi
   if "$MIRROR" --apply --forecast "$ffile" >&2; then
-    emit "$line" done
+    emit "$line" "done"
     jq --argjson open "$open" --arg at "$(epoch_to_iso "$NOW")" \
       '{open_set: $open, forecast: {mergeOrder, waves, certifiedWidth}, recomputed_at: $at}' "$ffile" >"$WORK/state.json"
     printf 'put\tjanitor/state.json\t%s\n' "$WORK/state.json" >>"$NODES_EDITS"
@@ -286,7 +286,7 @@ previews_pass() {
     fi
     git cat-file blob "$NS/nodes:$path" >"$WORK/preview-$name.json"
     if "$JANITOR_PREVIEW_HOOK" teardown "$name" "$WORK/preview-$name.json" >&2; then
-      emit "$line" done
+      emit "$line" "done"
       printf 'rm\t%s\t-\n' "$path" >>"$NODES_EDITS"
     else
       fail_line "$line" "the teardown hook failed; the record is kept"
@@ -324,7 +324,7 @@ nodes_commit() {
     if [ "$apply" = 0 ]; then emit "$(jq -c '{action: "nodes-commit", files: .}' <<<"$changed")" planned; return 0; fi
     new="$(git commit-tree "$tree" -p "$tip" -m "$msg")"
     if push_ref refs/heads/nodes "" "$new"; then
-      emit "$(jq -c --arg sha "$new" '{action: "nodes-commit", sha: $sha, files: .}' <<<"$changed")" done
+      emit "$(jq -c --arg sha "$new" '{action: "nodes-commit", sha: $sha, files: .}' <<<"$changed")" "done"
       return 0
     fi
     warn "nodes push rejected (attempt $attempt): $(push_detail)"
@@ -400,13 +400,13 @@ claims_pass() {
       else fail_line "$line" "$(push_detail)"; fi
       continue
     fi
-    emit "$line" done
+    emit "$line" "done"
     if jq -e .has_issue <<<"$c" >/dev/null; then
-      if gh issue comment "$n" --repo "$REPO" --body "$body" >/dev/null; then emit "$comment" done
+      if gh issue comment "$n" --repo "$REPO" --body "$body" >/dev/null; then emit "$comment" "done"
       else fail_line "$comment" "gh issue comment failed"; fi
     fi
     if [ -n "$remove" ]; then
-      if gh issue edit "$n" --repo "$REPO" --remove-label in-progress >/dev/null; then emit "$remove" done
+      if gh issue edit "$n" --repo "$REPO" --remove-label in-progress >/dev/null; then emit "$remove" "done"
       else fail_line "$remove" "gh issue edit failed"; fi
     fi
   done <<<"$plan"
@@ -422,7 +422,7 @@ retire_pass() {  # token revocation and the halt notice for each node retired in
     if [ "$apply" = 0 ]; then emit "$line" planned
     elif [ -z "${JANITOR_REVOKE_HOOK:-}" ]; then
       FAILED=1; emit "$(jq -c '. + {detail: "JANITOR_REVOKE_HOOK is not set; revoke the node token by hand"}' <<<"$line")" unconfigured
-    elif "$JANITOR_REVOKE_HOOK" "$handle" "$owner" >&2; then emit "$line" done
+    elif "$JANITOR_REVOKE_HOOK" "$handle" "$owner" >&2; then emit "$line" "done"
     else fail_line "$line" "the revoke hook failed; revoke the node token by hand"; fi
 
     held="$(jq -c --arg h "$handle" '[.[] | select(.holder == $h)] | sort_by(.issue)' <<<"$LOCKS")"
@@ -436,7 +436,7 @@ retire_pass() {  # token revocation and the halt notice for each node retired in
     line="$(jq -cn --arg h "$handle" --arg t "$ticket" --arg r "$reason" --arg l "$link" \
       '{action: "summon-halt", handle: $h, ticket: $t, reason: $r, link: $l}')"
     if [ "$apply" = 0 ]; then emit "$line" planned; continue; fi
-    if "$SUMMON" --kind halt --apply --ticket "$ticket" --link "$link" --reason "$reason" >&2; then emit "$line" done
+    if "$SUMMON" --kind halt --apply --ticket "$ticket" --link "$link" --reason "$reason" >&2; then emit "$line" "done"
     else fail_line "$line" "summon.sh failed"; fi
   done <<<"$plan"
 }
@@ -450,7 +450,7 @@ branches_pass() {
     line="$(jq -c '{action: "delete-branch", branch, sha, ticket, issue, reason, age_days: (.age / 86400 | floor)}' <<<"$b")"
     if [ "$apply" = 0 ]; then emit "$line" planned; continue; fi
     ref="refs/heads/$(jq -r .branch <<<"$b")"; sha="$(jq -r .sha <<<"$b")"
-    if push_ref "$ref" "$sha" ""; then emit "$line" done
+    if push_ref "$ref" "$sha" ""; then emit "$line" "done"
     elif lease_lost; then
       emit "$(jq -c '. + {detail: "the branch moved since it was read; left alone"}' <<<"$line")" skipped
     else fail_line "$line" "$(push_detail)"; fi
@@ -462,7 +462,7 @@ ready_pass
 previews_pass
 nodes_commit
 if [ "$NODES_OK" = 1 ]; then
-  node_lines "$([ "$apply" = 1 ] && echo done || echo planned)"
+  node_lines "$([ "$apply" = 1 ] && echo "done" || echo planned)"
 else
   # Nothing landed on the nodes branch: no node changed state, so nothing may act on one.
   node_lines failed

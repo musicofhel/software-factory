@@ -1,6 +1,7 @@
 # Clock and janitor: owns every time-driven transition. Hourly, one at a time.
 # Dry-run form for a week after any change to this job (gemini-cli pattern): the
-# DRY_RUN variable is flipped by a PR, never by hand.
+# JANITOR_DRY_RUN variable is flipped by a PR, never by hand. Only JANITOR_DRY_RUN=false applies;
+# unset, true or anything else is a dry run, and a manual dispatch can only narrow it to a dry run.
 name: janitor
 on:
   schedule:
@@ -11,13 +12,18 @@ on:
         description: "print what would change, change nothing"
         type: boolean
         default: true
+# Concurrency groups are repo-wide: sharing the mirror's group keeps the janitor from overlapping
+# the mirror job and itself. A pending run is replaced by a newer pending one; the next hour covers it.
 concurrency:
-  group: janitor
+  group: mirror
   cancel-in-progress: false
 permissions:
   contents: write
   issues: write
   pull-requests: write
+defaults:
+  run:
+    shell: bash
 jobs:
   janitor:
     runs-on: ubuntu-latest
@@ -25,10 +31,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      # 0 absent → sweep; 3 halted → skip the sweep (green, with a notice); anything else is
+      # unknown → red.
       - name: halt check
-        run: ./factory/bin/halt-check.sh
+        id: halt
+        run: |
+          set +e
+          ./factory/bin/halt-check.sh
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "halted=false" >> "$GITHUB_OUTPUT" ;;
+            3) echo "halted=true" >> "$GITHUB_OUTPUT"
+               echo "::notice::factory/HALT is on main; the janitor sweep is skipped" ;;
+            *) exit "$rc" ;;
+          esac
       - name: janitor sweep
+        if: steps.halt.outputs.halted == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          DRY_RUN: ${{ inputs.dry_run != false && vars.JANITOR_DRY_RUN != 'false' }}
-        run: ./factory/bin/janitor.sh ${{ env.DRY_RUN == 'true' && '--dry-run' || '' }}
+          DISCORD_WEBHOOK: ${{ secrets.SUMMONER_WEBHOOK }}
+          SUMMONER_TO: ${{ vars.SUMMONER_TO }}
+          APPLY: ${{ vars.JANITOR_DRY_RUN == 'false' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false) }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
+          echo "janitor $mode" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./factory/bin/janitor.sh "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
