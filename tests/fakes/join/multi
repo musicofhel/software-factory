@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Multi-call fake for tests/test_join.sh: the test links it into a closed PATH under the name of
+# each tool the join wizard probes or installs with, and it behaves by that name. Every call is
+# logged as {"tool", "argv", "pwd"} to $FAKE_JOIN_LOG when set. Nothing here sandboxes or
+# downloads anything; each fake writes only where the real tool would given the same flags and
+# environment, so a missing --root or cache variable shows up as a write into $HOME.
+#
+#   uname          -s → $FAKE_UNAME_S (Linux), -m → $FAKE_UNAME_M (x86_64)
+#   nproc          $FAKE_NPROC (8)
+#   df -Pk DIR     one POSIX line, $FAKE_DF_AVAIL_KB (100 GiB) available
+#   id -u          $FAKE_UID (linked only by the case that wants root)
+#   sysctl -n K    hw.ncpu → $FAKE_NPROC, hw.memsize → $FAKE_MEMSIZE (16 GiB)
+#   vm_stat        page size 16384; $FAKE_VM_FREE / _INACTIVE / _SPECULATIVE pages
+#   bwrap          --version "bubblewrap 0.9.0"; otherwise exit $FAKE_BWRAP_EXIT (0)
+#   sandbox-exec   exit $FAKE_SANDBOX_EXEC_EXIT (0)
+#   claude         --version "$FAKE_CLAUDE_VERSION (Claude Code)" (2.1.280); `auth status --json`
+#                  → {"loggedIn": $FAKE_CLAUDE_LOGGED_IN (true), "email": <a secret the wizard must
+#                  never print>}
+#   codex          --version "codex-cli 0.50.0"
+#   make test      runs in the clone: logs $TMPDIR, writes a file into it, then `sleep
+#                  $FAKE_SUITE_SECONDS` (0) as a child process and exits $FAKE_SUITE_EXIT (0)
+#   cargo install --locked [--root R] <crate>@<v>
+#                  R/bin/<crate> printing "<crate> <v>" (no --root: $CARGO_HOME or ~/.cargo);
+#                  the crate cache under $CARGO_HOME (default ~/.cargo)/registry
+#   uv tool list | uv tool install <pkg>==<v>
+#                  tools in $UV_TOOL_DIR (~/.local/share/uv/tools), executables in $UV_TOOL_BIN_DIR
+#                  (~/.local/bin), cache in $UV_CACHE_DIR (~/.cache/uv); list prints "<pkg> v<v>"
+#   npx -y @adlc/cli@<v> --version | init --root R --harness H
+#                  primes $npm_config_cache (~/.npm)/_npx/fake/node_modules/@adlc/cli; init makes R/.adlc
+#   npm install -g [--prefix P] [--cache C] @anthropic-ai/claude-code@<v>
+#                  P/bin/claude at <v> (no --prefix: ~/.npm-global)
+#   curl -fsSL -o FILE URL
+#                  a *.tar.xz URL gets a tarball holding a `dcg` that prints its version (0.15.3);
+#                  anything else a `cux` binary printing "cux 0.4.1". $FAKE_CURL_FAIL=1 → exit 22
+#   sha256sum -c - / shasum -a 256 -c -
+#                  reads "<sha>  <file>" lines, logs them; "OK", or FAILED and exit 1 when
+#                  $FAKE_SHA_MISMATCH=1
+# Any other call exits 2 so the wizard never relies on a verb the fake does not know.
+set -euo pipefail
+me="$(basename "$0")"
+if [ -n "${FAKE_JOIN_LOG:-}" ]; then
+  printf '%s\0' "$@" | jq -cRs --arg t "$me" --arg pwd "$PWD" '{tool: $t, argv: (split("\u0000")[:-1]), pwd: $pwd}' >>"$FAKE_JOIN_LOG"
+fi
+nope() { echo "fake $me: unsupported call: $*" >&2; exit 2; }
+stub() {  # stub <path> <version-line>: an executable that prints the line for --version
+  mkdir -p "$(dirname "$1")"
+  printf '#!/usr/bin/env bash\necho "%s"\n' "$2" >"$1"
+  chmod +x "$1"
+}
+
+case "$me" in
+  uname)
+    case "${1:-}" in -m) echo "${FAKE_UNAME_M:-x86_64}" ;; -s|'') echo "${FAKE_UNAME_S:-Linux}" ;; *) echo 6.0.0-fake ;; esac ;;
+  nproc) echo "${FAKE_NPROC:-8}" ;;
+  df)
+    echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+    echo "/dev/fake 209715200 104857600 ${FAKE_DF_AVAIL_KB:-104857600} 50% /" ;;
+  id) [ "${1:-}" = -u ] || nope "$@"; echo "${FAKE_UID:-1000}" ;;
+  sysctl)
+    case "${2:-}" in hw.ncpu) echo "${FAKE_NPROC:-8}" ;; hw.memsize) echo "${FAKE_MEMSIZE:-17179869184}" ;; *) nope "$@" ;; esac ;;
+  vm_stat)
+    echo "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+    echo "Pages free:                               ${FAKE_VM_FREE:-100000}."
+    echo "Pages active:                             500000."
+    echo "Pages inactive:                           ${FAKE_VM_INACTIVE:-200000}."
+    echo "Pages speculative:                        ${FAKE_VM_SPECULATIVE:-10000}." ;;
+  bwrap) [ "${1:-}" = --version ] && { echo "bubblewrap 0.9.0"; exit 0; }; exit "${FAKE_BWRAP_EXIT:-0}" ;;
+  sandbox-exec) exit "${FAKE_SANDBOX_EXEC_EXIT:-0}" ;;
+  claude)
+    case "${1:-}" in
+      --version) echo "${FAKE_CLAUDE_VERSION:-2.1.280} (Claude Code)" ;;
+      auth) [ "${2:-}" = status ] || nope "$@"
+            jq -n --argjson in "${FAKE_CLAUDE_LOGGED_IN:-true}" \
+              '{loggedIn: $in, authMethod: "claude.ai", email: "owner-secret@example.invalid", orgName: "Secret Org"}' ;;
+      *) nope "$@" ;;
+    esac ;;
+  codex) [ "${1:-}" = --version ] || nope "$@"; echo "codex-cli 0.50.0" ;;
+  make)
+    [ "${1:-}" = test ] || nope "$@"
+    jq -cn --arg tmp "${TMPDIR:-}" --arg pwd "$PWD" '{suite_tmpdir: $tmp, pwd: $pwd}' >>"${FAKE_JOIN_LOG:-/dev/null}"
+    [ -z "${TMPDIR:-}" ] || echo scratch >"$TMPDIR/suite-scratch"
+    sleep "${FAKE_SUITE_SECONDS:-0}"
+    exit "${FAKE_SUITE_EXIT:-0}" ;;
+  cargo)
+    [ "${1:-}" = install ] || nope "$@"
+    shift; root="" spec=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --locked) ;; --root) root="$2"; shift ;; *@*) spec="$1" ;; *) nope install "$@" ;; esac
+      shift
+    done
+    ch="${CARGO_HOME:-$HOME/.cargo}"
+    mkdir -p "$ch/registry"; echo "${spec}" >"$ch/registry/fetched-${spec%@*}"
+    stub "${root:-$ch}/bin/${spec%@*}" "${spec%@*} ${spec#*@}" ;;
+  uv)
+    [ "${1:-}" = tool ] || nope "$@"
+    tools="${UV_TOOL_DIR:-$HOME/.local/share/uv/tools}"
+    case "${2:-}" in
+      list)
+        [ -d "$tools" ] || { echo "No tools installed"; exit 0; }
+        for d in "$tools"/*/; do [ -f "$d/version" ] && printf '%s v%s\n- %s\n' "$(basename "$d")" "$(command cat "$d/version")" "$(basename "$d")"; done ;;
+      install)
+        pkg="${3%%==*}" ver="${3#*==}"
+        mkdir -p "$tools/$pkg" "${UV_CACHE_DIR:-$HOME/.cache/uv}"
+        echo "$ver" >"$tools/$pkg/version"
+        echo "$pkg" >"${UV_CACHE_DIR:-$HOME/.cache/uv}/fetched-$pkg"
+        stub "${UV_TOOL_BIN_DIR:-$HOME/.local/bin}/$pkg" "usage: $pkg" ;;
+      *) nope "$@" ;;
+    esac ;;
+  npx)
+    [ "${1:-}" = -y ] || nope "$@"
+    v="${2#@adlc/cli@}"
+    cache="${npm_config_cache:-$HOME/.npm}"
+    mkdir -p "$cache/_npx/fake/node_modules/@adlc/cli"
+    jq -n --arg v "$v" '{name: "@adlc/cli", version: $v}' >"$cache/_npx/fake/node_modules/@adlc/cli/package.json"
+    case "${3:-}" in
+      --version) echo "$v" ;;
+      init) [ "${4:-}" = --root ] || nope "$@"; mkdir -p "$5/.adlc"; echo '{}' >"$5/.adlc/config.json" ;;
+      *) nope "$@" ;;
+    esac ;;
+  npm)
+    [ "${1:-}" = install ] && [ "${2:-}" = -g ] || nope "$@"
+    shift 2; prefix="$HOME/.npm-global" pkg=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --prefix) prefix="$2"; shift ;; --cache) shift ;; @anthropic-ai/claude-code@*) pkg="$1" ;; *) nope "$@" ;; esac
+      shift
+    done
+    [ -n "$pkg" ] || nope "no package"
+    mkdir -p "$prefix/bin"
+    printf '#!/usr/bin/env bash\ncase "$1" in --version) echo "%s (Claude Code)" ;; auth) echo "{\\"loggedIn\\": true}" ;; esac\n' \
+      "${pkg##*@}" >"$prefix/bin/claude"
+    chmod +x "$prefix/bin/claude" ;;
+  curl)
+    [ "${FAKE_CURL_FAIL:-0}" != 1 ] || exit 22
+    out="" url=""
+    while [ $# -gt 0 ]; do
+      case "$1" in -fsSL) ;; -o) out="$2"; shift ;; https://*) url="$1" ;; *) nope "$@" ;; esac
+      shift
+    done
+    [ -n "$out" ] && [ -n "$url" ] || nope "need -o FILE URL"
+    if [[ "$url" == *.tar.xz ]]; then
+      d="$(mktemp -d)"
+      stub "$d/dcg" "0.15.3"
+      tar -cJf "$out" -C "$d" dcg
+      rm -rf "$d"
+    else
+      stub "$out" "cux 0.4.1"
+    fi ;;
+  sha256sum|shasum)
+    rc=0
+    while read -r sum file; do
+      jq -cn --arg s "$sum" --arg f "$file" '{sha_check: $s, file: $f}' >>"${FAKE_JOIN_LOG:-/dev/null}"
+      if [ "${FAKE_SHA_MISMATCH:-0}" = 1 ]; then echo "$file: FAILED"; rc=1; else echo "$file: OK"; fi
+    done
+    exit "$rc" ;;
+  *) nope "$@" ;;
+esac

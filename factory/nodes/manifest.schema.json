@@ -18,7 +18,8 @@
     "adapters": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": { "enum": ["claude-code", "codex", "agy", "opencode"] },
+      "propertyNames": { "enum": ["claude-code", "codex", "gemini", "agy", "jetski", "opencode", "pi", "cursor",
+                                  "copilot"] },
       "additionalProperties": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" }
     },
     "quota_tier":      { "enum": ["free", "pro", "max", "team", "unknown"] },
