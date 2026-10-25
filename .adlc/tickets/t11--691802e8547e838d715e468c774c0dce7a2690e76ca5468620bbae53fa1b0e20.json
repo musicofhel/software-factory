@@ -1,0 +1,14 @@
+{
+  "body": "weight: heavy\ntier: 2\ncharter: C5\n\nProve build order step 2 end to end on the dev box, then close it out. Never against GitHub: every push goes to a local bare origin built by tests/fixtures/make-repo.sh.\n\nPart A, live smoke: run `factory/bin/join.sh --apply` (T7) with a temporary FACTORY_HOME and the fixture origin, then `factory/bin/run.sh --slot 1 --once` (T9) on a toy ticket T-smoke created in the fixture's own ticket store (\"add `hello.sh` that prints hello, with a test\"), with the claude-code adapter and the real vetto 0.6.5, ralon 0.1.7 and `npx -y @adlc/cli@1.12.0 fleet run`; wall clock at most 15 minutes, at most 2 strikes. Record the governor line, the claim ref in the fixture, the fleet reason, the pushed `ticket/T-smoke/dev-box` branch in the fixture, the ledger line and the token count. A reason other than success still passes if every branch the loop took was the specified one and the cause is named; a sandbox that ran open is a failure.\n\nPart B, close-out: `make test`, `make lint` and `make live` green; `npx -y @adlc/cli@1.12.0 coldstart --all --offline --json` gap list empty for T6-T11; README.md build-order row 2 reads \"built locally, awaiting first join\".\n\nAcceptance criteria:\n1. The live smoke's six recorded items exist, with the commands that produced them. Verify: `make live` (tests/live/test_smoke_live.sh) and its output in specs/factory-step2-v1/records/TB6.md.\n2. The sandbox was enforced during the smoke (vetto session events or audit show the policy applied; fleet's result echoes its sandbox policy). Verify: `vetto audit` output in the records.\n3. `make test`, `make lint`, `make live` exit 0. Verify: run them.\n4. coldstart gaps empty for T6-T11. Verify: `npx -y @adlc/cli@1.12.0 coldstart --all --offline --json`.\n5. README row 2 updated. Verify: `grep -n 'awaiting first join' README.md`.\n\nOut of scope: the real `join.sh --apply` against GitHub, the first heartbeat on the real `nodes` branch, fine-grained token ref scoping and the real 422 CAS: all due at first join.",
+  "category": "test",
+  "duration": 1,
+  "edges": [],
+  "id": "T11",
+  "rails": [],
+  "scope": [
+    "tests/live/test_smoke*.sh",
+    "tests/fixtures/**",
+    "README.md"
+  ],
+  "title": "Prove step 2 live on the dev box against a local origin, and close it out"
+}

@@ -1,0 +1,23 @@
+{
+  "body": "weight: light\ntier: 1\ncharter: C5\n\nBuild the join wizard `/factory:join`: `factory/bin/join.sh` plus `factory/skills/join/SKILL.md` (updated from contract to built). Design: docs/spec/SPEC-v0.2.txt \"Join wizard\" and \"Manifest\" (L295-345). Pinned tool versions and install commands: specs/factory-step2-v1/records/TB0.md; adapter pins: factory/policy/adapters.json (written by T6). Bash 4+, jq, git, gh; `set -euo pipefail`; dry-run is the default, `--apply` performs writes; exit 0 pass, 1 operational error, 2 refusal.\n\nSteps, in order:\n1. Probe: nproc, total and free RAM, free disk, OS including WSL2 detection, which of claude, codex, agy, opencode are installed and authenticated. A sandbox backend is required: `bwrap` on Linux, `sandbox-exec` on macOS; when it is missing the wizard refuses and prints the install line.\n2. slots = min(8, floor(free_ram_gb / 2) - 1); refuse when slots < 1.\n3. heavy_gates = whether a timed dry run of `make test` finishes inside the ticket timeout from factory/policy/budget.json.\n4. Refuse when `--dangerously-skip-permissions` is aliased or set in any shell rc file or Claude Code settings file the wizard can read.\n5. Install plan pinned from factory/policy/adapters.json and the TB0 pins (vetto 0.6.5, ralon 0.1.7, tamperguard 0.2.0, dcg v0.15.3, cux v0.4.1, @adlc/cli 1.12.0): dry run prints every command; `--apply` runs them, user space only, never sudo.\n6. Register: print the fine-grained token instructions (this repo only; contents write on the three ref patterns ticket/**, nodes/** and refs/locks/**; 90-day expiry) and the self-hosted runner command. It never creates a token or a runner. A token the user provides is stored at `~/.factory/token` with mode 0600.\n7. Build the manifest `<handle>.json`, validate it against factory/nodes/manifest.schema.json, commit it to the `nodes` branch and push with compare-and-swap (in tests: against the local bare origin built by tests/fixtures/make-repo.sh).\n8. Print the run-loop command and factory/RULES.md.\n\nAcceptance criteria:\n1. Each refusal (no sandbox backend, slots < 1, skip-permissions alias in a shell rc, skip-permissions in Claude settings, no authenticated adapter, manifest fails the schema) exits 2 with a message naming the cause. Verify: `make test` (tests/test_join.sh, one case per refusal, using fakes).\n2. The slots formula at its boundaries (free RAM 3.9, 4, 5.9, 6, 18, 19, 40 GB) gives 0(refuse), 1, 1, 2, 8, 8, 8. Verify: `make test` (tests/test_join.sh case 'slots').\n3. The dry run writes nothing anywhere; `--apply` writes nowhere outside the clone and `~/.factory/` (a test diffs a temporary `$HOME` before and after). Verify: `make test` (case 'home-diff').\n4. The manifest is committed to `nodes` and CAS-pushed to the fixture origin; a concurrent push makes the second wizard retry or fail cleanly, never force. Verify: `make test` (case 'nodes-cas').\n5. The wizard in `--dry-run` on a real Linux box prints the probe, the plan and the manifest. Verify: `make live` (tests/live/test_join_live.sh), output pasted into the row's records.\n6. shellcheck -S warning clean. Verify: `make lint`.\n\nOut of scope: creating the GitHub token or runner (the user does both by hand); the run loop (T9).",
+  "category": "feature",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T11"
+    }
+  ],
+  "id": "T7",
+  "rails": [],
+  "scope": [
+    "factory/bin/join.sh",
+    "factory/bin/lib/probe.sh",
+    "factory/skills/join/SKILL.md",
+    "factory/nodes/manifest.schema.json",
+    "factory/nodes/README.md",
+    "tests/test_join*.sh",
+    "tests/fakes/join/**",
+    "tests/live/test_join*.sh"
+  ],
+  "title": "Build the join wizard: probe, pinned install plan, token instructions, manifest committed to nodes"
+}

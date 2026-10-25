@@ -1,0 +1,21 @@
+{
+  "body": "weight: light\ntier: 0\ncharter: C5\n\nBuild the budget governor `factory/bin/governor.sh --json`, the gate the run loop (T9) asks before every claim. Design: docs/spec/SPEC-v0.2.txt \"Budget governor\" (L899-912) and the run-loop sketch (L352-361). It composes, in this order: version_check (factory/bin/version-check.sh), heartbeat (factory/bin/heartbeat.sh; hourly at most, skipped when the manifest's `last_seen` is under 60 minutes old), kill_switch_check (factory/bin/halt-check.sh; its exit 3 = halted), quiet_hours_check (manifest `quiet_hours` in the manifest's time zone; a window may wrap midnight), quota_check (cux v0.4.1; it has no `status --json`, so read the real JSON surface recorded in specs/factory-step2-v1/records/TB0.md and docs/adr/0005-run-loop-cli-reality.md, e.g. `cux usage show`; when every account is at or above `quota_cap`, sleep until the earliest reset). Sleep lengths come from factory/policy/budget.json `governor`.\n\nAlso `factory/bin/quota-gate.sh`: the absolute pre-strike command `fleet run --pre-strike-argv` calls before every strike (ADR-0005): it reads the same cux JSON and exits 0 when at least one account is under `quota_cap`, non-zero otherwise (fleet then pauses the ticket as quota-paused).\n\nOutput: exactly one JSON line `{\"action\": \"claim\"|\"sleep\"|\"refuse\", \"reason\": <string>, \"sleep_seconds\": <int>}`. Exit 0 on claim or sleep, 2 on refuse, 1 on an operational error. The current time comes from `FACTORY_NOW` (ISO-8601) when set, else the clock.\n\nAcceptance criteria:\n1. Each reason is produced by its own condition: version behind → refuse; HALT present → sleep haltSleepMinutes; inside quiet hours → sleep until they end; all accounts at the cap → sleep until the earliest reset; otherwise claim. Verify: `make test` (tests/test_governor.sh, one case per reason, fake cux under tests/fakes/cux and FACTORY_NOW).\n2. A quiet-hours window that wraps midnight (22:00-07:00) is honoured on both sides of midnight. Verify: `make test` (case 'midnight-wrap').\n3. A DST boundary in a non-UTC zone (America/New_York on the spring-forward and fall-back dates) gives the correct sleep length. Verify: `make test` (case 'dst').\n4. A malformed or empty cux payload fails closed: action sleep, never claim. Verify: `make test` (case 'cux-malformed').\n5. The heartbeat runs at most hourly: skipped when last_seen is under 60 minutes old. Verify: `make test` (case 'heartbeat-hourly').\n6. The fake cux's behaviour is itself tested against the payload shape recorded from the real cux v0.4.1. Verify: `make test` (case 'fake-cux').\n7. quota-gate.sh exits 0 with an account under the cap and non-zero when every account is at or above it or the payload is malformed. Verify: `make test` (case 'quota-gate').\n8. shellcheck -S warning clean. Verify: `make lint`.\n\nOut of scope: the claim itself and the run loop (T9).",
+  "category": "feature",
+  "duration": 1,
+  "edges": [
+    {
+      "to": "T9"
+    }
+  ],
+  "id": "T8",
+  "rails": [],
+  "scope": [
+    "factory/bin/governor.sh",
+    "factory/bin/lib/governor*.sh",
+    "factory/policy/budget.json",
+    "tests/test_governor*.sh",
+    "tests/fakes/cux",
+    "factory/bin/quota-gate.sh"
+  ],
+  "title": "Build the budget governor: version, heartbeat, kill switch, quiet hours and quota checks in one JSON verdict"
+}
