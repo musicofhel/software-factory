@@ -111,6 +111,40 @@ case_adapter_pin_behind() {
   check "a pin file that is not an object: exit 1 (unknown)" eq "$RC" 1
 }
 
+case_adapter_unpinned() {
+  vc_setup
+  desk_push factory/policy/adapters.json "$(command cat "$REPO_ROOT/factory/policy/adapters.json")"
+  manifest '{"claude-code": "2.1.280"}'
+  fake_cli claude "2.1.280 (Claude Code)"
+  vc --manifest "$WORLD/me.json" --json
+  check "the repo's adapters.json: claude-code at its pin claims, exit 0" eq "$RC" 0
+  check "pins_source is the file, no longer null" \
+    eq "$(jq -c '[.pins_source, [.adapters[] | [.name, .main_pin, .state]]]' <<<"$OUT")" \
+       '["factory/policy/adapters.json",[["claude-code","2.1.280","current"]]]'
+  manifest '{"codex": "0.5.0"}'
+  fake_cli codex "codex-cli 0.5.0"
+  vc --manifest "$WORLD/me.json" --json
+  check "codex is null on main: exit 2 even though it is installed at the manifest pin" eq "$RC" 2
+  check "state unpinned, main_pin null" eq "$(jq -c '[.adapters[0].state, .adapters[0].main_pin, .ok]' <<<"$OUT")" '["unpinned",null,false]'
+  check "the refusal says not pinned yet" \
+    eval 'grep -q "codex is not pinned on origin/main (null in factory/policy/adapters.json): the factory does not claim with it yet" <<<"$ERR"'
+  manifest '{"claude-code": "2.1.280", "codex": "0.5.0"}'
+  vc --manifest "$WORLD/me.json"
+  check "one null-pinned adapter in the manifest refuses the node: exit 2" eq "$RC" 2
+  manifest '{"aider": "1.0.0"}'
+  fake_cli aider "aider 1.0.0"
+  vc --manifest "$WORLD/me.json" --json
+  check "an adapter adapters.json does not list: exit 2, state unlisted" eq "$RC $(jq -r '.adapters[0].state' <<<"$OUT")" "2 unlisted"
+  check "the refusal says unknown adapter" eval 'grep -q "aider is not in factory/policy/adapters.json on origin/main: unknown adapter" <<<"$ERR"'
+  desk_push factory/policy/adapters.json '{"claude-code": "2.1.280-beta"}'
+  manifest '{"claude-code": "2.1.280"}'
+  vc --manifest "$WORLD/me.json" --json
+  check "a main pin that is not exactly x.y.z: exit 2, bad-pin" eq "$RC $(jq -r '.adapters[0].state' <<<"$OUT")" "2 bad-pin"
+  desk_push factory/policy/adapters.json '{"claude-code": 2}'
+  vc --manifest "$WORLD/me.json" --json
+  check "a main pin that is not a string: exit 2, bad-pin" eq "$RC $(jq -r '.adapters[0].state' <<<"$OUT")" "2 bad-pin"
+}
+
 case_installed_drift() {
   vc_setup
   manifest '{"claude-code": "2.1.280"}'
@@ -151,7 +185,7 @@ case_unknown() {
 }
 
 echo "test_version_check"
-for c in current version-behind numeric-compare adapter-pin-behind installed-drift unknown; do
+for c in current version-behind numeric-compare adapter-pin-behind adapter-unpinned installed-drift unknown; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

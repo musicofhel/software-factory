@@ -1,0 +1,35 @@
+# vetto 0.6.5 policy for test and build steps (ticket T6). No network; writes only to the worktree
+# and the factory dependency cache. Schema: vetto 0.6.5 src/policy/loader/schema.rs (unknown keys
+# are errors: vetto exits 125 and the command never runs). Measured in records/TB1.md of
+# specs/factory-step2-v1.
+#
+# Invoke it exactly so, from the worktree root ($PROJECT is vetto's working directory, not the git
+# top level):
+#
+#   vetto --profile strict --policy factory/policy/build.toml --tui none -- <build or test command>
+#
+# - `--profile strict` is required. A policy file cannot replace the base profile (`extends` in a
+#   --policy layer does not lower the CLI's default profile, and `extends = "strict"` under
+#   `--profile strict` is an inheritance cycle), and the default profile adds writable /tmp,
+#   ~/.cache and /run/user roots. Strict writes: $PROJECT, /dev/null, and what this file adds.
+#   /tmp inside the sandbox is a private tmpfs, so a worktree under /tmp is invisible to the
+#   command (vetto exits 125 without a message): keep worktrees out of /tmp.
+# - vetto drops a write root that does not exist ("does not exist; dropped"), so the caller
+#   creates $HOME/.factory/cache before the first build and points package managers at it
+#   (npm_config_cache, CARGO_HOME, UV_CACHE_DIR, PIP_CACHE_DIR, GOMODCACHE under it).
+# - vetto 0.6.5 exits 125 after every full-tier session, whatever the command returned
+#   (src/sandbox/linux/mod.rs child_exit ignores its code). A caller reads the command's result
+#   from what it wrote, never from vetto's exit status.
+
+[metadata]
+name = "factory-build"
+description = "Factory test/build steps: no network, writes bounded to the worktree and the dependency cache"
+
+[filesystem]
+allow_write = ["$PROJECT", "$HOME/.factory/cache"]
+allow_read = ["$HOME/.factory/cache"]
+
+[network]
+# One of off | allowlist | strict. vetto 0.6.5 does not reject an unknown mode, so
+# tests/test_policy.sh pins this value.
+mode = "off"

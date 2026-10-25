@@ -1,0 +1,36 @@
+# vetto 0.6.5 policy for model turns of the claude-code adapter (ticket T6). Egress only to the
+# adapter's API hosts, port 443: exactly the egressHosts fleet 1.12.0's claude-code adapter declares
+# (@adlc/fleet lib/adapters/claude-code.mjs). Every other fleet adapter is null in adapters.json,
+# so no node claims with one; pinning one adds its own agent-<adapter>.toml beside this file.
+# Schema: vetto 0.6.5 src/policy/loader/schema.rs. Measured in records/TB1.md of
+# specs/factory-step2-v1.
+#
+# Invoke it from the worktree root:
+#
+#   vetto --profile strict --agent claude --policy factory/policy/agent.toml --tui none -- <cmd>
+#
+# - `--agent claude` adds vetto's compatibility roots for Claude Code (~/.claude, ~/.claude.json,
+#   ~/.config/claude*, ~/.local/share/claude, npm/bun caches); without it the strict profile masks
+#   ~/.claude and the adapter cannot read its own login. It also arms vetto's git guard: vetto
+#   refuses to start on main or master, so run it on the ticket branch.
+# - No --net flag: the [network] table below is the network policy. An explicit --net replaces it
+#   (measured: `--net off` on top of this file resolves no host at all).
+# - Same caveats as build.toml: --profile strict is required, no worktree under /tmp, and vetto
+#   0.6.5's exit status is always 125 in the full tier.
+# - Does not wrap fleet: fleet's own bwrap sandbox cannot start inside vetto 0.6.5 (bwrap needs
+#   /proc/sys/kernel/overflowuid and a NETLINK_ROUTE socket, both denied in the sandbox). The run
+#   loop uses this file around a command it runs itself; ADR-0005 records the measurement.
+
+[metadata]
+name = "factory-agent-claude-code"
+description = "Factory model turns (claude-code): egress to the adapter's API hosts on 443 only"
+
+[filesystem]
+allow_write = ["$PROJECT", "$HOME/.factory/cache"]
+allow_read = ["$HOME/.factory/cache"]
+
+[network]
+# strict = host and port must both match (plain http to an allowed host is refused); a
+# base-domain rule also covers its subdomains.
+mode = "strict"
+allow = ["api.anthropic.com:443", "console.anthropic.com:443", "platform.claude.com:443"]

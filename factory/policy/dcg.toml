@@ -1,0 +1,62 @@
+# dcg (destructive_command_guard) v0.15.3 config for factory nodes: the shell hook that every
+# agent Bash call passes through. Format: `dcg config schema` at v0.15.3 (records/TB1.md of
+# specs/factory-step2-v1). Consumers point dcg at this file with `DCG_CONFIG=<abs path>` (hook) or
+# `dcg test -c <path> --dialect posix` (tests); the join wizard never writes ~/.config/dcg.
+#
+# Nodes run unattended: nobody reads a warning and nobody answers a prompt. So every matched rule
+# denies, an unverifiable command is refused, malformed hook input is refused, and dcg never edits
+# ~/.claude/settings.json or replaces its own binary. Loosening any line here is a CODEOWNERS PR.
+
+[general]
+color = "never"
+verbose = false
+check_updates = false
+# The wizard installs the hook itself; dcg must not rewrite the user's Claude settings on every call.
+self_heal_hook = false
+fail_closed = true
+unverified_decision = "deny"
+update_pin = true
+
+[packs]
+# core.git, core.filesystem and system.disk are always on. These add what an agent on a
+# contributor's box could reach beyond its worktree: history, publication, GitHub, the host,
+# and any cloud or cluster credential the owner happens to have.
+enabled = [
+  "strict_git",
+  "package_managers",
+  "platform.github",
+  "cicd.github_actions",
+  "secret_disclosure",
+  "system.permissions",
+  "system.services",
+  "containers.docker",
+  "containers.compose",
+  "containers.podman",
+  "kubernetes.kubectl",
+  "kubernetes.helm",
+  "cloud.aws",
+  "cloud.gcp",
+  "cloud.azure",
+  "infrastructure.terraform",
+  "remote.ssh",
+  "remote.scp",
+  "remote.rsync",
+]
+
+[policy]
+# Severity defaults would only warn on medium and log on low; an unattended agent ignores both.
+# Interactive prompts stay at dcg's default (off): there is no one to answer them.
+default_mode = "deny"
+
+[history]
+# Command text stays off disk as well as off the wire (SPEC I8).
+enabled = false
+
+[overrides]
+block = [
+  { pattern = "(^|[;&|(\\s])git\\s+push(\\s|$)", reason = "The run loop pushes ticket branches; an agent never pushes (factory/RULES.md 2)." },
+  { pattern = "(^|[;&|(\\s])gh\\s+(pr|issue|api|release|repo|label|secret|variable|workflow|run)(\\s|$)", reason = "The run loop talks to GitHub; agents report, they do not write (factory/RULES.md 5)." },
+  { pattern = "--dangerously-skip-permissions", reason = "Never run an agent with permissions skipped; the sandbox profiles exist so you do not need it (AGENTS.md)." },
+  { pattern = "(curl|wget)[^|;&]*\\|\\s*(ba|z|da)?sh(\\s|$)", reason = "Piping a download into a shell runs unpinned code." },
+  { pattern = "(^|[;&|(\\s])(ralon|vetto)\\s+(pause|uninstall|disable|allow|deny|kill)(\\s|$)", reason = "The sandbox and the rails lock are not the agent's to loosen." },
+]

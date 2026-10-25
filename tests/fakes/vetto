@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Fake `vetto` (0.6.5) for offline tests. Records every call as one JSON array of its argv in
+# $FAKE_VETTO_LOG (required) and copies the real CLI's measured behaviour (records/TB1.md of
+# specs/factory-step2-v1) without sandboxing anything:
+#   --version                 "vetto 0.6.5"
+#   [opts] -- <cmd...>        every --policy <path> must exist and hold only the tables vetto 0.6.5
+#                             parses; else "vetto: error: Security policy load failure: ..." and
+#                             exit 125 before the command runs (fail-closed). Otherwise runs <cmd>
+#                             and then exits 125 whatever it returned: vetto 0.6.5's full tier
+#                             loses the agent's status (src/sandbox/linux/mod.rs child_exit).
+#   FAKE_VETTO_EXIT           exit with this instead of 125 after the command (a fixed vetto)
+#   FAKE_VETTO_FAIL_CLOSED=1  refuse every session: exit 125, the command never runs
+# Anything else exits 2 so a script never relies on a verb the fake does not know.
+set -euo pipefail
+: "${FAKE_VETTO_LOG:?fake vetto needs FAKE_VETTO_LOG}"
+for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc . >>"$FAKE_VETTO_LOG"
+[ "${1:-}" = --version ] && { echo "vetto 0.6.5"; exit 0; }
+
+fail_closed() { printf 'vetto: error: %s\n' "$*" >&2; exit 125; }
+TABLES='metadata|security|security\.seccomp_notify|filesystem|secrets|display_only_deny|environment|network|network\.net_ports|unix_sockets|net_ports|limits|limits\.cgroup|limits\.io_rate|cgroup|process'
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    --policy)
+      p="${2:-}"; shift
+      [ -f "$p" ] || fail_closed "Security policy load failure: cannot read policy '$p'"
+      bad="$(grep -nE '^[[:space:]]*\[' "$p" | grep -vE "^[0-9]+:[[:space:]]*\[($TABLES)\][[:space:]]*(#.*)?$" | head -n1 || true)"
+      [ -z "$bad" ] || fail_closed "Security policy load failure: failed to parse policy 'cli:$p': unknown table at line ${bad%%:*}" ;;
+    --profile|--preset|--net|--tui|--backend|--agent|-a|--jsonl|--report|--report-dir|--timeout|--limits|--deny-glob|--net-quota)
+      shift ;;
+    -*) ;;
+    *) echo "fake vetto: unsupported command: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[ $# -gt 0 ] || { echo "fake vetto: no command after --" >&2; exit 2; }
+[ "${FAKE_VETTO_FAIL_CLOSED:-0}" != 1 ] || fail_closed "Sandbox process spawn failure: injected"
+"$@" || true
+exit "${FAKE_VETTO_EXIT:-125}"

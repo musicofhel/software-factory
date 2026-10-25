@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Fake `ralon` (0.1.7) for offline tests. Records every call as one JSON array of its argv in
+# $FAKE_RALON_LOG (required) and copies the real CLI's measured behaviour (records/TB1.md of
+# specs/factory-step2-v1) without enforcing anything:
+#   --version                         "ralon 0.1.7"
+#   run [--backend B] [-q] [--dry-run] [-C DIR] -- <cmd...>
+#                                     reads DIR/agent.lock (default: the current directory; the real
+#                                     CLI also walks up, this fake does not). No lock, an empty lock,
+#                                     a lock without `protect:` or with a pattern ralon refuses
+#                                     (`!`, `~`, `..` segment, `:`) → a message on stderr and exit 2,
+#                                     the command never runs. Otherwise runs <cmd> and exits with its
+#                                     status (the real CLI passes it through). --dry-run prints the
+#                                     patterns and exits 0.
+#   check [-C DIR] [PATH...]          with no PATH lists `locked <pattern>` per pattern; with PATHs
+#                                     prints `locked`/`writable` per path and exits 1 if any is
+#                                     protected. Matching here is bash glob matching after `**`→`*`,
+#                                     coarser than ralon's globset: tests use plain paths.
+# Anything else exits 2 so a script never relies on a verb the fake does not know.
+set -euo pipefail
+: "${FAKE_RALON_LOG:?fake ralon needs FAKE_RALON_LOG}"
+for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc . >>"$FAKE_RALON_LOG"
+[ "${1:-}" = --version ] && { echo "ralon 0.1.7"; exit 0; }
+verb="${1:-}"; shift || true
+dir=. dry=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    -C|--dir) dir="${2:-}"; shift ;;
+    --backend) shift ;;
+    -q|--quiet) ;;
+    --dry-run) dry=1 ;;
+    -*) echo "fake ralon: unsupported flag: $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+  shift
+done
+
+lock="$dir/agent.lock"
+[ -f "$lock" ] || { echo "ralon: no agent.lock found in $dir or any parent directory (run \`ralon init\`)" >&2; exit 2; }
+grep -qvE '^[[:space:]]*(#.*|---)?$' "$lock" || { echo "ralon: $lock is empty, so it protects nothing." >&2; exit 2; }
+grep -qE '^protect:' "$lock" || { echo "ralon: failed to parse $lock: no protect list" >&2; exit 2; }
+patterns=(agent.lock)
+while IFS= read -r p; do
+  p="${p#\"}"; p="${p%\"}"
+  case "/$p/" in
+    '/!'*|'/~'*|*/../*|*:*) echo "ralon: $lock: invalid pattern: \`$p\`" >&2; exit 2 ;;
+  esac
+  patterns+=("$p")
+done < <(sed -nE 's/^[[:space:]]+-[[:space:]]+(.*[^[:space:]])[[:space:]]*$/\1/p' "$lock")
+
+protected() { local p g; for p in "${patterns[@]}"; do g="${p//\*\*/*}"; [[ "$1" == $g || "$1" == $g/* ]] && return 0; done; return 1; }
+
+case "$verb" in
+  run)
+    if [ "$dry" = 1 ]; then printf 'would lock `%s`\n' "${patterns[@]}"; exit 0; fi
+    [ $# -gt 0 ] || { echo "fake ralon: run needs a command" >&2; exit 2; }
+    rc=0; "$@" || rc=$?; exit "$rc" ;;
+  check)
+    if [ $# = 0 ]; then printf 'locked    %s\n' "${patterns[@]}"; exit 0; fi
+    hit=0
+    for path in "$@"; do
+      if protected "$path"; then printf 'locked    %s\n' "$path"; hit=1; else printf 'writable  %s\n' "$path"; fi
+    done
+    exit "$hit" ;;
+  *) echo "fake ralon: unsupported command: $verb" >&2; exit 2 ;;
+esac

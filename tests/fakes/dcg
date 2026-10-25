@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Fake `dcg` (destructive_command_guard 0.15.3) for offline tests. Records every call as one JSON
+# array of its argv in $FAKE_DCG_LOG (required) and copies the real CLI's measured behaviour
+# (records/TB1.md of specs/factory-step2-v1) without its rule packs:
+#   --version                 "0.15.3" as the first line
+#   test [-c PATH] [--dialect D] [--robot] [--format json] [--stdin | <command>]
+#                             decision "deny" when the command matches the ERE $FAKE_DCG_DENY
+#                             (default: rm -rf /, git push, git reset --hard, gh pr|issue|api), else
+#                             "allow". --robot or --format json prints the robot document
+#                             {schema_version, dcg_version, robot_mode, command, decision[, mode,
+#                             reason, source]}; otherwise one line. Exit 1 deny, 0 allow.
+#                             A -c path that does not exist prints "Warning: Failed to load config
+#                             from <path>" on stderr and goes on with defaults, as dcg 0.15.3 does.
+# Anything else exits 2 so a script never relies on a verb the fake does not know.
+set -euo pipefail
+: "${FAKE_DCG_LOG:?fake dcg needs FAKE_DCG_LOG}"
+for a in "$@"; do jq -n --arg a "$a" '$a'; done | jq -sc . >>"$FAKE_DCG_LOG"
+case "${1:-}" in
+  --version|-V) echo "0.15.3"; exit 0 ;;
+  test) shift ;;
+  *) echo "fake dcg: unsupported command: ${1:-}" >&2; exit 2 ;;
+esac
+robot=0 stdin=0 cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--config) [ -f "${2:-}" ] || echo "Warning: Failed to load config from ${2:-}" >&2; shift ;;
+    --dialect|--agent|--with-packs) shift ;;
+    --robot) robot=1 ;;
+    --format|-f) [ "${2:-}" = json ] && robot=1; shift ;;
+    --format=json) robot=1 ;;
+    --stdin) stdin=1 ;;
+    -*) ;;
+    *) cmd="$1" ;;
+  esac
+  shift
+done
+[ "$stdin" = 0 ] || cmd="$(command cat)"
+[ -n "$cmd" ] || { echo "fake dcg: test needs a command" >&2; exit 2; }
+deny="${FAKE_DCG_DENY:-rm -rf /|git push|git reset --hard|gh (pr|issue|api)}"
+if [[ "$cmd" =~ $deny ]]; then decision=deny; else decision=allow; fi
+if [ "$robot" = 1 ]; then
+  jq -n --arg c "$cmd" --arg d "$decision" \
+    '{schema_version: 1, dcg_version: "0.15.3", robot_mode: true, command: $c, decision: $d}
+     + (if $d == "deny" then {mode: "deny", reason: "fake dcg: matched FAKE_DCG_DENY", source: "fake"} else {} end)'
+else
+  printf '%s: %s\n' "$decision" "$cmd"
+fi
+[ "$decision" = allow ]

@@ -7,14 +7,18 @@
 # Fetches <remote>/<branch> (default origin/main) as halt-check does, then compares:
 #   version    the checkout's factory/VERSION with factory/VERSION on <remote>/<branch>
 #   pins       each adapter pin in the node's manifest (--manifest, else $FACTORY_MANIFEST) with
-#              factory/policy/adapters.json on <remote>/<branch> ({"<adapter>": "<x.y.z>"}) when that
-#              file exists there (it does not yet: pins_source is null and only drift is checked)
+#              factory/policy/adapters.json on <remote>/<branch> ({"<adapter>": "<x.y.z>" | null},
+#              one key per fleet adapter). null means "not pinned yet": no node claims with it. An
+#              adapter missing from the file is unknown and refused the same way. Where the file
+#              does not exist on <remote>/<branch>, pins_source is null and only drift is checked.
 #   installed  each manifest pin with the installed CLI's `--version` (claude-code is `claude`;
 #              codex, agy, opencode are themselves). Drift, or a pinned CLI that is not installed,
 #              refuses claims until the owner re-pins.
-# Versions compare as numbers, x.y.z; anything after the third number is ignored.
+# Versions compare as numbers, x.y.z; anything after the third number is ignored (but a pin in
+# adapters.json must be exactly x.y.z, else it is a bad pin).
 #
-# Exit 0: current, or ahead. Exit 2: behind or drifted: do not claim (pull, re-pin, restart).
+# Exit 0: current, or ahead. Exit 2: behind, drifted or unpinned: do not claim (pull, re-pin,
+#         restart).
 # Exit 1: the fetch failed, or a VERSION, pin file or manifest is unreadable: the state is unknown,
 #         so a caller must treat any exit other than 0 as "do not claim".
 set -euo pipefail
@@ -22,7 +26,7 @@ PROG=version-check
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 json=0 remote=origin branch=main manifest="${FACTORY_MANIFEST:-}"
 while [ $# -gt 0 ]; do
@@ -84,7 +88,9 @@ report="$(jq -cn --arg ref "$remote/$branch" --arg sha "$sha" --arg lv "$local_v
    version: {local: $lv, remote: $rv, state: cmp($lv; $rv)},
    manifest: (if $manifest == "" then null else $manifest end), pins_source: $src,
    adapters: [ $ads[] | . + {main_pin: ($pins[.name] // null)}
-               | . + {state: (if .main_pin != null and ((.main_pin | tostring | test("^[0-9]+\\.[0-9]+\\.[0-9]+")) | not) then "bad-pin"
+               | . + {state: (.name as $n | if $pins != null and ($pins | has($n) | not) then "unlisted"
+                              elif $pins != null and .main_pin == null then "unpinned"
+                              elif .main_pin != null and ((.main_pin | type) != "string" or (.main_pin | test("^[0-9]+\\.[0-9]+\\.[0-9]+$") | not)) then "bad-pin"
                               elif .main_pin != null and cmp(.pin; .main_pin) == "behind" then "behind"
                               elif .installed == null then "not-installed"
                               elif cmp(.installed; .pin) != "current" then "drift"
@@ -93,6 +99,8 @@ report="$(jq -cn --arg ref "$remote/$branch" --arg sha "$sha" --arg lv "$local_v
                  + [ .adapters[] | select(.state != "current")
                      | if .state == "behind" then "\(.name) pin \(.pin) is behind \($ref) (\(.main_pin)): re-pin and upgrade"
                        elif .state == "bad-pin" then "\(.name) pin on \($ref) is not x.y.z: \(.main_pin)"
+                       elif .state == "unpinned" then "\(.name) is not pinned on \($ref) (null in \($src)): the factory does not claim with it yet"
+                       elif .state == "unlisted" then "\(.name) is not in \($src) on \($ref): unknown adapter, do not claim"
                        elif .state == "not-installed" then "\(.name) is pinned at \(.pin) but `\(.cli)` is not installed"
                        else "\(.name) installed \(.installed) drifted from its pin \(.pin): re-pin" end ])
   | .ok = (.refusals | length == 0)')"

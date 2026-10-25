@@ -1,11 +1,18 @@
 SHELL := /usr/bin/env bash
-.PHONY: test lint tickets doctor
+.PHONY: test lint live tickets doctor
 
 # Every shell file the factory ships or tests with, including helpers and fakes that later rows add.
 SH_FILES = $(shell find factory tests -type f \( -name '*.sh' -o -path 'tests/fakes/*' \) | sort)
 
 test:
 	@./factory/test.sh
+
+# The real pinned tools (vetto, ralon, dcg, fleet). Never part of `make test`: each tests/live/*.sh
+# prints `SKIP <reason>` and exits 0 only when a tool it needs is absent.
+live:
+	@fail=0; for t in tests/live/*.sh; do \
+	  if bash "$$t"; then echo "PASS $$t"; else echo "FAIL $$t"; fail=1; fi; \
+	done; exit $$fail
 
 # shellcheck is required: a lint that skips itself is a false green. actionlint is best-effort
 # (system binary, else uvx actionlint-py) because hosted runners do not ship it.
