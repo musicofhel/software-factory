@@ -26,6 +26,7 @@
 #             {enabled: bool} objects, urls, checks[], defaults for the fields never PUT)
 #        PUT  branches/<b>/protection (422 unless the four required keys are present; 404 for a
 #             branch the bare repo lacks)
+#        DELETE branches/<b>/protection (204: no output; 404 "Branch not protected" when it has none)
 #        GET  rulesets (summaries only, no rules: callers must GET by id), rulesets/<id>
 #        POST rulesets, PUT rulesets/<id> (422 on a duplicate name or an unknown rule type)
 #        A ?query on the path is ignored. --input FILE|- sends a JSON body (as gh does).
@@ -232,7 +233,7 @@ settings() {  # settings <method> <path below repos/R/> <body-json> <jq>
       (.enforcement // "active" | if IN("active", "disabled", "evaluate") then empty else "Invalid enforcement" end);
     [bad][0] // empty'
   case "$method $path" in
-    "GET branches/"*/protection|"PUT branches/"*/protection)
+    "GET branches/"*/protection|"PUT branches/"*/protection|"DELETE branches/"*/protection)
       b="${path#branches/}"; b="${b%/protection}"
       [ -n "${FAKE_GH_GIT:-}" ] && git -C "$FAKE_GH_GIT" show-ref --verify -q "refs/heads/$b" || http_err 404 "Branch not found"
       if [ "$method" = PUT ]; then
@@ -243,6 +244,7 @@ settings() {  # settings <method> <path below repos/R/> <body-json> <jq>
         smutate '.protection[$b] = $p' --arg b "$b" --argjson p "$body"
       fi
       jq -e --arg b "$b" '.protection[$b] != null' "$FAKE_GH_SETTINGS" >/dev/null || http_err 404 "Branch not protected"
+      if [ "$method" = DELETE ]; then smutate 'del(.protection[$b])' --arg b "$b"; return; fi
       out="$(jq --arg b "$b" --arg u "$url" ".protection[\$b] | $render_prot" "$FAKE_GH_SETTINGS")" ;;
     "GET rulesets")
       out="$(jq --arg r "$REPO" '[.rulesets[] | {id, name, target, source_type: "Repository", source: $r, enforcement}]' "$FAKE_GH_SETTINGS")" ;;

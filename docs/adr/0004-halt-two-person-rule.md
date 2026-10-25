@@ -69,10 +69,26 @@ stands: one code-owner approval to add HALT and one to remove it. Build order 3 
 check `gates / halt-guard`, which fails a PR deleting `factory/HALT` without two approvals. B and
 C stay open for when an organization with two or more owners exists.
 
+## Update (2026-10-25, step-2 ruling Q2, ticket T13)
+
+Step-2 ruling Q2 (`specs/factory-step2-v1/RULINGS.md`) moved every classic protection rule on
+`main` into the ruleset `main` in `factory/policy/branch-protection.json`, so the factory App's
+bypass covers them; classic protection is now empty, and `apply-branch-protection.sh` deletes one
+it finds. Context point 3 now reads: the ruleset's `pull_request` rule (`required_approving_review_count:
+1`, `require_code_owner_review: true`) applies to every PR into `main`.
+
+**The interim is unchanged:** one code-owner approval to add `factory/HALT` and one to remove it.
+The ruleset restates it (its `_halt` note) and the policy's `unexpressed` entry still prints on
+every run. One new fact: the factory App, the ruleset's only bypass actor when `FACTORY_APP_ID` is
+set, can push to `main` without a review, so it can add or delete `factory/HALT` too. Only
+post-merge holds the App token, and it pushes its completion commit only. Option C above is the
+same mechanism used on purpose.
+
 ## Consequences
 
 - The spec's two-person rule for lifting a halt is not enforced on GitHub until B or D lands.
   `slb` was already deferred by the spec, so for now the rule is a policy line and nothing more.
 - Related, unverified: GitHub's merge queue may be limited to organization-owned repos. The
   docs fetched on 2026-10-24 did not state its availability. The first `--apply` on the real
-  repo settles it: the `main-merge-queue` ruleset POST either succeeds or returns 422.
+  repo settles it: the POST of ruleset `main`, which carries the `merge_queue` rule, either
+  succeeds or returns 422.

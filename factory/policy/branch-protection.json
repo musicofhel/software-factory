@@ -1,32 +1,45 @@
 {
-  "_comment": "Branch rules as code for `main`, applied by factory/bin/apply-branch-protection.sh (repo admin; dry-run by default, --apply writes, a second run is a no-op; re-run after any change here). Only real GitHub REST fields live here: `protection` is the body of PUT repos/{r}/branches/{branch}/protection and each `rulesets` entry is the body of POST/PUT repos/{r}/rulesets (keys starting with `_` are stripped). A rule GitHub cannot express is listed under `unexpressed`, printed on every run, and never silently dropped. Admin bypass OFF for everyone, org owners included.",
+  "_comment": "Branch rules as code for `main`, applied by factory/bin/apply-branch-protection.sh (repo admin; dry-run by default, --apply writes, a second run is a no-op; re-run after any change here). Only real GitHub REST fields live here: `protection` is the body of PUT repos/{r}/branches/{branch}/protection (null: the branch has no classic protection, and one found on GitHub is DELETEd), and each `rulesets` entry is the body of POST/PUT repos/{r}/rulesets (keys starting with `_` are stripped). A rule GitHub cannot express is listed under `unexpressed`, printed on every run, and never silently dropped. Bypass OFF for everyone, admins included: no ruleset names a bypass actor, and the only one ever added is the factory GitHub App, from FACTORY_APP_ID.",
   "branch": "main",
-  "protection": {
-    "required_status_checks": {
-      "strict": true,
-      "contexts": ["gates / build-test", "gates / rails-proof", "gates / scope", "gates / tamper", "gates / dependencies", "gates / attest-verify", "gates / commit-check"]
-    },
-    "enforce_admins": true,
-    "required_pull_request_reviews": {
-      "dismiss_stale_reviews": true,
-      "require_code_owner_reviews": true,
-      "required_approving_review_count": 1
-    },
-    "restrictions": null,
-    "allow_force_pushes": false,
-    "allow_deletions": false,
-    "required_linear_history": false,
-    "lock_branch": false
-  },
+  "protection": null,
+  "_protection": "Step-2 ruling Q2 (specs/factory-step2-v1/RULINGS.md): every rule classic protection held now lives in ruleset `main`, where the App's bypass applies, so post-merge's direct push on the App token is not refused. Classic `required_pull_request_reviews` became the `pull_request` rule, `required_status_checks` the `required_status_checks` rule, `allow_force_pushes: false` the `non_fast_forward` rule, `allow_deletions: false` the `deletion` rule, and `enforce_admins: true` is a ruleset's default (only `bypass_actors` bypass, and there are none). Nothing was left for classic protection.",
   "rulesets": [
     {
-      "name": "main-merge-queue",
-      "_comment": "The merge queue is a ruleset rule; the classic protection endpoint has no field for it. One entry built at a time, merge commits. The four parameters the old file did not name are GitHub's UI defaults.",
+      "name": "main",
+      "_comment": "Every rule on main. Parameter names are GitHub's REST ruleset schema (docs.github.com/rest/repos/rules#create-a-repository-ruleset; components repository-rule-*). Merge queue: one entry built at a time, merge commits; its four parameters the old file did not name are GitHub's UI defaults.",
+      "_halt": "ADR-0004 interim (step-1 ruling Q2), unchanged by the move: factory/HALT follows the `pull_request` rule here and CODEOWNERS, so adding it needs one code-owner approval and removing it needs one. The two-approval removal is `gates / halt-guard` at build order 3; see `unexpressed`.",
       "target": "branch",
       "enforcement": "active",
       "bypass_actors": [],
       "conditions": { "ref_name": { "include": ["refs/heads/main"], "exclude": [] } },
       "rules": [
+        { "type": "deletion" },
+        { "type": "non_fast_forward" },
+        {
+          "type": "pull_request",
+          "parameters": {
+            "required_approving_review_count": 1,
+            "require_code_owner_review": true,
+            "dismiss_stale_reviews_on_push": true,
+            "require_last_push_approval": false,
+            "required_review_thread_resolution": false
+          }
+        },
+        {
+          "type": "required_status_checks",
+          "parameters": {
+            "strict_required_status_checks_policy": true,
+            "required_status_checks": [
+              { "context": "gates / build-test" },
+              { "context": "gates / rails-proof" },
+              { "context": "gates / scope" },
+              { "context": "gates / tamper" },
+              { "context": "gates / dependencies" },
+              { "context": "gates / attest-verify" },
+              { "context": "gates / commit-check" }
+            ]
+          }
+        },
         {
           "type": "merge_queue",
           "parameters": {
@@ -45,7 +58,7 @@
   "unexpressed": [
     {
       "rule": "factory/HALT: zero approvals to add, two to remove",
-      "why": "GitHub has no rule keyed on file deletion. Ruleset `required_reviewers` (file_patterns + minimum_approvals) needs a Team reviewer, so it is unavailable on this user-owned repo, and it would gate adding HALT as much as removing it. Until decided, HALT follows the CODEOWNERS rule: one code-owner approval to add and to remove.",
+      "why": "GitHub has no rule keyed on file deletion. Ruleset `required_reviewers` (file_patterns + minimum_approvals) needs a Team reviewer, so it is unavailable on this user-owned repo, and it would gate adding HALT as much as removing it. Until build order 3's `gates / halt-guard`, HALT follows ruleset main's pull_request rule and CODEOWNERS: one code-owner approval to add and to remove.",
       "adr": "docs/adr/0004-halt-two-person-rule.md"
     }
   ]
