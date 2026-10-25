@@ -71,7 +71,7 @@ else is long-lived.
 | # | Step | Status |
 |---|---|---|
 | 1 | Clock + janitor, claim protocol, kill switch | **built and pushed; Aaron's kit lines open** (`specs/factory-step1-v1`) |
-| 2 | Join wizard and run loop (vetto, Ralon, dcg, cux) | **built locally, awaiting first join** (`specs/factory-step2-v1`) |
+| 2 | Join wizard and run loop (vetto, Ralon, dcg, cux) | **built (follow-ups T12–T16 local, not pushed); on the dev box the toy ticket gets past fleet's preflight and is built, reviewed and merged in fleet's sandbox, then the loop stops at tamperguard under vetto (an open question); awaiting first join** (`specs/factory-step2-v1`, `specs/factory-step2-followups-v1`) |
 | 3 | CI gates and merge queue with the `Depends-on:` hold | queued |
 | 4 | Rail author charter, prosecution CLI, verifier wrapper, summoner, digest | queued |
 | 5 | Preview, behavior diff, release | queued |

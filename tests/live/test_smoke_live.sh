@@ -5,7 +5,11 @@
 #   1. origin  tests/fixtures/make-repo.sh builds a bare origin whose main is this repo's HEAD
 #              (`git archive`) plus three overlays: the toy ticket T-smoke, created in the fixture's
 #              own store by the real `adlc ticket create --write`; `fleet.gate` in .adlc/config.json
-#              (test: `bash tests/test_hello.sh`); budget weights.light.wallClockMinutes = 15.
+#              (test: `bash tests/test_hello.sh`) with `fleet.allowedCommands` for the toy ticket,
+#              whose one rail is factory/policy/** (fleet's rails-guard refuses a ticket with none);
+#              budget weights.light.wallClockMinutes = 15. fleet's claude-code worker may run only
+#              the gate commands, allowedCommands and read-only git (adapters/claude-code.mjs
+#              buildSettings), so without `chmod +x` it answers TICKET-BLOCKED (follow-ups TB5 records).
 #   2. HOME    a scratch HOME, because vetto 0.6.5 fails closed on this box's real one (~/.aws is a
 #              symlink, records/TB1.md §3.9; ~/.claude as a symlink fails the same way). Its
 #              .claude/.credentials.json is a HARD link to the real file: no copy of the secret, a
@@ -31,7 +35,8 @@
 # reason other than success passes when its branch is the specified one), that fleet's sandbox
 # was enforced, and that no ticket text left the node (I8). It prints the six recorded items
 # (governor line, claim ref, fleet reason, pushed branch, ledger line, token count) and the sandbox
-# evidence (fleet's policy echo, vetto audit) for records/TB6.md.
+# evidence (fleet's policy echo, vetto audit) for the records: TB6 of specs/factory-step2-v1, TB5 of
+# specs/factory-step2-followups-v1.
 #
 # Prints `SKIP <reason>` and exits 0 when a tool it needs is absent, the network is unreachable,
 # claude is not logged in, or the governor will not claim now (quota at the cap): it never waits.
@@ -75,10 +80,13 @@ trap 'keep; chmod -R u+w "$S" 2>/dev/null; rm -rf "$S"' EXIT
 O="$S/origin.git" C="$S/clone" FH="$S/fh" NH="$S/home"
 
 # ---- 1. the fixture origin ----------------------------------------------------------------------
-echo "  1. fixture origin: this repo's HEAD + T-smoke + fleet.gate"
+echo "  1. fixture origin: this repo's HEAD + T-smoke + fleet.gate + fleet.allowedCommands"
 mkdir -p "$S/main"
 git -C "$REPO_ROOT" archive HEAD | tar -x -C "$S/main"
-jq '.fleet = {gate: {test: "bash tests/test_hello.sh"}}' "$S/main/.adlc/config.json" >"$S/cfg.tmp"
+# Each entry becomes a `Bash(<entry>)` rule in the worker's .claude/settings.local.json.
+ALLOWED='["chmod +x hello.sh", "chmod +x hello.sh tests/test_hello.sh", "./hello.sh", "bash tests/test_hello.sh:*"]'
+jq --argjson a "$ALLOWED" '.fleet = {gate: {test: "bash tests/test_hello.sh"}, allowedCommands: $a}' \
+  "$S/main/.adlc/config.json" >"$S/cfg.tmp"
 mv "$S/cfg.tmp" "$S/main/.adlc/config.json"
 jq '.weights.light.wallClockMinutes = 15' "$S/main/factory/policy/budget.json" >"$S/budget.tmp"
 mv "$S/budget.tmp" "$S/main/factory/policy/budget.json"
@@ -87,15 +95,19 @@ body="$(printf '%s\n' 'weight: light' 'tier: 0' 'charter: C5' '' \
   'Acceptance criteria:' \
   '1. ./hello.sh prints hello and exits 0. Verify: `test "$(./hello.sh)" = hello`.' \
   '2. tests/test_hello.sh passes against hello.sh and fails when hello.sh prints anything else. Verify: `bash tests/test_hello.sh`.')"
+# One rail at least: fleet's gate runs `adlc rails-guard --ticket <id>`, which exits 1 on a ticket
+# with no rails ("has no rails declared"), so `rails: []` fails every strike (follow-ups TB5 records).
+# factory/policy/** is the rail ralon-lock.sh protects for every ticket anyway.
 jq -n --arg b "$body" '{id: "T-smoke", title: "Add hello.sh that prints hello, with a test", category: "feature",
-    duration: 1, scope: ["hello.sh", "tests/test_hello.sh"], rails: [], edges: [], body: $b}' >"$S/t-smoke.json"
+    duration: 1, scope: ["hello.sh", "tests/test_hello.sh"], rails: ["factory/policy/**"], edges: [], body: $b}' >"$S/t-smoke.json"
 rc=0
 (cd "$S/main" && npx -y @adlc/cli@1.12.0 ticket create --input "$S/t-smoke.json" --write --json) >"$S/ticket-create.json" 2>"$S/ticket-create.err" || rc=$?
 check "adlc ticket create --write T-smoke exits 0" eq "$rc" 0
 check "T-smoke is in the fixture's store" quiet ls "$S/main/.adlc/tickets/"t-smoke--*.json
 printf 'main-dir %s\nnode alice 1761300000 active 2\n' "$S/main" | bash "$REPO_ROOT/tests/fixtures/make-repo.sh" "$O"
-check "the fixture's main carries T-smoke and the gate" \
-  eq "$(git -C "$O" show main:.adlc/config.json | jq -r .fleet.gate.test) $(git -C "$O" ls-tree --name-only main .adlc/tickets/ | grep -c t-smoke)" "bash tests/test_hello.sh 1"
+check "the fixture's main carries T-smoke, the gate and the allowed commands" \
+  eq "$(git -C "$O" show main:.adlc/config.json | jq -c '[.fleet.gate.test, .fleet.allowedCommands]') $(git -C "$O" ls-tree --name-only main .adlc/tickets/ | grep -c t-smoke)" \
+  "$(jq -cn --argjson a "$ALLOWED" '["bash tests/test_hello.sh", $a]') 1"
 check "main's factory/bin is this repo's HEAD factory/bin, byte for byte and mode for mode" \
   eq "$(git -C "$O" rev-parse main:factory/bin)" "$(git -C "$REPO_ROOT" rev-parse HEAD:factory/bin)"
 
@@ -236,6 +248,14 @@ esac
 if [ -n "$origin_branch" ]; then
   check "the pushed tip is a record commit with the I6 trailers" \
     eq "$(git -C "$O" log -1 --format='%(trailers:key=Ticket,valueonly,separator=)|%(trailers:key=Node,valueonly,separator=)' "$origin_branch")" "T-smoke|dev-box"
+fi
+# Whenever the loop ran its tamperguard step, it ran under vetto + build.toml: the latest vetto
+# session in the scratch HOME is that call (step-2 AC2). vetto exits 125 whatever happened, so
+# this proves where tamperguard ran, not what it said; the ledger's reason says that.
+if [ "$(f '.actions | index("tamperguard") != null')" = true ]; then
+  check "tamperguard ran under vetto: the latest session is factory-build, strict, running tamperguard over the range" \
+    eq "$(vetto audit --latest --json 2>/dev/null | jq -r '"\(.profile) \(.command | test("--profile strict --policy [^ ]*/factory/policy/build.toml ")) \(.command | test("tamperguard --range"))"')" \
+    "factory-build true true"
 fi
 
 # ---- 7. I8: no ticket text in anything that left the node ---------------------------------------------
