@@ -17,6 +17,17 @@ The kill switch is `factory/HALT` on `main`. Present means every loop sleeps 30 
 and checks again. Anyone with write access adds it with a one-line PR that needs no
 review; removing it needs two approvals.
 
+## A node's needs-desk (the claim-protocol exception)
+
+The mirror sets `ready` and `needs-desk` from the ticket store; that is the claim protocol. One
+exception (step-2 ruling Q3): when a run loop stops a ticket (strikes exhausted, flail, tamper, a
+real scope failure), it comments the reason with the needs-desk marker
+(`factory/bin/lib/desk-marker.sh`), then labels the Issue `needs-desk` and removes `ready`. The
+mirror keeps that `needs-desk` until the store's state for the ticket changes: a desk edit (a new
+ticket hash) or a new claim cycle (a claim comment after the marker). Only markers and claims by
+the repo owner, org members and collaborators count. A `needs-desk` without the marker is
+recomputed from the store as before. To send the ticket back to the queue, fix it at the desk.
+
 ## Commit-check exemption (for build order step 3)
 
 One commit on `main` is written by no human and no node: post-merge's completion commit

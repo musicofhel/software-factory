@@ -39,6 +39,12 @@ run_ticket_of_issue() {
   jq -r '[.body // "" | split("\n")[] | capture("^Ticket: (?<id>[^[:space:]]+)[[:space:]]*$")] | .[0].id // empty' <<<"$1"
 }
 
+# run_ticket_hash_of_issue <issue-json>: the first `Ticket-Hash: <hash>` line of a mirror Issue body
+# (the store state the node claims; it goes into the needs-desk marker), or nothing.
+run_ticket_hash_of_issue() {
+  jq -r '[.body // "" | split("\n")[] | capture("^Ticket-Hash: (?<h>[A-Za-z0-9._-]{1,128})[[:space:]]*$")] | .[0].h // empty' <<<"$1"
+}
+
 # run_signoff: "Name <email>" of whoever commits on this node (git's own resolution: env, then config).
 run_signoff() { git -C "$CLONE" var GIT_COMMITTER_IDENT | sed -E 's/ [0-9]+ [-+][0-9]{4}$//'; }
 

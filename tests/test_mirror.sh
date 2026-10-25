@@ -3,9 +3,13 @@
 # (labels w:<weight>, tier:<n>, ready only when the gate record is clean, else needs-desk; body
 # with the ticket id and Depends-on: lines) through the fake gh, which records every call. The
 # store, gate manifest and forecast come from the fake adlc. Offline, no keys.
+# T14 acceptance 1-3 (case node-needs-desk): a node's needs-desk, with the run loop's marker, is kept
+# until the ticket's store state changes; one without the marker is recomputed as before.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
+# shellcheck source=factory/bin/lib/desk-marker.sh
+. "$REPO_ROOT/factory/bin/lib/desk-marker.sh"
 
 HDR=$'weight: light\ntier: 1\ncharter: C1'
 WRITES='(.[0] == "issue" and (.[1] | IN("create", "edit", "close", "reopen", "comment"))) or (.[0] == "label" and .[1] == "create")'
@@ -73,6 +77,8 @@ case_creates() {
   check "T1: labels w:light tier:1 ready" eq "$(labels T1)" '["ready","tier:1","w:light"]'
   check "T2: labels w:heavy tier:0 ready" eq "$(labels T2)" '["ready","tier:0","w:heavy"]'
   check "T1: body carries the ticket id line" has "$(body T1)" $'\nTicket: T1\n'
+  check "T1: body carries the store's ticketHash (run.sh copies it into its needs-desk marker)" \
+    has "$(body T1)" $'\nTicket: T1\nTicket-Hash: hash-T1\n\nGate: ready'
   check "T1: body carries the ticket body" has "$(body T1)" "Build claim.sh."
   check "created by gh issue create, two calls, labels passed at creation" \
     eq "$(fakegh_calls '.[0] == "issue" and .[1] == "create" and (index("--label") != null)')" 2
@@ -302,6 +308,94 @@ case_stranger_issues() {
   check "the duplicate is not edited" eq "$(jq -c '.issues[] | select(.number == 20) | .labels' "$FAKE_GH_ISSUES")" '[]'
 }
 
+# say <ticket> <authorAssociation> <body>: a comment on the ticket's Issue, as GitHub lists it.
+say() {
+  local tmp; tmp="$(mktemp)"
+  jq --argjson n "$(iss "$1" .number)" --arg a "$2" --arg b "$3" \
+    '(.issues[] | select(.number == $n)).comments += [{author: {login: "dev-box-owner"}, authorAssociation: $a, body: $b, createdAt: "2026-10-25T12:00:00Z"}]' \
+    "$FAKE_GH_ISSUES" >"$tmp" && mv "$tmp" "$FAKE_GH_ISSUES"
+}
+# node_desk <ticket> [hash] [authorAssociation]: what run.sh does when it stops a ticket: the result
+# comment ending in the marker, then needs-desk added and ready removed in one edit.
+node_desk() {
+  say "$1" "${3:-COLLABORATOR}" "$(printf 'Node `dev-box` stopped `%s`: reason `strikes-exhausted`.\n\n%s' "$1" \
+    "$(desk_marker "$1" "${2:-hash-$1}" strikes-exhausted dev-box)")"
+  gh issue edit "$(iss "$1" .number)" --repo test/repo --add-label needs-desk --remove-label ready >/dev/null
+}
+claim_comment() { say "$1" COLLABORATOR "Claimed by node \`dev-box\`: fleet run \`dev-box-s1-1-2\`, 2 slot(s), expected finish x."; }
+
+case_node_needs_desk() {
+  mir_setup
+  local t
+  for t in T1 T2 T3 T4 T5 T6 T7; do ticket "$t" "ticket $t" "$HDR"; gated "$t"; done
+  mir --apply
+  check "setup: every ticket ready" eq "$(lines '.gate == "ready"')" 7
+  local ready='["ready","tier:1","w:light"]' desk='["needs-desk","tier:1","w:light"]'
+  node_desk T1                                   # the node's marker at the current hash
+  gh issue edit "$(iss T2 .number)" --repo test/repo --add-label needs-desk >/dev/null   # no marker
+  node_desk T3 hash-T3 NONE                      # a stranger's comment carrying the marker
+  node_desk T4 hash-T4-old                       # the marker names an older ticket state
+  node_desk T5; say T5 COLLABORATOR "$(desk_marker T9 hash-T5 flail dev-box)"   # newest marker: another ticket (same hash)
+  node_desk T6; gh issue edit "$(iss T6 .number)" --repo test/repo --remove-label needs-desk >/dev/null  # desk took it off
+  node_desk T7
+  for _ in $(seq 1 99); do say T7 CONTRIBUTOR "chatter"; done     # 100 comments: gh may hide the newest
+  mir --apply
+  check "run 1: exit 0" eq "$RC" 0
+  check "run 1: T1 keeps the node's needs-desk, ready is not put back" eq "$(labels T1)" "$desk"
+  check "run 1: T1's line names the hold" eq "$(jq -sc '.[] | select(.ticket == "T1") | [.gate, .desk_hold, .add, .remove]' <<<"$OUT")" \
+    '["needs-desk",{"node":"dev-box","reason":"strikes-exhausted"},[],[]]'
+  check "run 1: T1's body gives the node's reason" \
+    has "$(body T1)" $'Gate: needs-desk\n- node: `dev-box` stopped it (strikes-exhausted); needs-desk holds until the ticket changes or a new claim'
+  check "run 1: T2, needs-desk without the marker, is recomputed (ready)" eq "$(labels T2)" "$ready"
+  check "run 1: T3, a marker from an author with no repo access, counts for nothing" eq "$(labels T3)" "$ready"
+  check "run 1: T4, a marker for an older ticketHash, is stale" eq "$(labels T4)" "$ready"
+  check "run 1: T5, the newest marker names another ticket" eq "$(labels T5)" "$ready"
+  check "run 1: T6, the label is gone, so nothing is kept (the marker never adds it)" eq "$(labels T6)" "$ready"
+  check "run 1: T7, a thread at gh's 100-comment page is not trusted to show the newest" eq "$(labels T7)" "$ready"
+  check "run 1: only T1 holds" eq "$(jq -sc '[.[] | select(.desk_hold != null) | .ticket]' <<<"$OUT")" '["T1"]'
+  local before; before="$(writes)"
+  mir --apply
+  check "run 2: T1 still needs-desk" eq "$(labels T1)" "$desk"
+  check "run 2: no write at all, every line unchanged" \
+    eval '[ "$(writes)" = "$before" ] && [ "$(lines '"'"'.action == "unchanged"'"'"')" = 7 ]'
+  mir --apply
+  check "run 3: T1 still needs-desk, still nothing written" eval '[ "$(labels T1)" = "$desk" ] && [ "$(writes)" = "$before" ]'
+  # A desk edit: a new ticketHash (and a fresh coldstart on it). The hold ends; the store decides.
+  set_ticket T1 '.body = "weight: light\ntier: 1\ncharter: C1\n\nclearer acceptance criteria" | .ticketHash = "hash-T1-v2"'
+  record '{"gate":"coldstart","ticket":"T1","data":{"cache":{"ticketHash":"hash-T1-v2","gaps":[]}}}'
+  mir --apply
+  check "after a store edit: T1 is recomputed, ready again" eq "$(labels T1)" "$ready"
+  check "  the line holds nothing and swaps the labels" \
+    eq "$(jq -sc '.[] | select(.ticket == "T1") | [.gate, .desk_hold, .add, .remove]' <<<"$OUT")" '["ready",null,["ready"],["needs-desk"]]'
+  check "  the body carries the new hash" has "$(body T1)" "Ticket-Hash: hash-T1-v2"
+  # A node stops it again, at the new hash: held. Then a new claim cycle after the marker ends it.
+  node_desk T1 hash-T1-v2
+  mir --apply
+  check "a second stop at the new hash: held" eq "$(labels T1)" "$desk"
+  claim_comment T1
+  mir --apply
+  check "after a new claim cycle (a claim comment after the marker): recomputed, ready" eq "$(labels T1)" "$ready"
+  # A store edit that leaves the ticket not ready: recomputed to needs-desk, with the store's reason.
+  node_desk T2
+  set_ticket T2 '.ticketHash = "hash-T2-v2"'
+  mir --apply
+  check "a store edit that leaves coldstart stale: needs-desk for the store's reason only" \
+    eq "$(jq -sc '.[] | select(.ticket == "T2") | [.gate, .desk_hold, .reasons]' <<<"$OUT")" \
+       '["needs-desk",null,["coldstart: stale (the ticket changed after coldstart ran)"]]'
+  # A ticket completed while held: closed as before.
+  node_desk T5
+  set_ticket T5 '.completed = true'
+  mir --apply
+  check "a held ticket completed in the store: its Issue closes" eq "$(iss T5 .state)" '"closed"'
+  check "one needs-desk read per run, of open needs-desk Issues only" \
+    eq "$(fakegh_calls '.[0:2] == ["issue", "list"] and (index("needs-desk") != null) and (index("number,comments") != null) and (index("open") != null)')" \
+       "$(jq -sc 'map(select(.[0:2] == ["ticket", "list"])) | length' "$FAKE_ADLC_LOG")"
+  node_desk T3
+  before="$(writes)"
+  FAKE_GH_FAIL='--label needs-desk' mir --apply
+  check "the needs-desk read fails: exit 1, nothing written" eval '[ "$RC" = 1 ] && [ "$(writes)" = "$before" ] && has "$ERR" "needs-desk comments"'
+}
+
 case_forecast_file() {
   mir_setup
   ticket T1 "one" "$HDR"; ticket T2 "two" "$HDR"; gated T1; gated T2
@@ -419,7 +513,7 @@ case_fake_semantics() {
 adlc() { "$FAKES_DIR/adlc" "$@"; }
 
 for c in creates updates-idempotent ready-only-when-gated depends-on-lines dry-run-inert closes-completed \
-         stranger-issues forecast-file read-failures-write-nothing refuses-apply workflow fake-semantics; do
+         stranger-issues node-needs-desk forecast-file read-failures-write-nothing refuses-apply workflow fake-semantics; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

@@ -15,8 +15,9 @@
 #   completed ticket  its Issue is closed (reason completed, `ready` removed); none is created
 #
 # The Issue body is the marker line, `Ticket: <id>`, one `Depends-on: <id>` per ticket holding an
-# edge to this one (ADLC edges point prerequisite → dependent), the gate verdict and its reasons,
-# then the ticket body verbatim. Labels: `w:<weight>` and `tier:<n>` from the body header
+# edge to this one (ADLC edges point prerequisite → dependent), `Ticket-Hash: <ticketHash>` (the
+# store state a node claims; run.sh copies it into its needs-desk marker), the gate verdict and its
+# reasons, then the ticket body verbatim. Labels: `w:<weight>` and `tier:<n>` from the body header
 # (`weight: light|heavy`, `tier: 0|1|2`, `charter: C<n>`), plus `ready` when all of these hold and
 # `needs-desk` otherwise:
 #   header          weight, tier and charter parse
@@ -26,6 +27,11 @@
 #   merge-forecast  the ticket has a merge-forecast record that is not a failure, and the forecast
 #                   certifies it now: no forecast gateFailures, the ticket is in wave 1, and no
 #                   SEQUENCE pair puts it behind a wave-1 ticket earlier in mergeOrder
+# One exception (step-2 ruling Q3, factory/RULES.md): an open Issue a node labeled `needs-desk` keeps
+# it, and gets no `ready`, while its newest trusted marker-or-claim comment is the run loop's
+# needs-desk marker for this ticket at the store's current ticketHash (format and rule:
+# factory/bin/lib/desk-marker.sh). A desk edit (a new ticketHash) or a new claim cycle (a claim
+# comment after the marker) ends the hold; a `needs-desk` without the marker is recomputed as above.
 # Other labels (in-progress, ...) are never touched. An Issue is the mirror's when its author is in
 # MIRROR_AUTHORS and its body has a `Ticket: <id>` line (the first one counts); the marker line is a
 # notice for humans, not proof, so a hand edit that keeps the Ticket line is overwritten on the next
@@ -37,7 +43,8 @@
 #
 # --dry-run (the default) writes nothing. Both modes print one JSON line per action on stdout:
 #   {"mode", "action": label-create|create|update|reopen|close|unchanged|conflict|orphan, "ticket",
-#    "issue", "gate", "reasons", "add", "remove", "title_changed", "body_changed", "result":
+#    "issue", "gate", "reasons", "desk_hold" ({node, reason} when a node's needs-desk is kept, else
+#    null), "add", "remove", "title_changed", "body_changed", "result":
 #    planned|done|failed|unchanged|conflict|kept}
 # --apply refuses (exit 2) unless RUNNER_ENVIRONMENT=github-hosted and the checkout is on main.
 # Exit 0 done or planned; 1 a read failed (then nothing is written), a write failed or a conflict
@@ -50,8 +57,10 @@ set -euo pipefail
 PROG=mirror
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
+# shellcheck source=factory/bin/lib/desk-marker.sh
+. "$(dirname "$0")/lib/desk-marker.sh"
 
-usage() { sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 forecast="" repo=""
 while [ $# -gt 0 ]; do
@@ -121,6 +130,10 @@ jq -e 'type == "object" and (.waves | type) == "array"' "$WORK/forecast.json" >/
 gh issue list --repo "$REPO" --state all --limit "$LIMIT" --json number,title,body,state,labels,author \
   >"$WORK/issues.json" || die "gh issue list failed"
 [ "$(jq length "$WORK/issues.json")" -lt "$LIMIT" ] || die "gh returned $LIMIT Issues, its limit; the list may be truncated"
+# The comments of open needs-desk Issues only: where a node's marker can hold the label.
+gh issue list --repo "$REPO" --state open --label needs-desk --limit "$LIMIT" --json number,comments \
+  >"$WORK/desk.json" || die "gh issue list (needs-desk comments) failed"
+[ "$(jq length "$WORK/desk.json")" -lt "$LIMIT" ] || die "gh returned $LIMIT needs-desk Issues, its limit; the list may be truncated"
 gh label list --repo "$REPO" --json name --limit "$LIMIT" >"$WORK/labels.json" || die "gh label list failed"
 [ "$(jq length "$WORK/labels.json")" -lt "$LIMIT" ] || die "gh returned $LIMIT labels, its limit; the list may be truncated"
 
@@ -194,7 +207,16 @@ def record_reasons($t):
   | . + {tid: ([$b | lines | .[] | (capture("^Ticket:[ \t]*(?<id>[^ \t]+)[ \t]*$") | .id)?] | first),
          labels: [.labels[].name], marked: ($b | contains($marker))} ] as $issues
 | [$issues[] | select(.author.login | IN($authors[]))] as $mine
-| [$issues[] | select(.marked and (.author.login | IN($authors[]) | not) and .author.is_bot == true)] as $impostors
+| def desk_hold($cur; $t):
+    if $cur == null or $cur.state != "OPEN" or ($cur.labels | index("needs-desk")) == null then null
+    else ([$D[] | select(.number == $cur.number)][0].comments // null) as $cm
+      | if ($cm | type) != "array" or ($cm | length) >= $desk_cap then null
+        else [$cm[] | desk_event] | last
+          | if . != null and .kind == "desk" and .ticket == $t.id and .hash == $t.hash
+            then {node, reason} else null end
+        end
+    end;
+[$issues[] | select(.marked and (.author.login | IN($authors[]) | not) and .author.is_bot == true)] as $impostors
 | ($T | map(.id)) as $ids
 
 | ( $T[] as $t
@@ -208,16 +230,20 @@ def record_reasons($t):
         elif $cur == null and ($imp | length) > 0 then empty
         else
           ($t | header) as $h
-          | (header_reasons($h) + record_reasons($t) + forecast_reasons($t.id)) as $reasons
+          | (header_reasons($h) + record_reasons($t) + forecast_reasons($t.id)) as $store
+          | desk_hold($cur; $t) as $hold
+          | ($store + if $hold == null then []
+                      else ["node: `\($hold.node)` stopped it (\($hold.reason)); needs-desk holds until the ticket changes or a new claim"]
+                      end) as $reasons
           | (if $reasons == [] then "ready" else "needs-desk" end) as $gate
           | ([if ($h.weight | weight_ok) then "w:\($h.weight)" else empty end]
              + [if ($h.tier | tier_ok) then "tier:\($h.tier)" else empty end] + [$gate]) as $want
           | ([$T[] | select(any(.edges[]?; .to == $t.id)) | .id] | unique) as $deps
           | ($t.title | norm | sub("^\\s+"; "") | if . == "" then "Ticket \($t.id)" else . end) as $title
-          | ([$marker, "Ticket: \($t.id)"] + ($deps | map("Depends-on: \(.)"))
+          | ([$marker, "Ticket: \($t.id)"] + ($deps | map("Depends-on: \(.)")) + ["Ticket-Hash: \($t.hash)"]
              + ["", "Gate: \($gate)"] + ($reasons | map("- " + .)) + ["", "---", "", ($t.body | norm)]
              | join("\n") | norm) as $body
-          | {ticket: $t.id, gate: $gate, reasons: $reasons, title: $title, body: $body}
+          | {ticket: $t.id, gate: $gate, reasons: $reasons, desk_hold: $hold, title: $title, body: $body}
           + if $cur == null then {action: "create", issue: null, add: $want, remove: []}
             else ($want - $cur.labels) as $add | ([$cur.labels[] | select(owned)] - $want) as $rm
               | ($cur.title != $title) as $tc | (($cur.body // "" | norm) != $body) as $bc
@@ -236,8 +262,10 @@ def record_reasons($t):
     | {action: "orphan", ticket: .tid, issue: .number, reason: "a mirror Issue whose ticket is not in the store; left as is"} )
 '
 plan="$(jq -c -n --slurpfile T "$WORK/tickets.jsonl" --slurpfile GM "$WORK/gm.json" --slurpfile FF "$WORK/forecast.json" \
-  --slurpfile II "$WORK/issues.json" --arg marker "$MARKER" --argjson authors "$AUTHORS" \
-  '$T as $T | $GM[0].entries as $E | $FF[0] as $F | $II[0] as $I | '"$PLAN_JQ")" || die "could not compute the plan"
+  --slurpfile II "$WORK/issues.json" --slurpfile DD "$WORK/desk.json" --arg marker "$MARKER" --argjson authors "$AUTHORS" \
+  --arg desk_re "$DESK_MARKER_RE" --arg claim_re "$DESK_CLAIM_RE" --argjson desk_trusted "$DESK_TRUSTED" \
+  --argjson desk_cap "$DESK_COMMENT_CAP" \
+  "$DESK_JQ"'$T as $T | $GM[0].entries as $E | $FF[0] as $F | $II[0] as $I | $DD[0] as $D | '"$PLAN_JQ")" || die "could not compute the plan"
 
 # ------------------------------------------------------------------------------------- write
 emit() {  # emit <plan-object> <result> [detail]

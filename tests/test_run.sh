@@ -8,10 +8,14 @@
 # strikes-exhausted, flail, review-unavailable, anything-else), 2 argv, 3 resume, 4 no-transcript,
 # 5 once, 6 scope-stub; plus the paused claim's resume in place, the resume cap, a lost lock, the
 # governor's verdicts, the dry run, slot guards and the fakes themselves. T12 acceptance 4: the bwrap
-# shim on fleet's PATH only, and only at fleet pin 1.12.0 (case bwrap-shim).
+# shim on fleet's PATH only, and only at fleet pin 1.12.0 (case bwrap-shim). T14 acceptance 4: every
+# needs-desk path comments the reason with the needs-desk marker before the label (desk_case,
+# tamper, resume-cap, desk-marker).
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
+# shellcheck source=factory/bin/lib/desk-marker.sh
+. "$REPO_ROOT/factory/bin/lib/desk-marker.sh"
 RUN="$BIN/run.sh"
 iso() { jq -nr --argjson e "$1" '$e | todate'; }
 T0="$(jq -nr '"2026-10-25T12:00:00Z" | fromdateiso8601')"
@@ -77,7 +81,7 @@ EOF
      last_seen: $seen, status: "active"}' >"$FACTORY_MANIFEST"
   under_cap
   fakegh_issue 1 $((T0 - 86400)) ready,w:light "T-run: add hello.sh" \
-    "$(printf '<!-- mirrored by factory/bin/mirror.sh -->\nTicket: T-run\n\nBuild hello.sh. %s\n' "$MARK")"
+    "$(printf '<!-- mirrored by factory/bin/mirror.sh -->\nTicket: T-run\nTicket-Hash: hash-T-run\n\nBuild hello.sh. %s\n' "$MARK")"
   WT="$WORLD/clone/.worktrees/T-run"
 }
 under_cap() {
@@ -103,6 +107,8 @@ labels() { jq -r '.issues[] | select(.number == 1) | [.labels[].name] | sort | j
 trailer() { git -C "$FAKE_GH_GIT" log -1 --format="%(trailers:key=$2,valueonly)" "$1" | sed '/^$/d'; }
 fleet_calls() { wc -l <"$FAKE_FLEET_LOG" | tr -d ' '; }
 no_mark() { ! grep -rqF "$MARK" "$@"; }
+marker() { desk_marker_read "$(last_comment)"; }   # the needs-desk marker of the result comment
+want_marker() { jq -cn --arg r "$1" --arg h "${2:-hash-T-run}" '{ticket: "T-run", hash: $h, reason: $r, node: "dev-box"}'; }
 
 case_success() {
   run_setup
@@ -161,7 +167,8 @@ case_tamper() {
   check "  verdict, score and finding count only" eq "$(jq -c .tamperguard <<<"$LAST")" '{"verdict":"tamper","score":10,"findings":1}'
   check "  scope-check never ran" test ! -e "$WORLD/scope.log"
   check "  nothing pushed" test -z "$(pushed)"
-  check "  labeled needs-desk" eq "$(labels)" in-progress,needs-desk,ready,w:light
+  check "  labeled needs-desk, ready removed" eq "$(labels)" in-progress,needs-desk,w:light
+  check "  the comment ends in the needs-desk marker, reason tamper" eq "$(marker)" "$(want_marker tamper)"
   check "  the lock is released" test -z "$(lock)"
   check "  the comment says nothing was pushed" grep -qF 'Nothing pushed.' <<<"$(last_comment)"
   jq -r '.issues[].comments[].body' "$FAKE_GH_ISSUES" >"$WORLD/comments.txt"; printf '%s\n' "$OUT" >"$WORLD/stdout.txt"
@@ -223,7 +230,9 @@ case_resume_cap() {
   check "the fourth is handled as strikes-exhausted: desk" eq "$(field '"\(.outcome) \(.reason)"')" "desk wall-clock"
   check "  the cap is in the record" eq "$(field .note)" "resume cap 3 reached"
   check "  labeled needs-desk, lock released, worktree gone" \
-    eq "$(labels) $(lock) $([ -e "$WT" ] && echo kept || echo gone)" "in-progress,needs-desk,ready,w:light  gone"
+    eq "$(labels) $(lock) $([ -e "$WT" ] && echo kept || echo gone)" "in-progress,needs-desk,w:light  gone"
+  check "  the marker carries the Ticket-Hash read at claim time, across the resumes (slot state)" \
+    eq "$(marker)" "$(want_marker wall-clock)"
 }
 
 case_lock_lost() {
@@ -246,7 +255,8 @@ desk_case() {
   check "$1: exit 0, the loop goes on" eq "$RC" 0
   check "  outcome desk" eq "$(field '"\(.outcome) \(.reason)"')" "desk $1"
   check "  the branch is pushed with the reason" eq "$(trailer "$(pushed)" Fleet-Reason)" "$1"
-  check "  labeled needs-desk" eq "$(labels)" in-progress,needs-desk,ready,w:light
+  check "  labeled needs-desk, ready removed" eq "$(labels)" in-progress,needs-desk,w:light
+  check "  the comment ends in the needs-desk marker with the reason" eq "$(marker)" "$(want_marker "$1")"
   check "  the lock is released" test -z "$(lock)"
   check "  the comment: reason, strikes, branch" grep -qE "reason \`$1\`, strikes 1 of 2, .*Branch \`ticket/T-run/dev-box\`" <<<"$(last_comment)"
   check "  the worktree is gone, no slot state" eq "$([ -e "$WT" ] && echo kept)$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)" ""
@@ -254,6 +264,50 @@ desk_case() {
 }
 case_strikes_exhausted() { desk_case strikes-exhausted; }
 case_flail() { desk_case flail; }
+
+case_desk_marker() {
+  # A real scope failure (exit 2, not the stub's "not built"): the fourth needs-desk path.
+  run_setup
+  printf '#!/usr/bin/env bash\necho "out of scope: x" >&2\nexit 2\n' >"$WORLD/bin/scope-fail"
+  chmod +x "$WORLD/bin/scope-fail"
+  export FACTORY_SCOPE_CHECK="$WORLD/bin/scope-fail"
+  loop --once
+  check "a real scope failure: exit 0, outcome desk, reason scope-fail" eq "$RC $(field '"\(.outcome) \(.reason)"')" "0 desk scope-fail"
+  check "  nothing pushed, labeled needs-desk, ready removed" eq "$(pushed) $(labels)" " in-progress,needs-desk,w:light"
+  check "  the comment ends in the marker, reason scope-fail" eq "$(marker)" "$(want_marker scope-fail)"
+  check "  the marker is the comment's last line" eq "$(last_comment | tail -n1)" \
+    "<!-- factory-needs-desk v1 ticket=T-run hash=hash-T-run reason=scope-fail node=dev-box -->"
+  # comment first, then one edit that adds needs-desk and removes ready: the mirror never sees the
+  # label without the marker, and no node can claim the Issue (claim.sh takes `ready`) in between.
+  local ci ei
+  ci="$(jq -sc 'map(.[0:2] == ["issue", "comment"] and (.[-1] | contains("factory-needs-desk"))) | index(true)' "$FAKE_GH_LOG")"
+  ei="$(jq -sc 'map(.[0:2] == ["issue", "edit"] and (index("needs-desk") != null)) | index(true)' "$FAKE_GH_LOG")"
+  check "  the marker comment comes before the label edit" \
+    eq "$([ "$ci" != null ] && [ "$ei" != null ] && [ "$ci" -lt "$ei" ] && echo before)" before
+  check "  the label edit adds needs-desk and removes ready" \
+    eq "$(jq -sc 'map(select(.[0:2] == ["issue", "edit"] and (index("needs-desk") != null)) | [.[2], .[5:]]) | .[0]' "$FAKE_GH_LOG")" \
+       '["1",["--add-label","needs-desk","--remove-label","ready"]]'
+  # The real claim.sh's claim comment is what the mirror counts as a new claim cycle.
+  check "  claim.sh's claim comment reads as a claim (DESK_CLAIM_RE)" \
+    eq "$(jq -c --arg desk_re "$DESK_MARKER_RE" --arg claim_re "$DESK_CLAIM_RE" --argjson desk_trusted "$DESK_TRUSTED" \
+            "$DESK_JQ"'[.issues[0].comments[0] | . + {authorAssociation: "COLLABORATOR"} | desk_event]' "$FAKE_GH_ISSUES")" '[{"kind":"claim"}]'
+  # An Issue from a mirror that wrote no Ticket-Hash line: the marker says unknown, so the mirror
+  # recomputes that label rather than hold it.
+  run_setup
+  local tmp; tmp="$(mktemp)"
+  jq '(.issues[] | select(.number == 1)).body |= sub("Ticket-Hash: hash-T-run\n"; "")' "$FAKE_GH_ISSUES" >"$tmp" && mv "$tmp" "$FAKE_GH_ISSUES"
+  export FAKE_FLEET_REASON=flail
+  loop --once
+  check "no Ticket-Hash line on the Issue: the marker's hash is unknown" eq "$(marker)" "$(want_marker flail unknown)"
+  # Outcomes that do not label needs-desk carry no marker.
+  run_setup
+  loop --once
+  check "scope-check not built (released, no label): no marker" eq "$(marker)$(labels)" in-progress,ready,w:light
+  run_setup
+  export FAKE_FLEET_REASON=preflight
+  loop --once
+  check "a run-level failure (released, no label): no marker" eq "$(marker)$(labels)" in-progress,ready,w:light
+}
 
 case_review_unavailable() {
   run_setup
@@ -573,7 +627,7 @@ case_bwrap_shim() {
 }
 
 for c in ${CASES:-success scope-stub tamper quota-paused wall-clock resume-in-place resume-cap lock-lost \
-                  strikes-exhausted flail review-unavailable anything-else argv resume no-transcript once \
+                  strikes-exhausted flail desk-marker review-unavailable anything-else argv resume no-transcript once \
                   governor dry-run guards fakes bwrap-shim}; do
   run_case "$c"
 done

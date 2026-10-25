@@ -32,14 +32,14 @@
 #     success                       tamperguard (under vetto + build.toml) then scope-check. Both
 #                                   pass → push ticket/<id>/<handle>, open the PR, comment; the
 #                                   lock stays (SPEC-v0.2 releases it at merge). tamper or a real
-#                                   scope failure → label needs-desk, release, no push. scope-check
+#                                   scope failure → comment, label needs-desk, release, no push. scope-check
 #                                   "not built" (step 3's stub) → record scope-check-not-built, keep
 #                                   a LOCAL ticket branch, release, no push, stop the slot (exit 2)
 #     quota-paused | wall-clock     push the partial branch, heartbeat the lock, keep the worktree;
 #                                   the next iteration (after the governor) re-runs the identical
 #                                   fleet argv there, which resumes it. A fourth pause of one claim
 #                                   is handled as strikes-exhausted
-#     strikes-exhausted | flail     push the branch, label needs-desk, comment, release
+#     strikes-exhausted | flail     push the branch, comment, label needs-desk, release
 #     review-unavailable            release, nap governor.reviewUnavailableSleepMinutes
 #     lock-held | ticket-blocked | mirror-fetch-failed
 #                                   release, comment the reason, nap nothingClaimableSleepMinutes
@@ -49,6 +49,10 @@
 #   then the worktree and its mirror are removed (except while paused). A mirror that cannot be
 #   built → reason mirror-failed, release, comment, stop the slot (exit 1).
 #
+# Labeling needs-desk: the result comment ends in the needs-desk marker (lib/desk-marker.sh: ticket,
+# the Issue's Ticket-Hash at claim time, reason, handle), written before the label, and the one
+# `gh issue edit` adds needs-desk and removes ready, so no node claims the Issue in between. The
+# mirror keeps that label until the ticket's store state changes (factory/RULES.md, step-2 Q3).
 # A nap is at most governor.nodeHeartbeatMinutes; then the governor is asked again. A paused claim's
 # lock is heartbeated (heartbeat.sh) when claim.heartbeatMinutes have passed. One JSON line per
 # iteration goes to $FACTORY_HOME/run/ledger.jsonl and, with --json, to stdout: ids, reason codes,
@@ -68,8 +72,10 @@ PROG=run
 . "$(dirname "$0")/lib/common.sh"
 # shellcheck source=factory/bin/lib/run.sh
 . "$(dirname "$0")/lib/run.sh"
+# shellcheck source=factory/bin/lib/desk-marker.sh
+. "$(dirname "$0")/lib/desk-marker.sh"
 
-usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -177,7 +183,7 @@ serial() {  # serial <cmd...>: one at a time per node (governor fetches, git fet
 
 # Per-iteration variables. REC accumulates the ledger line.
 reset_iteration() {
-  ISSUE="" TICKET="" WEIGHT="" WT="" BASE="" BASE_KIND="" LAPSED="" RUN_ID="" RESUMES=0 FLEET_ARGV='[]'
+  ISSUE="" TICKET="" TICKET_HASH="" WEIGHT="" WT="" BASE="" BASE_KIND="" LAPSED="" RUN_ID="" RESUMES=0 FLEET_ARGV='[]'
   MAX_STRIKES=0 WALL_MIN=0 STRIKES=0 FLEET_RUN=unknown REASON="" NEXT_SLEEP=0 STOP_RC="" LOGBASE="" DOC=""
   REC="$(jq -cn --argjson s "$slot" --argjson i "$ITER" --arg at "$(epoch_to_iso "$(now_epoch)")" --arg h "$HANDLE" \
           --arg a "$ADAPTER@$ADAPTER_VERSION" \
@@ -188,16 +194,17 @@ act() { rec --arg a "$1" '.actions += [$a]'; }
 outcome() { rec --arg o "$1" '.outcome = $o'; }
 
 state_save() {
-  jq -cn --argjson n "$ISSUE" --arg t "$TICKET" --arg w "$WEIGHT" --arg wt "$WT" --arg b "$BASE" --arg bk "$BASE_KIND" \
+  jq -cn --argjson n "$ISSUE" --arg t "$TICKET" --arg th "$TICKET_HASH" --arg w "$WEIGHT" --arg wt "$WT" --arg b "$BASE" --arg bk "$BASE_KIND" \
          --arg l "$LAPSED" --arg r "$RUN_ID" --argjson res "$RESUMES" --argjson argv "$FLEET_ARGV" \
          --argjson ms "$MAX_STRIKES" --argjson beat "$1" --arg reason "$REASON" \
-    '{issue: $n, ticket: $t, weight: $w, worktree: $wt, base: $b, base_kind: $bk, lapsed: $l, run_id: $r,
+    '{issue: $n, ticket: $t, ticket_hash: $th, weight: $w, worktree: $wt, base: $b, base_kind: $bk, lapsed: $l, run_id: $r,
       resumes: $res, fleet_argv: $argv, max_strikes: $ms, lock_beat_at: $beat, paused_reason: $reason}' >"$STATE.tmp"
   mv -f "$STATE.tmp" "$STATE"
 }
 state_load() {
   local s; s="$(command cat "$STATE")"
   ISSUE="$(jq -r .issue <<<"$s")" TICKET="$(jq -r .ticket <<<"$s")" WEIGHT="$(jq -r .weight <<<"$s")"
+  TICKET_HASH="$(jq -r '.ticket_hash // ""' <<<"$s")"
   WT="$(jq -r .worktree <<<"$s")" BASE="$(jq -r .base <<<"$s")" BASE_KIND="$(jq -r .base_kind <<<"$s")"
   LAPSED="$(jq -r .lapsed <<<"$s")" RUN_ID="$(jq -r .run_id <<<"$s")" RESUMES="$(jq -r .resumes <<<"$s")"
   FLEET_ARGV="$(jq -c .fleet_argv <<<"$s")" MAX_STRIKES="$(jq -r .max_strikes <<<"$s")"
@@ -224,13 +231,16 @@ facts() {  # the JSON every outbound text is rendered from (I8: ids, codes, coun
     '{handle: $h, ticket: $t, issue: $n, reason: $r, strikes: $s, max_strikes: $ms, adapter: $a, fleet_run: $run,
       branch: (if $br == "" then null else $br end), head: $head, base: $base, base_kind: $bk, pr: $pr, tokens: null}'
 }
-comment() {  # comment <kind> [branch head pr]
-  local body; body="$(run_comment "$1" "$(facts "${2:-}" "${3:-}" "${4:-null}")")"
+comment() {  # comment <kind> [branch head pr]; a desk comment ends in the needs-desk marker
+  local body m; body="$(run_comment "$1" "$(facts "${2:-}" "${3:-}" "${4:-null}")")"
+  if [ "$1" = desk ]; then
+    if m="$(desk_marker "$TICKET" "$TICKET_HASH" "$REASON" "$HANDLE")"; then body+=$'\n\n'"$m"; else act desk-marker-failed; fi
+  fi
   if gh issue comment "$ISSUE" --repo "$REPO" --body "$body" >/dev/null 2>>"$LOGBASE.err"; then act comment
   else act comment-failed; fi
 }
 label_desk() {
-  if gh issue edit "$ISSUE" --repo "$REPO" --add-label needs-desk >/dev/null 2>>"$LOGBASE.err"; then act label-needs-desk
+  if gh issue edit "$ISSUE" --repo "$REPO" --add-label needs-desk --remove-label ready >/dev/null 2>>"$LOGBASE.err"; then act label-needs-desk
   else act label-needs-desk-failed; fi
 }
 push_record() {  # push_record <parent> <outcome> [trailers...]: record commit + push; sets PUSHED_SHA
@@ -360,7 +370,7 @@ on_success() {
     0:ok|0:review) ;;
     2:tamper)
       rec --arg s "$score" --arg f "$findings" '.tamperguard = {verdict: "tamper", score: ($s | tonumber), findings: ($f | tonumber)}'
-      REASON=tamper; outcome desk; label_desk; comment desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
+      REASON=tamper; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
     *) REASON=tamperguard-error; outcome released; finish_release 1 0 1; return ;;
   esac
   rec --arg v "$verdict" --arg s "$score" --arg f "$findings" '.tamperguard = {verdict: $v, score: ($s | tonumber), findings: ($f | tonumber)}'
@@ -375,7 +385,7 @@ on_success() {
     REASON=scope-check-not-built; outcome held; finish_release 1 0 2; return
   elif [ "$src" = 2 ]; then
     rec '.scope_check = "fail"'
-    REASON=scope-fail; outcome desk; label_desk; comment desk; release_lock; wt_remove; rm -f "$STATE"; return
+    REASON=scope-fail; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return
   elif [ "$src" != 0 ]; then
     rec '.scope_check = "error"'
     REASON=scope-check-error; outcome released; finish_release 1 0 1; return
@@ -402,8 +412,8 @@ on_success() {
 }
 on_desk() {  # strikes-exhausted | flail (and a pause past the resume cap)
   push_record "$(worker_tip)" "$REASON" "Fleet-Reason: $REASON" "Fleet-Strikes: $STRIKES" || true
-  label_desk
   comment desk "${PUSHED_SHA:+ticket/$TICKET/$HANDLE}" "$PUSHED_SHA"
+  label_desk
   release_lock; wt_remove; rm -f "$STATE"
   outcome desk
 }
@@ -456,7 +466,7 @@ dispatch() {
 
 # ------------------------------------------------------------------ one iteration
 iteration() {
-  local g grc=0 action greason gsleep c crc=0 now issues
+  local g grc=0 action greason gsleep c crc=0 now issues issue
   now="$(now_epoch)"
   if [ -f "$STATE" ]; then
     state_load
@@ -500,7 +510,9 @@ iteration() {
   MAX_STRIKES="$(budget ".weights.\"$WEIGHT\".maxStrikes")"
   WALL_MIN="$(budget ".weights.\"$WEIGHT\".wallClockMinutes")"
   issues="$(gh issue list --repo "$REPO" --state open --limit 1000 --json number,body 2>>"$LOGBASE.err")" || issues='[]'
-  TICKET="$(run_ticket_of_issue "$(jq -c --argjson n "$ISSUE" '[.[] | select(.number == $n)][0] // {}' <<<"$issues")")"
+  issue="$(jq -c --argjson n "$ISSUE" '[.[] | select(.number == $n)][0] // {}' <<<"$issues")"
+  TICKET="$(run_ticket_of_issue "$issue")"
+  TICKET_HASH="$(run_ticket_hash_of_issue "$issue")"
   if ! valid_ticket_id "$TICKET" || ! git check-ref-format "refs/heads/ticket/$TICKET/$HANDLE"; then
     TICKET=unresolved REASON=ticket-unresolved; outcome released; finish_release 1 0 1; return
   fi
