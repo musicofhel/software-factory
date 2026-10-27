@@ -12,6 +12,9 @@
 # order (an open parent, a forecast wave behind wave 1); `in-review` while an open PR from this
 # repository's ticket/<id>/* exists (a fork's or a closed one counts for nothing); `needs-desk` wins.
 # Depends-on lines link the parent's Issue `(#n)`, also one created in the same run.
+# T26 / TB7 (case ready-only-when-gated): no per-ticket merge-forecast record is asked for (adlc
+# 1.12.0 has no command that writes one); the live forecast is the certificate. Case
+# parent-edge-stale: intake:I10, a new child's edge on the parent makes the parent's coldstart stale.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -48,10 +51,11 @@ set_ticket() {  # set_ticket <id> <jq update>
   mv "$tmp" "$WORLD/store.json"
 }
 record() { printf '%s\n' "$1" >>"$WORLD/repo/.adlc/manifest.jsonl"; }
-gated() {  # gated <id> [ticketHash]: clean spec-lint, coldstart and merge-forecast records
+gated() {  # gated <id> [ticketHash]: clean spec-lint and coldstart records, what desk-gates.sh
+  # --write records. No merge-forecast record: adlc 1.12.0 cannot write one, and the mirror asks
+  # for none (the live forecast certifies wave 1, T26).
   record "{\"gate\":\"spec-lint\",\"ticket\":\"$1\",\"data\":{\"verified\":true}}"
   record "{\"gate\":\"coldstart\",\"ticket\":\"$1\",\"data\":{\"tier\":\"cheap\",\"cache\":{\"ticketHash\":\"${2:-hash-$1}\",\"model\":\"m\",\"gaps\":[]}}}"
-  record "{\"gate\":\"merge-forecast\",\"ticket\":\"$1\",\"data\":{\"certifiedWidth\":2}}"
 }
 mir() {  # mir <args>: run the mirror in the checkout; sets RC, OUT (JSON lines), ERR
   RC=0
@@ -171,27 +175,28 @@ case_ready_only_when_gated() {
   ticket T2 "no spec-lint" "$HDR"
   ticket T3 "coldstart gaps" "$HDR"
   ticket T4 "coldstart stale" "$HDR"
-  ticket T5 "no merge-forecast record" "$HDR"
+  ticket T5 "no merge-forecast record (none is asked for)" "$HDR"
   ticket T6 "bad header" $'weight: medium\ntier: 7\n\nno charter'
   ticket T7 "spec-lint failed later" "$HDR"
   ticket T8 "prompt-only coldstart, clean" "$HDR"
   ticket T9 "sequenced behind T1" "$HDR"
   ticket T10 "wave 2" "$HDR"
-  ticket T11 "merge-forecast record is a failure" "$HDR"
+  ticket T11 "a failing merge-forecast record (ignored)" "$HDR"
   gated T1
   record '{"gate":"coldstart","ticket":"T2","data":{"cache":{"ticketHash":"hash-T2","gaps":[]}}}'
-  record '{"gate":"merge-forecast","ticket":"T2","data":{}}'
   gated T3; record '{"gate":"coldstart","ticket":"T3","data":{"cache":{"ticketHash":"hash-T3","gaps":[{"kind":"missing-file"}]}}}'
   gated T4 hash-T4-old
+  # T5: clean spec-lint and coldstart, no merge-forecast record at all: the forecast certifies it.
   record '{"gate":"spec-lint","ticket":"T5","data":{"verified":true}}'
   record '{"gate":"coldstart","ticket":"T5","data":{"cache":{"ticketHash":"hash-T5","gaps":[]}}}'
   gated T6
   gated T7; record '{"gate":"spec-lint","ticket":"T7","data":{"verified":false}}'
   record '{"gate":"spec-lint","ticket":"T8","data":{"verified":true}}'
   record '{"gate":"coldstart","ticket":"T8","data":{"verdict":"{\"gaps\":[],\"ticketHash\":\"hash-T8\"}"}}'
-  record '{"gate":"merge-forecast","ticket":"T8","data":{}}'
   gated T9; gated T10
-  gated T11; record '{"gate":"merge-forecast","ticket":"T11","data":{"verified":false}}'
+  # T11: a merge-forecast record that is a failure (an older writer's, or a hand edit) is not read;
+  # the live forecast below certifies T11, so it is ready.
+  gated T11; record '{"gate":"merge-forecast","ticket":"T11","data":{"verified":false,"gateFailures":["x"]}}'
   record '{"gate":"spec-lint","ticket":"T1-other","data":{"verified":false}}'
   export FAKE_ADLC_FORECAST='{"waves":[["T1","T2","T3","T4","T5","T6","T7","T8","T9","T11"],["T10"]],
     "mergeOrder":["T1","T2","T3","T4","T5","T6","T7","T8","T9","T11","T10"],
@@ -200,21 +205,22 @@ case_ready_only_when_gated() {
   mir --apply
   check "exit 0" eq "$RC" 0
   local t want
-  for t in T1 T8; do check "$t ready" eq "$(labels "$t")" '["ready","tier:1","w:light"]'; done
-  for t in T2 T3 T4 T5 T7 T9 T11; do check "$t needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'; done
+  for t in T1 T5 T8 T11; do check "$t ready" eq "$(labels "$t")" '["ready","tier:1","w:light"]'; done
+  for t in T2 T3 T4 T7 T9; do check "$t needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'; done
   # A wave behind wave 1 is dependency order only: blocked, not a case for the desk (T25).
   check "T10 blocked (its only reason is the forecast wave)" eq "$(labels T10)" '["blocked","tier:1","w:light"]'
   check "T6: needs-desk and no w:/tier: label from an invalid header" eq "$(labels T6)" '["needs-desk"]'
   check "T2 reason" eq "$(reasons T2)" '["spec-lint: no record"]'
   check "T3 reason" eq "$(reasons T3)" '["coldstart: 1 unresolved gap(s)"]'
   check "T4 reason" eq "$(reasons T4)" '["coldstart: stale (the ticket changed after coldstart ran)"]'
-  check "T5 reason" eq "$(reasons T5)" '["merge-forecast: no record"]'
+  check "T5: no merge-forecast record is no reason" eq "$(reasons T5)" '[]'
   check "T6 reasons" eq "$(reasons T6)" \
     '["header: weight '"'"'medium'"'"' is not light|heavy","header: tier '"'"'7'"'"' is not 0|1|2","header: charter missing"]'
   check "T7: the latest spec-lint record counts" eq "$(reasons T7)" '["spec-lint: the latest record is not a verified pass"]'
   check "T9 reason" eq "$(reasons T9)" '["merge-forecast: sequenced behind T1 in wave 1"]'
   check "T10 reason" eq "$(reasons T10)" '["merge-forecast: in wave 2, not wave 1"]'
-  check "T11: the latest merge-forecast record counts" eq "$(reasons T11)" '["merge-forecast: the latest record is a failure"]'
+  check "T11: a failing merge-forecast record is ignored" eq "$(reasons T11)" '[]'
+  check "no reason names a merge-forecast record" eq "$(jq -sc '[.[].reasons[]? | select(test("record"; "i") and startswith("merge-forecast"))]' <<<"$OUT")" '[]'
   check "the Issue body shows the verdict and reasons" has "$(body T3)" $'Gate: needs-desk\n- coldstart: 1 unresolved gap(s)'
   # The gate turns: T2 gets its spec-lint pass, T1 regresses. Labels swap; in-progress stays.
   gh issue edit "$(iss T1 .number)" --repo test/repo --add-label in-progress >/dev/null
@@ -230,6 +236,48 @@ case_ready_only_when_gated() {
   check "and readies nothing" eq "$(lines '.gate == "ready"')" 0
   want='merge-forecast: the forecast has gate failures (vetoed pair T2-T8 concurrent)'
   check "T8 names the forecast failure" eq "$(reasons T8)" "[\"$want\"]"
+}
+
+# intake:I10. The edge {to: <child>} lives on the PARENT, so adding a dependent edits the parent and
+# changes its ticketHash; the parent's coldstart record (taken on the old hash) goes stale and a
+# ready parent flips to needs-desk, `coldstart: stale`. This is EXPECTED, not a bug: the desk
+# runbook (factory/RULES.md, desk steps 3-4) writes the child and the parent's edge in one desk PR,
+# then re-runs the parent's coldstart with factory/bin/desk-gates.sh --write, so the fresh record
+# rides in the same PR. The fake store does not derive ticketHash from the edges (real adlc does);
+# the fixture sets the new hash with the edge, as `adlc ticket` would compute it.
+case_parent_edge_stale() {
+  mir_setup
+  ticket T1 "parent" "$HDR"; set_ticket T1 '.ticketHash = "hash-T1-v1"'
+  gated T1 hash-T1-v1
+  mir --apply
+  check "before: exit 0" eq "$RC" 0
+  check "before: the parent, records on hash v1, is ready" eq "$(line T1 '[.gate, .reasons]')" '["ready",[]]'
+  check "before: its body carries hash v1" has "$(body T1)" "Ticket-Hash: hash-T1-v1"
+  # The desk adds child T2 (with its own records) and the parent's edge: T1's hash is now v2.
+  ticket T2 "child" "$HDR"; gated T2
+  set_ticket T1 '.edges = [{to: "T2"}] | .ticketHash = "hash-T1-v2"'
+  local nrec; nrec="$(wc -l <"$WORLD/repo/.adlc/manifest.jsonl")"
+  mir --apply
+  check "after the edge: exit 0" eq "$RC" 0
+  check "after the edge: T1's records are untouched (still on v1)" \
+    eq "$(wc -l <"$WORLD/repo/.adlc/manifest.jsonl")$(jq -sc '[.[] | select(.ticket == "T1" and .gate == "coldstart") | .data.cache.ticketHash]' "$WORLD/repo/.adlc/manifest.jsonl")" \
+       "${nrec}[\"hash-T1-v1\"]"
+  check "after the edge: T1 needs-desk, coldstart stale, and only that (expected, intake:I10)" \
+    eq "$(line T1 '[.gate, .reasons, .add, .remove]')" \
+       '["needs-desk",["coldstart: stale (the ticket changed after coldstart ran)"],["needs-desk"],["ready"]]'
+  check "after the edge: T1's labels" eq "$(labels T1)" '["needs-desk","tier:1","w:light"]'
+  check "after the edge: T1's body carries hash v2" has "$(body T1)" "Ticket-Hash: hash-T1-v2"
+  check "after the edge: the child T2 waits on T1 (blocked)" eq "$(line T2 '[.gate, .reasons]')" '["blocked",["blocked: waits on T1"]]'
+  # desk-gates.sh --write records a fresh coldstart on v2 (in the same desk PR): ready again.
+  record '{"gate":"coldstart","ticket":"T1","data":{"tier":"cheap","cache":{"ticketHash":"hash-T1-v2","model":"m","gaps":[]}}}'
+  mir --apply
+  check "a fresh coldstart on v2: T1 ready again" \
+    eq "$(line T1 '[.gate, .reasons, .add, .remove]')" '["ready",[],["ready"],["needs-desk"]]'
+  check "  T1's labels" eq "$(labels T1)" '["ready","tier:1","w:light"]'
+  check "  T2 still blocked on its open parent" eq "$(labels T2)" '["blocked","tier:1","w:light"]'
+  local before; before="$(writes)"
+  mir --apply
+  check "a rerun writes nothing" eq "$(writes)" "$before"
 }
 
 case_rails_required() {
@@ -551,7 +599,6 @@ case_forecast_wave_blocked() {
   ticket T5 "wave 2, behind an open parent" "$HDR"
   gated T1; gated T2; gated T3; gated T5
   record '{"gate":"coldstart","ticket":"T4","data":{"cache":{"ticketHash":"hash-T4","gaps":[]}}}'
-  record '{"gate":"merge-forecast","ticket":"T4","data":{}}'
   export FAKE_ADLC_FORECAST='{"waves":[["T1"],["T2","T3","T4","T5"]],"mergeOrder":["T1","T2","T3","T4","T5"],"pairs":[],"gateFailures":[]}'
   mir --apply
   check "exit 0" eq "$RC" 0
@@ -783,7 +830,7 @@ case_fake_semantics() {
 
 adlc() { "$FAKES_DIR/adlc" "$@"; }
 
-for c in creates updates-idempotent ready-only-when-gated rails-required depends-on-lines dry-run-inert closes-completed all-completed \
+for c in creates updates-idempotent ready-only-when-gated parent-edge-stale rails-required depends-on-lines dry-run-inert closes-completed all-completed \
          stranger-issues node-needs-desk forecast-file depends-on-blocked forecast-wave-blocked in-review links \
          close-removes-gate-labels read-failures-write-nothing refuses-apply workflow fake-semantics; do
   run_case "$c"

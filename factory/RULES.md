@@ -41,6 +41,38 @@ only `needs-desk` with the reason `rails: none declared`, and `make tickets`
 needs `--allow-unsigned` while no manifest key exists (factory-run-calls-v1 ruling Q1), and
 post-merge passes it.
 
+## The desk runbook (a desk PR; specs/factory-step3-v1 TB7, ticket T26)
+
+A desk PR changes only `.adlc/` and carries `Signed-off-by:` and no `Ticket:`. It goes through the
+`desk` job of `.github/workflows/gates.yml` (`factory/bin/desk-gates.sh --check`, the base's copy).
+To write one:
+
+1. Branch from the current `main`. The job refuses a manifest that does not start with main's bytes
+   (`does not extend`). Two desk PRs cut from one main, or a desk PR and a post-merge commit, break
+   the hash chain (`chain broken`). When main moves under an open desk PR, reset the branch to the
+   new main and redo the `adlc` writes and step 4. Never resolve a manifest conflict by hand: the
+   lines carry the hash of the line before them.
+2. Write the ticket with `adlc ticket create --input <file> --write --allow-unsigned`, with the
+   next free `T<n>` id (ADR-0002 amendment T26), the header block, at least `factory/policy/**` in
+   `rails`, and a scope. Every scope glob must match a tracked path or a path the ticket (or a
+   ticket it waits on) declares new on a body line ``New paths: `a/b.sh`, `c/d.md` ``. At least one
+   glob must match an existing file: adlc's forecast calls a scope that matches nothing `unscoped`
+   and sequences it behind every other ticket, and `make tickets` refuses any forecast warning that
+   names the ticket. A parent's tier is never higher than its child's.
+3. **A child and its parent's edge go in one PR.** The edge `{to: <child>}` lives on the parent, so
+   adding it changes the parent's ticketHash, and the parent's coldstart record goes stale. The
+   mirror then holds the parent at `needs-desk`, `coldstart: stale` (intake:I10). Write the child
+   first, then the parent's edge.
+4. Run `factory/bin/desk-gates.sh --write` in the PR's checkout. It records spec-lint and coldstart
+   for every open ticket whose record is missing or stale, including the parent of step 3, so the
+   records ride in the same PR. `--dry-run`, the default, shows what it would write.
+5. Run `make tickets` and `factory/bin/desk-gates.sh --check` locally. Then commit `.adlc/` with
+   `Signed-off-by:` and open the PR.
+
+The mirror labels an open ticket `ready` only with a verified spec-lint record and a gap-free
+coldstart record on its current ticketHash. A ticket written without them stays at `needs-desk`
+with `no record`, and the `desk` job fails the PR that adds it.
+
 ## Commit-check exemption (for build order step 3)
 
 One commit on `main` is written by no human and no node: post-merge's completion commit

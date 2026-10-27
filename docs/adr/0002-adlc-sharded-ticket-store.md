@@ -33,7 +33,7 @@ which the ADLC schema does not have (it has `category`, `duration`, `budget`, `s
    job parses the header to set `w:<weight>` and `tier:<n>` labels; `tk` stays the trial
    replacement if this becomes painful.
 3. Every ticket declares at least `factory/policy/**` in `rails` (amendment T18 below).
-4. Ticket ids are ADLC ULIDs (`T-01K…`); lock refs use the Issue number
+4. Ticket ids are ADLC ULIDs (`T-01K…`) (amended by T26 below: the ids are `T<n>`); lock refs use the Issue number
    (`refs/locks/issue-N`) as the spec says, and the mirror job keeps the mapping in the
    Issue body.
 
@@ -61,3 +61,27 @@ protects for every ticket, so the rail costs a build ticket nothing.
   `ticket complete --write --authorize` pass `--allow-unsigned`
   (`specs/factory-run-calls-v1/RULINGS.md` Q1, matching `.adlc/config.json` `securityMode:
   unsigned-fallback`). A key may replace this later.
+
+## Amendment T26 (2026-10-27): ticket ids, completion, and the desk's records
+
+`specs/factory-step3-v1` TB7 (ticket T26; gaps intake:I11 and merge:G20 of that spec's
+`records/sim/`).
+
+- **Ids are `T<n>`, not ULIDs.** Decision 4 named ADLC ULIDs, but the store has held `T1`…`T31`
+  since step 1. `adlc ticket create --help` (1.12.0) mints a ULID when `id` is omitted and says
+  "supply one only to keep an existing T<n> id". The desk always supplies one: the next free
+  `T<n>`, so branch names, trailers and Issue bodies keep one id form. Lock refs and the mirror's
+  Issue mapping are unchanged.
+- **Completed means merged to main** (invariant I20 of `specs/factory-step3-v1/SPEC.md`). SPEC-v0.2
+  completes a ticket at release in its transitions table (L185–193), but at merge in its Merge section
+  (L689–690). This ADR rules for merge: post-merge (`factory/bin/post-merge.sh`) completes the merged
+  PR's ticket on main, and a dependant's `Depends-on:` hold reads "not completed on main". Release is
+  a later state for step 5. It never re-opens or re-completes a ticket.
+- **The desk writes the records `ready` needs.** `factory/bin/desk-gates.sh --write` records
+  spec-lint and coldstart for every open ticket whose record is missing or stale, with adlc 1.12.0's
+  own record commands. adlc has no merge-forecast record command, so the mirror certifies wave 1 from
+  the live forecast. The `desk` job of `.github/workflows/gates.yml` refuses a PR touching `.adlc/**`
+  in any of these cases: the store fails `make tickets` (now a contract lint: header, scope, edges,
+  tier, forecast warnings); `adlc ticket doctor` fails; the manifest does not extend main's with an
+  intact hash chain and 0 skipped entries; or an open ticket's records are not current. The runbook
+  is in `factory/RULES.md`.

@@ -110,16 +110,16 @@ desk_ticket() {  # desk_ticket <id> <tier> <scope-dir> <edges-json>
   ticket_json "$@" >"$SIM/ticket-$1.json"
   adlc_desk ticket create --input "$SIM/ticket-$1.json" --write --allow-unsigned --json >>"$LOG" 2>&1 || die "adlc ticket create $1 failed"
 }
-records_standin() {  # what TB7's desk gates will write: spec-lint, coldstart, merge-forecast records
-  local id h
-  desk_sync
-  for id in "$@"; do
-    h="$(adlc_desk ticket show "$id" --json | jq -r .ticketHash)"
-    adlc_desk gate-manifest record spec-lint --ticket "$id" --data '{"verified":true}' >>"$LOG" 2>&1
-    adlc_desk gate-manifest record coldstart --ticket "$id" --data "$(jq -cn --arg h "$h" '{cache: {ticketHash: $h, gaps: []}}')" >>"$LOG" 2>&1
-    adlc_desk gate-manifest record merge-forecast --ticket "$id" --data '{"verified":true,"certifiedWidth":1}' >>"$LOG" 2>&1
-  done
-  desk_push "desk: spec-lint, coldstart and merge-forecast records for $* (sim stand-in for TB7)"
+desk_records() {  # desk_records [dir]: the desk's records for every open ticket of the clone in <dir>
+                  # (default the desk), written by factory/bin/desk-gates.sh --write (ticket T26), never by hand
+  local d="${1:-$SIM/desk}"
+  ( cd "$d" && FACTORY_ADLC="$ADLC" ./factory/bin/desk-gates.sh --write ) >>"$LOG" 2>&1 ||
+    die "desk-gates.sh --write failed in $d (sim.log has its lines)"
+}
+records_push() {  # records_push <what>: the desk's records for a ticket the mirror did not make ready, pushed
+  desk_sync; desk_records
+  [ -n "$(git -C "$SIM/desk" status --porcelain)" ] || die "no record of $1 was missing or stale, and it is not ready"
+  desk_push "desk: records for $1 (factory/bin/desk-gates.sh --write)"
 }
 
 # ------------------------------------------------------------------ a node
@@ -205,7 +205,7 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   elif has_label "$n" ready; then stage "$X.mirror-ready" pass "#$n ready"
   else
     stage "$X.mirror-ready" red "#$n: $(ghq --argjson n "$n" '.issues[] | select(.number == $n) | [.labels[].name] | join(",")')"
-    standin "records for $id"; records_standin "$id"
+    records_push "$id"
     has_label "$n" ready || die "$id is not ready even with its records"
   fi
 
@@ -348,14 +348,16 @@ desk_sync
 desk_ticket T-sim-child 1 sim/child '[]'
 desk_ticket T-sim-parent 0 sim/parent '[{"to":"T-sim-child"}]'
 stage desk.write pass "T-sim-parent (tier 0) → T-sim-child (tier 1)"
-desk_push "desk: T-sim-parent and T-sim-child"
+# The desk runbook (factory/RULES.md): the records ride in the same push as the tickets.
+desk_records
+desk_push "desk: T-sim-parent and T-sim-child, and their records (factory/bin/desk-gates.sh --write)"
 judge push.mirror "mirror on the desk push: $(check_of mirror "$(main_sha)")" test "$(check_of mirror "$(main_sha)")" = success
 
 P_ISSUE="$(issue_of T-sim-parent)"
 [ -n "$P_ISSUE" ] || die "the mirror opened no Issue for T-sim-parent"
 if has_label "$P_ISSUE" ready; then stage P.mirror-ready pass "#$P_ISSUE ready"; else
   stage P.mirror-ready red "#$P_ISSUE needs-desk: $(ghq --argjson n "$P_ISSUE" '.issues[] | select(.number == $n) | .body' | grep -E '^- ' | tr '\n' ' ' | cut -c1-200)"
-  standin "records for both tickets"; records_standin T-sim-parent T-sim-child
+  records_push "both tickets"
 fi
 C_ISSUE="$(issue_of T-sim-child)"
 judge C.mirror-blocked "#$C_ISSUE labels $(ghq --argjson n "$C_ISSUE" '.issues[] | select(.number == $n) | [.labels[].name] | join(",")')" \

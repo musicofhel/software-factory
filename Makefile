@@ -35,8 +35,10 @@ lint:
 	AL="$${ACTIONLINT:-$$(command -v actionlint || true)}"; \
 	if [ -n "$$AL" ]; then "$$AL" -shellcheck "$$SC"; else echo "lint: actionlint not installed; workflows not linted"; fi
 
-# The store, then the desk's check on it (factory/bin/ticket-check.sh: exit 2 on an open ticket
-# without rails).
+# The store, then the desk's contract lint on it (factory/bin/ticket-check.sh: exit 2 on an open
+# ticket without rails, a bad header, a scope glob that matches nothing tracked or declared new, an
+# edge to no ticket, a tier inversion or a forecast warning naming it; ticket T26). The desk's
+# records and the desk PR's gate are factory/bin/desk-gates.sh (factory/RULES.md, the desk runbook).
 tickets:
 	@npx -y @adlc/cli@1.12.0 ticket list
 	@./factory/bin/ticket-check.sh

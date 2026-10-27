@@ -30,10 +30,12 @@
 #                   never relabeled for it
 #   spec-lint       the ticket's latest spec-lint record is a verified pass
 #   coldstart       the ticket's latest coldstart record has an empty gap list and was taken on the
-#                   ticket's current ticketHash (a ticket edited since is stale)
-#   merge-forecast  the ticket has a merge-forecast record that is not a failure, and the forecast
-#                   certifies it now: no forecast gateFailures, the ticket is in wave 1, and no
-#                   SEQUENCE pair puts it behind a wave-1 ticket earlier in mergeOrder
+#                   ticket's current ticketHash (a ticket edited since is stale). The desk writes
+#                   both records with factory/bin/desk-gates.sh --write (ticket T26)
+#   merge-forecast  the forecast certifies it now: no forecast gateFailures, the ticket is in wave 1,
+#                   and no SEQUENCE pair puts it behind a wave-1 ticket earlier in mergeOrder. The live
+#                   forecast is the certificate: adlc 1.12.0 has no merge-forecast record command
+#                   (`merge-forecast --help` lists none), so no per-ticket record is asked for (TB7)
 #   parents         every ticket with an edge to it is completed (reason `blocked: waits on <ids>`;
 #                   the forecast's serial order stands, the queue's Depends-on hold is the backstop)
 # `blocked` (SPEC-v0.2 L213) instead of `needs-desk` when the only reasons are dependency order: an
@@ -76,7 +78,7 @@ PROG=mirror
 # shellcheck source=factory/bin/lib/desk-marker.sh
 . "$(dirname "$0")/lib/desk-marker.sh"
 
-usage() { sed -n '2,71p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 forecast="" repo=""
 while [ $# -gt 0 ]; do
@@ -204,7 +206,7 @@ def coldstart_shape:
     | if ($v | type) == "object" then {gaps: $v.gaps, hash: $v.ticketHash} else null end
   else null end;
 def record_reasons($t):
-  latest("spec-lint"; $t.id) as $s | latest("coldstart"; $t.id) as $c | latest("merge-forecast"; $t.id) as $m
+  latest("spec-lint"; $t.id) as $s | latest("coldstart"; $t.id) as $c
   | [ (if $s == null then "spec-lint: no record"
        elif $s.data.verified == true then empty
        else "spec-lint: the latest record is not a verified pass" end),
@@ -214,11 +216,7 @@ def record_reasons($t):
          elif ($cs.gaps | type) != "array" then "coldstart: the latest record has no gap list"
          elif ($cs.gaps | length) > 0 then "coldstart: \($cs.gaps | length) unresolved gap(s)"
          elif $cs.hash != $t.hash then "coldstart: stale (the ticket changed after coldstart ran)"
-         else empty end end),
-      (if $m == null then "merge-forecast: no record"
-       elif $m.data.verified == false or (($m.data.gateFailures // []) | length) > 0 then
-         "merge-forecast: the latest record is a failure"
-       else empty end) ];
+         else empty end end) ];
 
 ($F.gateFailures // []) as $gf
 | ($F.waves // []) as $waves

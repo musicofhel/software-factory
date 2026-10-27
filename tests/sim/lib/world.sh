@@ -47,7 +47,10 @@ world_build() {
     mkdir -p "$seed/$(dirname "$f")" && command cp -p "$SIM_ROOT/$f" "$seed/$f"
   done
   mkdir -p "$seed/.adlc/tickets" "$seed/.adlc/ticket-archive"
-  printf '{"format":"adlc-ticket-directory","version":1}\n' | tee "$seed/.adlc/tickets/.store.json" >"$seed/.adlc/ticket-archive/.store.json"
+  # Each directory's own format marker, as `adlc init` writes them (real `ticket doctor` refuses the
+  # archive with the directory's marker: "store:archive: unsupported ticket store manifest").
+  printf '{"format":"adlc-ticket-directory","version":1}\n' >"$seed/.adlc/tickets/.store.json"
+  printf '{"format":"adlc-ticket-archive","version":1}\n' >"$seed/.adlc/ticket-archive/.store.json"
   : >"$seed/.adlc/manifest.jsonl"
   printf '%s\n' "main-dir $seed" "node dev-box $((T0 - 600)) active 1 dev-box-owner" \
     "node node-b $((T0 - 600)) active 1 node-b-owner" | "$SIM_ROOT/tests/fixtures/make-repo.sh" "$ORIGIN"

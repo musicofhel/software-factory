@@ -51,6 +51,32 @@
 #                             waves are Kahn levels over the open tickets (an edge {to: C} on P makes C
 #                             wait for P while P is open), mergeOrder the waves flattened. FAKE_ADLC_STORE
 #                             and FAKE_ADLC_TICKETS are ignored in this mode.
+#                             The manifest is hash-chained as adlc's (gate-manifest lib/record.mjs:117-131,
+#                             measured in specs/factory-step3-v1/records/TB7.md): seq = the previous
+#                             entry's seq + 1, prev = sha256 of the previous raw line (null on the first).
+#                             More verbs of 1.12.0 in this mode (TB7):
+#                             `gate-manifest verify --json` ({valid, message, count, segments: 0,
+#                             signed: false, break}; a seq or prev mismatch exits 2 with the message
+#                             on stderr, as verify.mjs:134), `ticket doctor --json` ({exitCode, ok,
+#                             checks}; a broken chain fails store:storehash-manifest-bind with
+#                             MANIFEST_CHAIN_INVALID, and a .adlc/ticket-archive/.store.json whose format
+#                             is not adlc-ticket-archive v1 fails store:archive, each exit 2), `coldstart <id> --offline --json`
+#                             (coldstart lib/gate.mjs:213-280: body, scope, rails and edge targets;
+#                             exit 2 on a gap) and `coldstart <id> --prompt-only --record-verdict -`
+#                             (appends {gate: coldstart, ticket, data: {promptOnly, usageStatus,
+#                             verdict, ticketIds, tier}} as lib/verdict.mjs:58-68), and the forecast's
+#                             `ticket "<id>" has no scope defined` / `scope matches 0 files in repo`
+#                             warnings (merge-forecast lib/forecast.mjs:69-72; a bash pattern stands in
+#                             for adlc's glob).
+#   spec-lint <file> [--json] [--record --ticket id [--dir D]]
+#                             (either mode; spec-lint bin/spec-lint.mjs, lib/parse.mjs, lib/record.mjs):
+#                             the criteria are the list items under a heading (`#…` or a bold-only
+#                             line) matching acceptance|criteria|requirements|definition of done|
+#                             success; one is verified when it says `Verify: <x>`, `verified by <x>`
+#                             or carries a backticked command. Zero criteria or a wish exits 2;
+#                             a pass with --record appends {gate: spec-lint, ticket, data: {verified:
+#                             true}, files: {<file as given>: sha256}} to D/manifest.jsonl (D default
+#                             ./.adlc), chained as above.
 # Anything else exits 2 so a script never relies on a verb the fake does not know.
 set -euo pipefail
 : "${FAKE_ADLC_LOG:?fake adlc needs FAKE_ADLC_LOG}"
@@ -66,6 +92,49 @@ not_found() {
   exit 2
 }
 MANIFEST=.adlc/manifest.jsonl
+sha256() { sha256sum | cut -d' ' -f1; }
+chain_append() {  # chain_append <manifest> <entry-json>: seq and prev as adlc's record.mjs
+  local m="$1" last="" seq=1 prev=null
+  if [ -s "$m" ]; then
+    last="$(tail -n1 "$m")"
+    seq="$(( $(jq -r '.seq' <<<"$last") + 1 ))"
+    prev="\"$(printf '%s' "$last" | sha256)\""
+  fi
+  jq -c --argjson s "$seq" --argjson p "$prev" '{seq: $s} + . + {prev: $p}' <<<"$2" >>"$m"
+  printf '%s\n' "$seq"
+}
+
+if [ "${1:-}" = spec-lint ]; then
+  file="${2:?fake adlc: spec-lint needs a file}" json=0 rec=0 id="" dir=.adlc
+  set -- "${@:3}"
+  while [ $# -gt 0 ]; do
+    case "$1" in --json) json=1 ;; --record) rec=1 ;; --ticket) id="$2"; shift ;; --dir) dir="$2"; shift ;;
+      *) echo "fake adlc: spec-lint: unsupported $1" >&2; exit 2 ;; esac
+    shift
+  done
+  [ -f "$file" ] || { echo "spec-lint: cannot read $file" >&2; exit 1; }
+  [ "$rec" = 0 ] || [ -n "$id" ] || { echo "--record requires --ticket" >&2; exit 1; }
+  res="$(jq -Rsc --arg f "$file" '
+    split("\n") | reduce .[] as $l ({in: false, c: []};
+      if ($l | test("^#{1,6}\\s+")) then .in = ($l | sub("^#{1,6}\\s+"; "") | test("acceptance|criteria|requirements|definition of done|success"; "i"))
+      elif ($l | test("^\\*\\*((?!\\*\\*).)+\\*\\*:?\\s*$")) then .in = ($l | test("acceptance|criteria|requirements|definition of done|success"; "i"))
+      elif .in and ($l | test("^[ \t]*(?:[-*]|\\d+\\.)\\s+\\S")) then
+        .c += [{text: ($l | sub("^[ \t]*(?:[-*]|\\d+\\.)\\s+"; "")),
+                status: (if ($l | test("(verify\\s*:|verified\\s+by)\\s+\\S"; "i") or test("`[^`]+`")) then "VERIFIED" else "WISH" end)}]
+      else . end)
+    | {file: $f, total: (.c | length), verified: ([.c[] | select(.status == "VERIFIED")] | length),
+       wishes: ([.c[] | select(.status == "WISH")] | length), criteria: .c}' "$file")"
+  [ "$json" = 0 ] || printf '%s\n' "$res"
+  if [ "$(jq .total <<<"$res")" = 0 ]; then echo "spec-lint: no acceptance criteria found." >&2; exit 2; fi
+  if [ "$(jq .wishes <<<"$res")" != 0 ]; then echo "spec-lint: $(jq .wishes <<<"$res") wish(es) found" >&2; exit 2; fi
+  if [ "$rec" = 1 ]; then
+    mkdir -p "$dir"
+    chain_append "$dir/manifest.jsonl" "$(jq -cn --arg t "$id" --arg f "$file" --arg h "$(sha256 <"$file")" \
+      '{gate: "spec-lint", ticket: $t, data: {verified: true}, files: {($f): $h}}')" >/dev/null
+  fi
+  [ "$json" = 1 ] || echo "spec-lint: all criteria verified."
+  exit 0
+fi
 
 if [ "${FAKE_ADLC_GITSTORE:-0}" = 1 ]; then
   TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo '{"ok":false,"code":"STORE_NOT_FOUND"}' >&2; exit 2; }
@@ -81,9 +150,20 @@ if [ "${FAKE_ADLC_GITSTORE:-0}" = 1 ]; then
     [ -z "$old" ] || rm -f "$old"
     jq -S . <<<"$1" >"$SDIR/$lid--$h.json"
   }
-  gs_append() {  # gs_append <entry-json>: seq is the next line number
-    local m="$TOP/.adlc/manifest.jsonl" n; n=0; [ -f "$m" ] && n="$(wc -l <"$m" | tr -d ' ')"
-    jq -c --argjson s "$((n + 1))" '{seq: $s} + .' <<<"$1" >>"$m"
+  gs_append() { chain_append "$TOP/.adlc/manifest.jsonl" "$1" >/dev/null; }
+  gs_verify() {  # {valid, message, count, segments, signed, break} of the root manifest's chain
+    local m="$TOP/.adlc/manifest.jsonl"
+    { [ -f "$m" ] && command cat "$m"; true; } | jq -Rsc '
+      split("\n") | map(select(. != "")) as $l
+      | (first(range(0; $l | length) as $i | ($l[$i] | fromjson) as $e
+          | select($e.seq != $i + 1 or $e.prev != (if $i == 0 then null else $sha[$i - 1] end))
+          | {seq: $e.seq, lineNo: ($i + 1), reason: (if $e.seq != $i + 1 then "seq mismatch" else "prev hash mismatch" end),
+             segment: "root"}) // null) as $b
+      | {valid: ($b == null),
+         message: (if $b == null then "manifest ok (\($l | length) entries)"
+                   else "chain broken at seq \($b.seq) (line \($b.lineNo)): \($b.reason)" end),
+         count: ($l | length), segments: 0, signed: false, break: $b}' \
+      --argjson sha "$({ [ -f "$m" ] && command cat "$m"; true; } | while IFS= read -r line; do printf '%s' "$line" | sha256; done | jq -Rsc 'split("\n") | map(select(. != ""))')"
   }
   gs_frozen() { jq -e 'any(.[]; (.rails | type) == "array" and (.rails | length) > 0)' <<<"$(gs_all)" >/dev/null; }
   gs_unsigned() {  # a frozen store's write: refused without --allow-unsigned (exit 2), else warned
@@ -139,9 +219,70 @@ if [ "${FAKE_ADLC_GITSTORE:-0}" = 1 ]; then
       want="" prev=""; for a in "${@:3}"; do [ "$prev" = --ticket ] && want="$a"; prev="$a"; done
       { [ -f "$TOP/.adlc/manifest.jsonl" ] && command cat "$TOP/.adlc/manifest.jsonl"; true; } |
         jq -sc --arg t "$want" '{entries: [.[] | select($t == "" or .ticket == $t) | . + {segment: "root"}], skipped: []}' ;;
+    "gate-manifest verify")
+      v="$(gs_verify)"
+      has --json "${@:3}" && printf '%s\n' "$v" || jq -r .message <<<"$v"
+      jq -e .valid <<<"$v" >/dev/null || { echo "gate-manifest verify: $(jq -r .message <<<"$v")" >&2; exit 2; }
+      ;;
+    "ticket doctor")
+      v="$(gs_verify)"
+      # The archive's own format marker, if the directory exists (real doctor: store:archive).
+      arch=true
+      [ ! -f "$TOP/.adlc/ticket-archive/.store.json" ] ||
+        jq -e '.format == "adlc-ticket-archive" and .version == 1' "$TOP/.adlc/ticket-archive/.store.json" >/dev/null 2>&1 || arch=false
+      d="$(jq -c --argjson arch "$arch" '(.valid) as $chain | ($chain and $arch) as $ok
+        | {exitCode: (if $ok then 0 else 2 end), ok: $ok,
+           checks: [{name: "config-valid", ok: true, detail: null}, {name: "tickets-load", ok: true, detail: null},
+                    {name: "store:archive", ok: $arch,
+                     detail: (if $arch then null else "unsupported ticket store manifest (expected format version 1)" end)},
+                    {name: "store:storehash-manifest-bind", ok: $chain, detail: (if $chain then null else "MANIFEST_CHAIN_INVALID" end)}]}' <<<"$v")"
+      if has --json "${@:3}"; then printf '%s\n' "$d"
+      else jq -r '.checks[] | "  \(if .ok then "ok" else "FAIL" end)\t\(.name)\(if .detail then " \(.detail)" else "" end)"' <<<"$d"; fi
+      [ "$(jq .exitCode <<<"$d")" = 0 ] || exit 2 ;;
+    "coldstart "*)
+      id="${2:?fake adlc: coldstart needs a ticket id}"
+      t="$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$all")"
+      [ -n "$t" ] || { echo "coldstart: ticket not found: $id" >&2; exit 1; }
+      if has --prompt-only "${@:3}"; then
+        prev=""; src=""; for a in "${@:3}"; do [ "$prev" = --record-verdict ] && src="$a"; prev="$a"; done
+        echo "=== user ($id) ==="
+        [ -n "$src" ] || exit 0
+        if [ "$src" = - ]; then verdict="$(command cat)"; else verdict="$(command cat "$src")"; fi
+        [ -n "$verdict" ] || { echo "--record-verdict: empty" >&2; exit 1; }
+        seq="$(chain_append "$TOP/.adlc/manifest.jsonl" "$(jq -cn --arg id "$id" --arg v "$verdict" \
+          '{gate: "coldstart", ticket: $id, data: {promptOnly: true, usageStatus: "unreported", verdict: $v, ticketIds: [$id], tier: "cheap"}}')")"
+        echo "gate-manifest: recorded seq=$seq gate=coldstart ticket=$id"
+      elif has --offline "${@:3}"; then
+        r="$(jq -c --argjson all "$all" '
+          [ (if ((.body // "") | test("\\S")) then empty else {what: "missing body"} end),
+            (if ((.scope | type) != "array" or (.scope | length) == 0) then {what: "missing scope"}
+             elif any(.scope[]; (type != "string") or (test("\\S") | not)) then {what: "invalid scope"} else empty end),
+            (if has("rails") and ((.rails | type) != "array" or any(.rails[]; (type != "string") or (test("\\S") | not)))
+             then {what: "invalid rails"} else empty end),
+            ((.edges // [])[] | .to as $to | if any($all[]; .id == $to) then empty
+             else {what: "unknown edge target", why_blocking: "edge points to unknown ticket \($to)"} end) ] as $g
+          | {ok: ($g == []), results: [{id, pass: ($g == []), gaps: $g, cached: false, offline: true}]}' <<<"$t")"
+        printf '%s\n' "$r"
+        jq -e .ok <<<"$r" >/dev/null || exit 2
+      else echo "fake adlc: coldstart needs --offline or --prompt-only" >&2; exit 2; fi ;;
     "merge-forecast --json"|"merge-forecast "*)
       jq -e 'any(.[]; .completed != true)' <<<"$all" >/dev/null || { echo "error: no active tickets found (all tickets are completed)" >&2; exit 1; }
-      jq -c '[.[] | select(.completed != true)] as $open
+      files="$(git -C "$TOP" ls-files)"
+      warn='[]'
+      while IFS=$'\t' read -r id globs; do
+        [ -n "$id" ] || continue
+        if [ "$globs" = '[]' ]; then warn="$(jq -c --arg id "$id" '. + ["ticket \"\($id)\" has no scope defined"]' <<<"$warn")"; continue; fi
+        hit=0
+        while IFS= read -r g; do
+          while IFS= read -r f; do
+            # shellcheck disable=SC2053  # the glob is a pattern on purpose
+            [ -n "$f" ] && [[ "$f" == $g ]] && { hit=1; break; }
+          done <<<"$files"
+          [ "$hit" = 0 ] || break
+        done < <(jq -r '.[]' <<<"$globs")
+        [ "$hit" = 1 ] || warn="$(jq -c --arg id "$id" '. + ["ticket \"\($id)\" scope matches 0 files in repo"]' <<<"$warn")"
+      done < <(jq -r '.[] | select(.completed != true) | [.id, (.scope // [] | tojson)] | @tsv' <<<"$all")
+      jq -c --argjson warn "$warn" '[.[] | select(.completed != true)] as $open
         | ($open | map(.id)) as $ids
         | (reduce $open[] as $p ({}; reduce ($p.edges // [])[] as $e (.; if ($e.to | IN($ids[])) then .[$e.to] += [$p.id] else . end))) as $deps
         | {waves: [], done: []}
@@ -150,7 +291,7 @@ if [ "${FAKE_ADLC_GITSTORE:-0}" = 1 ]; then
             | [ $ids[] as $i | select(($i | IN($d[])) | not) | select(all(($deps[$i] // [])[]; IN($d[]))) | $i ] as $w
             | if ($w | length) == 0 then error("cycle") else .waves += [$w | sort] | .done += $w end)
         | {pairs: [], waves, mergeOrder: [.waves[][]], firstWaveWidth: (.waves[0] | length),
-           certifiedWidth: (.waves[0] | length), warnings: [], gateFailures: []}' <<<"$all" ;;
+           certifiedWidth: (.waves[0] | length), warnings: $warn, gateFailures: []}' <<<"$all" ;;
     *) echo "fake adlc: unsupported command: $*" >&2; exit 2 ;;
   esac
   exit 0

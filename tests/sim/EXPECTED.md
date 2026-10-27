@@ -3,8 +3,8 @@
 Every stage judges the **desired** behavior of the pipeline (specs/factory-step3-v1/SPEC.md): `pass`
 means the pipeline did the right thing, `red: <gap id>` that it does not yet, with the gap of
 `specs/factory-step3-v1/records/sim/*.md` that explains it and the row that fixes it. After a red
-stage the sim plays a labeled stand-in (`stand-in:` in sim.log: the records TB7 will write,
-GitHub's queue, the merge) so the later stages stay observable. `tests/sim/lib/compare.sh` compares this table with the results in both
+stage the sim plays a labeled stand-in (`stand-in:` in sim.log: GitHub's queue,
+the merge) so the later stages stay observable. `tests/sim/lib/compare.sh` compares this table with the results in both
 directions: a stage that goes green before its line here says `pass` fails the sim as much as a
 regression does. The row that fixes a gap flips its lines in the same commit. A stage only GitHub
 itself can prove is `red: kit: <line>` (TB12), never `pass`.
@@ -26,7 +26,7 @@ not model.
 | janitor.no-nodes | red: ci:G22 — janitor.sh dies on a missing `nodes` branch (the branch itself is kit: merge:G15) |
 | desk.write | pass |
 | push.mirror | pass |
-| P.mirror-ready | red: intake:I1 — nothing writes the spec-lint/coldstart/merge-forecast records mirror.sh needs (TB7) |
+| P.mirror-ready | pass |
 | C.mirror-blocked | pass |
 | C.depends-link | pass |
 | P.claim | pass |
@@ -47,6 +47,7 @@ not model.
 | P.pr.tamper | pass |
 | P.pr.dependencies | pass |
 | P.pr.commit-check | pass |
+| P.pr.desk | pass |
 | P.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | P.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | P.hold | red: merge:G3 — no `depends-on` job (TB8) |
@@ -60,6 +61,7 @@ not model.
 | P.mg.tamper | pass |
 | P.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
 | P.mg.commit-check | pass |
+| P.mg.desk | pass |
 | P.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | P.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | P.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
@@ -85,6 +87,7 @@ not model.
 | C.pr.tamper | pass |
 | C.pr.dependencies | pass |
 | C.pr.commit-check | pass |
+| C.pr.desk | pass |
 | C.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | C.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | C.hold | red: merge:G3 — no `depends-on` job (TB8) |
@@ -98,6 +101,7 @@ not model.
 | C.mg.tamper | pass |
 | C.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
 | C.mg.commit-check | pass |
+| C.mg.desk | pass |
 | C.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | C.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | C.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
@@ -118,8 +122,11 @@ not model.
 | S.stranger-refused | pass |
 | S.ticket-adlc | pass |
 | S.head-edits-gate-config | pass |
-| S.desk-pr | red: intake:I6 — no `desk` job in gates.yml (TB7) |
+| S.desk-pr | pass |
 | S.class-desk | pass |
+| S.desk-chain-race | pass |
+| S.desk-stale-base | pass |
+| S.desk-no-records | pass |
 | S.child-before-parent | red: merge:G3 — no `depends-on` job (TB8) |
 | S.tier-jump | red: merge:G5 — no `tier-order` job (TB8) |
 | S.queue-conflict | red: merge:G7 — no ejection: no `autorebase` label, no ejections.jsonl (TB9) |

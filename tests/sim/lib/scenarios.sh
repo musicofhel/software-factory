@@ -48,6 +48,17 @@ approve() {  # approve <pr> [login]: one APPROVED review
   gh_state '(.pulls[] | select(.number == $n)).reviews += [{author: {login: $u}, state: "APPROVED"}]' \
     --argjson n "$1" --arg u "${2:-sim-owner}"
 }
+scn_desk_ticket() {  # scn_desk_ticket <id> <scope-dir>: a tier-0 ticket in the scratch clone's store. Its scope
+                     # also names README.md (adlc's forecast calls a scope matching no file `unscoped`, and
+                     # ticket-check refuses that) and its body declares <scope-dir>/hello.sh a new path
+  ticket_json "$1" 0 "$2" '[]' | jq --arg s "$2" '.scope += ["README.md"] | .body += "\n\nNew paths: `\($s)/hello.sh`."' >"$SIM/ticket-$1.json"
+  ( read -r -a a <<<"$ADLC"; cd "$SCN" && "${a[@]}" ticket create --input "$SIM/ticket-$1.json" --write --allow-unsigned --json ) >>"$LOG" 2>&1 ||
+    die "adlc ticket create $1 failed"
+}
+desk_commit() {  # desk_commit <what>: commit the scratch clone's .adlc/ as the desk does (DCO, no Ticket:)
+  git -C "$SCN" add -A .adlc
+  git -C "$SCN" commit -qm "$(printf 'desk: %s\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>' "$1")"
+}
 check_fails_naming() {  # check_fails_naming <job> <head> <regex>: the job failed and its log matches
   local log
   [ "$(check_of "$1" "$2")" = failure ] || return 1
@@ -92,8 +103,8 @@ desk_ticket T-sim-c2 1 sim/c2 '[]'
 desk_ticket T-sim-p2 0 sim/p2 '[{"to":"T-sim-c2"}]'
 desk_ticket T-sim-b1 0 sim/b1 '[]'
 desk_ticket T-sim-b2 0 sim/b2 '[]'
-desk_push "desk: the failure-scenario tickets"
-records_standin T-sim-s T-sim-q T-sim-t1 T-sim-victim T-sim-c2 T-sim-p2 T-sim-b1 T-sim-b2
+desk_records
+desk_push "desk: the failure-scenario tickets, and their records (factory/bin/desk-gates.sh --write)"
 
 # ------------------------------------------------------------------ PR-only scenarios
 # A file outside the ticket's scope: scope fails and names it.
@@ -200,16 +211,37 @@ git -C "$SCN" add .adlc/config.json
 scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn-gate-config T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.head-edits-gate-config "$(scn_detail build-test "$h")" base_gate_ran "$h"
 
-# A desk PR (only .adlc/**): a `desk` check runs the desk gates and passes.
+# A desk PR (only .adlc/**), written as the desk runbook says (factory/RULES.md): the ticket and its
+# records in one commit. The `desk` check runs the desk gates and passes.
 scn_start desk/scn-desk
-ticket_json T-sim-desk 0 sim/desk '[]' >"$SIM/ticket-T-sim-desk.json"
-( read -r -a a <<<"$ADLC"; cd "$SCN" && "${a[@]}" ticket create --input "$SIM/ticket-T-sim-desk.json" --write --allow-unsigned --json ) >>"$LOG" 2>&1 ||
-  die "adlc ticket create T-sim-desk failed"
-git -C "$SCN" add -A .adlc
-git -C "$SCN" commit -qm "$(printf 'desk: T-sim-desk\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>')"
+scn_desk_ticket T-sim-desk sim/desk; desk_records "$SCN"; desk_commit T-sim-desk
 pr="$(scn_pr desk/scn-desk - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.desk-pr "desk: $(check_of desk "$h")" test "$(check_of desk "$h")" = success
 judge S.class-desk "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" '.class == "desk" and .ticket == null'
+
+# Two desk PRs cut from one main, joined: B's manifest lines were chained on the old main, after
+# A's. The desk check fails on the broken hash chain, before anything reaches main. (Nothing here
+# merges: one more open ticket on main would change node-b's claims below.)
+scn_start desk/scn-race-b
+scn_desk_ticket T-sim-rb sim/rb; desk_records "$SCN"; desk_commit T-sim-rb
+git -C "$SCN" show HEAD:.adlc/manifest.jsonl | tail -n +"$(( $(git -C "$SCN" show origin/main:.adlc/manifest.jsonl | wc -l) + 1 ))" >"$SIM/race-b.lines"
+scn_start desk/scn-race
+scn_desk_ticket T-sim-ra sim/ra; desk_records "$SCN"; desk_commit T-sim-ra
+command cat "$SIM/race-b.lines" >>"$SCN/.adlc/manifest.jsonl"; desk_commit "T-sim-rb's manifest lines, written on the old main"
+pr="$(scn_pr desk/scn-race - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.desk-chain-race "$(scn_detail desk "$h")" check_fails_naming desk "$h" 'chain broken'
+
+# A desk PR from an older main (its manifest is not main's plus new lines): it fails until rebased.
+git -C "$SCN" checkout -q -B desk/scn-stale "$SEED_SHA"
+scn_put .adlc/specs/sim-note.md 'a desk note'; desk_commit "a note, from the seed's main"
+pr="$(scn_pr desk/scn-stale - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.desk-stale-base "$(scn_detail desk "$h")" check_fails_naming desk "$h" 'does not extend the base'
+
+# A ticket written without its records: the desk check names the missing record.
+scn_start desk/scn-norec
+scn_desk_ticket T-sim-nr sim/nr; desk_commit T-sim-nr
+pr="$(scn_pr desk/scn-norec - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.desk-no-records "$(scn_detail desk "$h")" check_fails_naming desk "$h" 'T-sim-nr.*missing record'
 
 # The child before its parent: T-sim-c2's PR while T-sim-p2 is open. depends-on fails.
 scn_start ticket/T-sim-c2/scn-early

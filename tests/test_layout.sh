@@ -25,4 +25,8 @@ chk "prosecuteFailOn is medium or stricter" "jq -e '.prosecuteFailOn | IN(\"medi
 chk "quota cap default is 0.4" "jq -e '.governor.quotaCapDefault == 0.4' factory/policy/budget.json >/dev/null"
 chk "every workflow has a concurrency group" "for w in .github/workflows/*.yml; do grep -q '^concurrency:' \"\$w\" || exit 1; done"
 chk "no workflow runs factory-node jobs on pull_request" "( for w in \$(grep -l 'runs-on:.*factory-node' .github/workflows/*.yml 2>/dev/null); do grep -q 'pull_request' \"\$w\" && exit 1; done; exit 0 )"
+# ADR-0002 amendment T26 (intake:I11, I20): ticket ids are T<n>, and completed means merged to main.
+chk "ADR-0002 rules ticket ids are T<n>, not ULIDs" "grep -q '^- \*\*Ids are \`T<n>\`, not ULIDs\.\*\*' docs/adr/0002-adlc-sharded-ticket-store.md"
+chk "ADR-0002 rules completed means merged to main" "grep -q '^- \*\*Completed means merged to main\*\*' docs/adr/0002-adlc-sharded-ticket-store.md"
+chk "every store id is T<n>" "ids=\$(jq -r '.id // empty' .adlc/tickets/t*--*.json 2>/dev/null); [ -n \"\$ids\" ] && ! grep -vqE '^T[0-9]+\$' <<<\"\$ids\""
 exit $ok
