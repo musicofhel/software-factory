@@ -54,6 +54,12 @@
 #        view <n> --json fields (the same fields).
 # api:   DELETE collaborators/<login> (204; the login is appended to .removed_collaborators of
 #        FAKE_GH_ISSUES, so a sim can see the revoke).
+#        GET pulls/<n>: the REST pull-request object of a "pulls" entry (number, state, merged, title,
+#        body, user.login, author_association, head {ref, sha, repo.full_name}, base {ref, sha = the
+#        base branch's tip, repo.full_name}, labels). author_association is the entry's own, else
+#        OWNER for the repo's owner, COLLABORATOR for a login in .collaborators of FAKE_GH_ISSUES and
+#        not in .removed_collaborators, else NONE; head.repo is the entry's headRepository (a fork),
+#        else the repo. 404 for an unknown number.
 # __forms: prints every form this fake models, one per line (`issue list`, `api GET git/ref/*`, …);
 #        tests/test_sim.sh holds the repo's call sites against it.
 # FAKE_GH_UNKNOWN: a file; every refused form (an unsupported command, subcommand, flag or api
@@ -140,6 +146,25 @@ api() {
       [ "$method" = DELETE ] || unsupported "fake gh api: only DELETE collaborators/<login> is modeled"
       : "${FAKE_GH_ISSUES:?fake gh api collaborators needs FAKE_GH_ISSUES}"
       mutate '.removed_collaborators = ((.removed_collaborators // []) + [$u])' --arg u "${path#collaborators/}"
+      return 0 ;;
+    pulls/*)
+      [ "$method" = GET ] || unsupported "fake gh api: only GET pulls/<n> is modeled"
+      local n="${path#pulls/}" base_sha
+      [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any((.pulls // [])[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
+        http_err 404 "Not Found"
+      base_sha="$(git -C "${FAKE_GH_GIT:?fake gh api pulls needs FAKE_GH_GIT}" rev-parse -q --verify \
+        "refs/heads/$(jq -r --argjson n "$n" '.pulls[] | select(.number == $n) | .baseRefName // "main"' "$FAKE_GH_ISSUES")" || true)"
+      out="$(jq -c --argjson n "$n" --arg repo "$REPO" --arg bs "$base_sha" '
+        (.collaborators // []) as $c | (.removed_collaborators // []) as $gone
+        | .pulls[] | select(.number == $n) | (.author.login // "someone") as $who
+        | {number, state: (.state | if . == "OPEN" then "open" else "closed" end), merged: (.state == "MERGED"),
+           title: (.title // ""), body: (.body // ""), user: {login: $who},
+           author_association: (.author_association // if $who == ($repo | split("/")[0]) then "OWNER"
+                                 elif ($who | IN($c[])) and (($who | IN($gone[])) | not) then "COLLABORATOR" else "NONE" end),
+           head: {ref: .headRefName, sha: (.headRefOid // ""), repo: {full_name: (.headRepository // $repo)}},
+           base: {ref: (.baseRefName // "main"), sha: $bs, repo: {full_name: $repo}},
+           labels: ((.labels // []) | map(if type == "string" then {name: .} else . end))}' "$FAKE_GH_ISSUES")"
+      if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
       return 0 ;;
   esac
   : "${FAKE_GH_GIT:?fake gh api needs FAKE_GH_GIT}"
@@ -514,7 +539,8 @@ forms() {
     "api GET git/matching-refs/*" "api GET git/ref/*" "api GET git/commits/*" "api POST git/commits" \
     "api POST git/refs" "api PATCH git/refs/*" "api DELETE git/refs/*" \
     "api GET branches/*/protection" "api PUT branches/*/protection" "api DELETE branches/*/protection" \
-    "api GET rulesets" "api GET rulesets/*" "api POST rulesets" "api PUT rulesets/*" "api DELETE collaborators/*"
+    "api GET rulesets" "api GET rulesets/*" "api POST rulesets" "api PUT rulesets/*" "api DELETE collaborators/*" \
+    "api GET pulls/*"
 }
 
 case "${1:-}" in

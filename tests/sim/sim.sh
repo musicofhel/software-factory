@@ -139,10 +139,10 @@ pr_event() {  # pr_event <n> [action]: build refs/pull/<n>/merge on current main
   base="$(main_sha)"; head="$(pr_field "$n" .headRefOid)"
   merge="$(pr_merge_ref "$n" "$base" "$head")"
   [ -n "$merge" ] || { say "  PR #$n conflicts with main: GitHub runs no pull_request workflow"; return 0; }
-  jq -n --argjson n "$n" --arg a "${2:-opened}" --arg h "$(pr_field "$n" .headRefName)" --arg hs "$head" --arg bs "$base" \
-    --argjson l "$(pr_field "$n" '.labels // []' | jq -c .)" \
-    '{action: $a, number: $n, pull_request: {number: $n, head: {ref: $h, sha: $hs}, base: {ref: "main", sha: $bs}, labels: $l}}' \
-    >"$SIM/ev-pr.json"
+  # .pull_request is GitHub's pull-request object (the fake gh's GET pulls/<n>), as the event carries it.
+  jq -n --argjson n "$n" --arg a "${2:-opened}" --arg hs "$head" --arg bs "$base" \
+    --argjson p "$(FAKE_GH_LOG=/dev/null "$SIM_FAKES/gh" api "repos/$REPO/pulls/$n")" \
+    '{action: $a, number: $n, pull_request: ($p | .head.sha = $hs | .base.sha = $bs)}' >"$SIM/ev-pr.json"
   drive pull_request "$SIM/ev-pr.json" "$merge"
 }
 required_report() {  # required_report <base-sha> <head-sha>: the required contexts of the base policy that
@@ -178,6 +178,13 @@ merge_standin() {  # merge_standin <n> <commit>: main fast-forwards to <commit> 
 }
 jobs_on() {  # jobs_on <event> <head>: every job the driver ran for that event and head, in run order
   jq -r --arg e "$1" --arg h "$2" 'select(.event == $e and .head_sha == $h) | .job' "$SIM/jobs.jsonl" | awk '!seen[$0]++'
+}
+ctx_of() {  # ctx_of <event> <head>: the JSON the `context` job printed (lib/gate-context.sh), or {}
+  local log; log="$(job_log "$1" "$2" context)"
+  { [ -n "$log" ] && grep -h '^{"event":' "$log" | tail -n1; } || echo '{}'
+}
+ctx_is() {  # ctx_is <event> <head> <jq condition on the context>
+  ctx_of "$1" "$2" | jq -e "$3" >/dev/null
 }
 job_stages() {  # job_stages <prefix> <event> <head>: one stage per job run, pass = success
   local j c
@@ -230,9 +237,13 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   judge "$X.tier-label" "PR labels: $(pr_field "$pr" '[.labels[].name] | join(",")')" \
     ghq -e --argjson n "$pr" 'any(.pulls[] | select(.number == $n) | .labels[]; .name | startswith("tier:"))'
 
-  # Every workflow job on pull_request.
+  # Every workflow job on pull_request; the gate context names this PR, its ticket and class.
+  local pbase; pbase="$(main_sha)"
   pr_event "$pr"
   job_stages "$X.pr" pull_request "$head"
+  judge "$X.pr.identity" "context: $(ctx_of pull_request "$head")" ctx_is pull_request "$head" \
+    ".event == \"pull_request\" and .pr == $pr and .ticket == \"$id\" and .handle == \"dev-box\" and .class == \"ticket\"
+     and .base == \"$pbase\" and .head == \"$head\""
   local miss; miss="$(required_report "$(main_sha)" "$head")"
   judge "$X.pr.required-checks" "${miss:-every required context reports green}" test -z "$miss"
   judge "$X.hold" "depends-on: $(check_of depends-on "$head")" test "$(check_of depends-on "$head")" = success
@@ -241,8 +252,12 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   # The queue, merge_group, the merge.
   judge "$X.enqueue" "nothing enqueues a green PR" enqueued "$pr"
   standin "hand-enqueue #$pr: gh-readonly-queue/main/pr-$pr-<base>"
+  pbase="$(main_sha)"
   group="$(queue_standin "$pr")"
   job_stages "$X.mg" merge_group "$group"
+  # On merge_group the PR number comes from gh-readonly-queue/main/pr-<N>-<sha>, the ticket from PR N's head ref.
+  judge "$X.mg.identity" "context: $(ctx_of merge_group "$group")" ctx_is merge_group "$group" \
+    ".event == \"merge_group\" and .pr == $pr and .ticket == \"$id\" and .class == \"ticket\" and .base == \"$pbase\" and .head == \"$group\""
   miss="$(required_report "$(main_sha)" "$group")"
   judge "$X.mg.required-checks" "${miss:-every required context reports green}" test -z "$miss"
   stage "$X.merge" red "no queue merges it (no merge queue on a user-owned repo; no first-party queue)"

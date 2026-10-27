@@ -240,6 +240,12 @@ run_uses() {
       local r depth path dir
       r="$(jq -r '.ref // ""' <<<"$with")"; depth="$(jq -r '."fetch-depth" // "1"' <<<"$with")"; path="$(jq -r '.path // ""' <<<"$with")"
       dir="$ws${path:+/$path}"
+      # A target dir that is not a git repo has its contents deleted first (actions/checkout v4,
+      # 11d5960, src/git-directory-helper.ts:26-31,116-124): a `.base/` the PR head commits is wiped
+      # before the base is checked out there.
+      if [ -d "$dir" ] && [ ! -d "$dir/.git" ]; then
+        echo "Deleting the contents of '$dir'"; find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+      fi
       # With no `ref:`, a branch event checks out its branch by name (`checkout -B <branch>`, not a
       # detached sha); a pull_request (refs/pull/<n>/merge) stays detached.
       local name=""

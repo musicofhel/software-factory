@@ -33,7 +33,9 @@ world_build() {
   export FACTORY_NOW="$T0" FAKE_GH_NOW="$T0" npm_config_offline=true
   : "${npm_config_cache:=$HOME/.npm}"; export npm_config_cache
   : >"$FAKE_GH_LOG"; : >"$FAKE_GH_UNKNOWN"; : >"$FAKE_CURL_LOG"; : >"$FAKE_TAMPERGUARD_LOG"; : >"$SIM/jobs.jsonl"
-  printf '{"labels":[],"issues":[],"pulls":[],"checks":[],"queue":[],"merged":[]}\n' >"$FAKE_GH_ISSUES"
+  # The repo's collaborators besides its owner (sim-owner): the node owners and the desk. A PR's
+  # author_association (fake gh GET pulls/<n>) reads them; anyone else is NONE.
+  printf '{"labels":[],"issues":[],"pulls":[],"checks":[],"queue":[],"merged":[],"collaborators":["dev-box-owner","node-b-owner","desk"]}\n' >"$FAKE_GH_ISSUES"
   printf '{"protection":{},"rulesets":[],"next_id":1}\n' >"$FAKE_GH_SETTINGS"
 
   # The seed: every tracked and untracked-not-ignored file of the working tree, the store emptied.

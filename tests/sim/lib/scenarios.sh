@@ -124,6 +124,57 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$SCN/factory/bin/scope-check.sh"; git -
 scn_put docs/outside.md 'outside the scope'
 scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn-gate T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.head-edits-gate "$(scn_detail scope "$h")" check_fails_naming scope "$h" 'docs/outside\.md'
+# The rule itself: the job ran the BASE's scope-check.sh from ./.base (its gate-context line says so)
+# and failed; the head's `exit 0` copy never ran.
+judge S.base-script "$(scn_detail scope "$h")" check_fails_naming scope "$h" 'gate from /.*/\.base on '
+
+# The head commits its own `.base/factory/bin/scope-check.sh` (`exit 0`): the base checkout wipes it,
+# so the base's gate still runs.
+scn_start ticket/T-sim-s/scn-plant
+mkdir -p "$SCN/.base/factory/bin"; printf '#!/usr/bin/env bash\nexit 0\n' >"$SCN/.base/factory/bin/scope-check.sh"
+chmod +x "$SCN/.base/factory/bin/scope-check.sh"; git -C "$SCN" add .base
+scn_put docs/outside.md 'outside the scope'
+scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn-plant T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.head-plants-base "$(scn_detail scope "$h")" check_fails_naming scope "$h" 'gate from /.*/\.base on '
+
+# A ticket branch whose PR body names another ticket: the context and every ticket gate refuse it.
+scn_start ticket/T-sim-s/scn-body
+scn_put sim/s/hello.sh 'echo hello'
+scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn-body T-sim-victim)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.foreign-body "$(scn_detail context "$h"); $(scn_detail scope "$h")" \
+  eval 'check_fails_naming context "$h" "body says .Ticket: T-sim-victim" && check_fails_naming scope "$h" "body says .Ticket: T-sim-victim"'
+
+# A branch under ticket/ that is not ticket/<id>/<handle> (an id never holds a `/`): refused, not
+# read as a human PR.
+scn_start ticket/T-sim-s/scn/deep
+scn_put sim/s/hello.sh 'echo hello'
+scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn/deep T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.ticket-ref-malformed "$(scn_detail context "$h")" check_fails_naming context "$h" 'is under ticket/ but is not ticket/<id>/<handle>'
+
+# A fork's PR from a branch named like a ticket: never a ticket PR.
+scn_start ticket/T-sim-s/fork
+scn_put sim/s/hello.sh 'echo hello'
+scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/fork T-sim-s stranger)"
+gh_state '(.pulls[] | select(.number == $n)).headRepository = "stranger/factory"' --argjson n "$pr"
+pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.fork-ticket-ref "$(scn_detail context "$h")" check_fails_naming context "$h" 'a fork is never a ticket PR'
+
+# A collaborator's PR off a ticket branch, past the desk's paths: class human.
+scn_start human/scn-docs
+scn_put docs/sim-note.md 'a note'
+git -C "$SCN" commit -qm "$(printf 'docs: a note\n\nSigned-off-by: dev-box-owner <dev-box-owner@sim.invalid>')"
+pr="$(scn_pr human/scn-docs - dev-box-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.class-human "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" \
+  '.class == "human" and .author_association == "COLLABORATOR" and .ticket == null'
+
+# A stranger's PR (from a fork, not a ticket branch): no class, refused.
+scn_start stranger/scn-docs
+scn_put docs/sim-stranger.md 'a stranger note'
+git -C "$SCN" commit -qm "$(printf 'docs: a stranger note\n\nSigned-off-by: stranger <stranger@sim.invalid>')"
+pr="$(scn_pr stranger/scn-docs - stranger)"
+gh_state '(.pulls[] | select(.number == $n)).headRepository = "stranger/factory"' --argjson n "$pr"
+pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.stranger-refused "$(scn_detail context "$h")" check_fails_naming context "$h" 'not a collaborator'
 
 # A ticket PR touching .adlc/**: scope fails and names it.
 scn_start ticket/T-sim-s/scn-adlc
@@ -141,6 +192,7 @@ git -C "$SCN" add -A .adlc
 git -C "$SCN" commit -qm "$(printf 'desk: T-sim-desk\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>')"
 pr="$(scn_pr desk/scn-desk - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.desk-pr "desk: $(check_of desk "$h")" test "$(check_of desk "$h")" = success
+judge S.class-desk "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" '.class == "desk" and .ticket == null'
 
 # The child before its parent: T-sim-c2's PR while T-sim-p2 is open. depends-on fails.
 scn_start ticket/T-sim-c2/scn-early
@@ -172,7 +224,10 @@ judge S.queue-conflict "#$PR_B labels: $(pr_field "$PR_B" '[.labels[].name] | jo
 scn_start ticket/T-sim-t1/scn-foreign
 scn_put sim/t1/foreign.sh 'echo one'; scn_commit T-sim-t1
 scn_put sim/t1/foreign2.sh 'echo two'; scn_commit T-sim-victim
-pr="$(scn_pr ticket/T-sim-t1/scn-foreign T-sim-t1)"; approve "$pr"; pr_event "$pr"
+pr="$(scn_pr ticket/T-sim-t1/scn-foreign T-sim-t1)"; approve "$pr"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+# The ticket gates refuse it on the PR already (the merge below is the stand-in's, not a gate's).
+judge S.foreign-trailer-refused "$(scn_detail context "$h"); $(scn_detail commit-check "$h")" \
+  eval 'check_fails_naming context "$h" "trailer .Ticket: T-sim-victim" && check_fails_naming commit-check "$h" "trailer .Ticket: T-sim-victim"'
 queue_and_merge "$pr"
 judge S.foreign-trailer "T-sim-victim completed: $(adlc_desk ticket show T-sim-victim --json | jq -r .ticket.completed)" \
   test "$(adlc_desk ticket show T-sim-victim --json | jq -r .ticket.completed)" != true
@@ -210,6 +265,7 @@ scn_start human/halt-add
 scn_put factory/HALT 'sim: stop the line'
 git -C "$SCN" commit -qm "$(printf 'halt: stop the line\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>')"
 pr="$(scn_pr human/halt-add - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.class-halt-add "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" '.class == "halt" and .author_association == "OWNER"'
 miss="$(required_report "$(main_sha)" "$h")"
 approvals="$(git -C "$ORIGIN" show "$(main_sha):factory/policy/branch-protection.json" |
   jq '[.rulesets[]?.rules[]? | select(.type == "pull_request") | .parameters.required_approving_review_count] | max // 0')"
@@ -222,4 +278,5 @@ scn_start human/halt-remove
 git -C "$SCN" rm -q factory/HALT
 git -C "$SCN" commit -qm "$(printf 'halt: resume\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>')"
 pr="$(scn_pr human/halt-remove - sim-owner)"; approve "$pr"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.class-halt-remove "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" '.class == "halt"'
 judge S.halt-remove "$(scn_detail halt-guard "$h")" check_fails_naming halt-guard "$h" 'approv'

@@ -12,9 +12,11 @@ itself can prove is `red: kit: <line>` (TB12), never `pass`.
 
 Stage names: `world.*`, `desk.*`, `push.*`, `janitor.*` are the setup; `P.*` is T-sim-parent's path
 and `C.*` T-sim-child's (`.pr.<job>` = the job on pull_request, `.mg.<job>` = on merge_group, one
-line per job the driver ran from the YAML); `S.*` are the failure scenarios (lib/scenarios.sh), each
-judged on the gate that should stop it naming its own reason; `gh.forms` = no script called a `gh`
-form the fake gh does not model.
+line per job the driver ran from the YAML; `.identity` = the `context` job resolved this PR's number,
+ticket, class, base and head, on merge_group from the queue ref); `S.*` are the failure scenarios
+(lib/scenarios.sh), each judged on the gate that should stop it naming its own reason, and `S.class-*`
+on the class the `context` job gave the PR; `gh.forms` = no script called a `gh` form the fake gh does
+not model.
 
 | stage | expected |
 |---|---|
@@ -33,6 +35,8 @@ form the fake gh does not model.
 | P.pr-open | pass |
 | P.claim-released | red: node:G3 — the lock is kept across the PR and the Issue stays `ready` (TB6) |
 | P.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
+| P.pr.context | pass |
+| P.pr.identity | pass |
 | P.pr.build-test | pass |
 | P.pr.rails-proof | red: ci:G6 — rails-proof.sh is a stub (TB3) |
 | P.pr.scope | red: ci:G6 — scope-check.sh is a stub (TB3) |
@@ -44,6 +48,8 @@ form the fake gh does not model.
 | P.hold | red: merge:G3 — no `depends-on` job (TB8) |
 | P.tier-order | red: merge:G5 — no `tier-order` job (TB8) |
 | P.enqueue | red: merge:G4 — nothing enqueues a green PR (TB9) |
+| P.mg.context | pass |
+| P.mg.identity | pass |
 | P.mg.build-test | pass |
 | P.mg.rails-proof | red: ci:G6 — rails-proof.sh is a stub (TB3) |
 | P.mg.scope | red: ci:G6 — scope-check.sh is a stub (TB3) |
@@ -65,6 +71,8 @@ form the fake gh does not model.
 | C.pr-open | pass |
 | C.claim-released | red: node:G3 — the lock is kept across the PR and the Issue stays `ready` (TB6) |
 | C.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
+| C.pr.context | pass |
+| C.pr.identity | pass |
 | C.pr.build-test | pass |
 | C.pr.rails-proof | red: ci:G6 — rails-proof.sh is a stub (TB3) |
 | C.pr.scope | red: ci:G6 — scope-check.sh is a stub (TB3) |
@@ -76,6 +84,8 @@ form the fake gh does not model.
 | C.hold | red: merge:G3 — no `depends-on` job (TB8) |
 | C.tier-order | red: merge:G5 — no `tier-order` job (TB8) |
 | C.enqueue | red: merge:G4 — nothing enqueues a green PR (TB9) |
+| C.mg.context | pass |
+| C.mg.identity | pass |
 | C.mg.build-test | pass |
 | C.mg.rails-proof | red: ci:G6 — rails-proof.sh is a stub (TB3) |
 | C.mg.scope | red: ci:G6 — scope-check.sh is a stub (TB3) |
@@ -92,15 +102,26 @@ form the fake gh does not model.
 | S.tamper-skip | red: ci:G2 — the tamper job errors on `--base` before reading the diff (TB3) |
 | S.rail-edit | red: ci:G6 — rails-proof.sh is a stub (TB3) |
 | S.no-trailer | red: ci:G6 — commit-check.sh is a stub (TB4) |
-| S.head-edits-gate | red: ci:G5 — the head's own `exit 0` scope-check.sh runs and passes (TB2) |
+| S.head-edits-gate | red: ci:G6 — the base's scope-check.sh runs (I16 holds, S.base-script) but is a stub, so it cannot name docs/outside.md (TB3) |
+| S.base-script | pass |
+| S.head-plants-base | pass |
+| S.foreign-body | pass |
+| S.ticket-ref-malformed | pass |
+| S.fork-ticket-ref | pass |
+| S.class-human | pass |
+| S.stranger-refused | pass |
 | S.ticket-adlc | red: ci:G6 — scope-check.sh is a stub (TB3) |
 | S.desk-pr | red: intake:I6 — no `desk` job in gates.yml (TB7) |
+| S.class-desk | pass |
 | S.child-before-parent | red: merge:G3 — no `depends-on` job (TB8) |
 | S.tier-jump | red: merge:G5 — no `tier-order` job (TB8) |
 | S.queue-conflict | red: merge:G7 — no ejection: no `autorebase` label, no ejections.jsonl (TB9) |
 | S.foreign-trailer | red: merge:G11 — post-merge completes every `Ticket:` trailer, so T-sim-victim completes (TB4) |
+| S.foreign-trailer-refused | pass |
 | S.held-24h | red: merge:G8a — the janitor releases the 25 h lock and the Issue stays `ready` for a second build (TB6) |
 | S.built-plus-claim | red: merge:G8b — the built PR's lock counts toward the slot; the new claim is cut `over-slots` (TB6) |
+| S.class-halt-add | pass |
 | S.halt-add | red: merge:G17 — adding HALT waits on `gates / <job>` contexts and one approval (TB10) |
+| S.class-halt-remove | pass |
 | S.halt-remove | red: ci:G11 — no `halt-guard` job; one approval would do (TB10) |
 | gh.forms | pass |
