@@ -1,6 +1,5 @@
 # Build gates. CI reruns every deterministic gate because a laptop is not a trust boundary.
-# Hosted runners only on pull_request (fork safety). w:heavy jobs run on factory-node
-# runners from `push` events on ticket/** branches, never on pull_request from a fork.
+# Hosted runners only (fork safety).
 #
 # The base is trusted, the head is data (I16, specs/factory-step3-v1 TB2). A gate job checks out the
 # PR head (pull_request.head.sha, or merge_group.head_sha) as the working tree it inspects, and the
@@ -13,8 +12,10 @@
 # calls this workflow from enqueue.yml (`workflow_call`) with inputs pr, base (main) and head (the
 # queue commit factory-queue/pr-<n>, parents [main, PR head]): the same gates run there, read from the
 # workflow file of MAIN (the caller's), and lib/gate-context.sh resolves that event as `queue` (I18).
-# In a called workflow github.event_name is the caller's, so `dependencies` is skipped there, as on
-# merge_group.
+# Every job reports on every path (I18): the required set of factory/policy/branch-protection.json is
+# exactly these job ids, and `apply-branch-protection.sh --check` fails when the two differ or a job
+# gains a job-level `if:` (specs/factory-step3-v1 TB10, ticket T29). Actions are pinned by commit sha.
+# No w:heavy job is required until a self-hosted factory-node runner exists.
 #
 # `depends-on` and `tier-order` (specs/factory-step3-v1 TB8, ticket T27) read the store at the base, or
 # at origin/main when it descends from the base: labeler.yml re-runs a held job once its parent merged
@@ -46,9 +47,9 @@ jobs:
   context:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - name: base, head, PR, ticket and class (exit 2 refuses the PR)
         env: { GH_TOKEN: "${{ github.token }}" }
@@ -56,11 +57,11 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22 }
       # The shellcheck `make lint` runs (join.sh SHELLCHECK_PIN); the runner's own is older, so the
       # step fails unless the pinned one is first on PATH.
@@ -68,14 +69,19 @@ jobs:
         run: |
           pipx install shellcheck-py==0.11.0.1
           shellcheck --version | grep -qx 'version: 0.11.0'
+      # `make lint` refuses to run without actionlint (ci:G18); actionlint-py wraps the release binary.
+      - name: actionlint 1.7.12 (actionlint-py 1.7.12.24)
+        run: |
+          pipx install actionlint-py==1.7.12.24
+          actionlint -version | head -n 1 | grep -qx '1.7.12'
       - name: the base's fleet.gate commands, exactly as fleet runs them on the node (I16, I17)
         run: ./.base/factory/bin/build-test.sh
   rails-proof:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - name: no path of BASE...HEAD touches a rail of the base's ticket
         env: { GH_TOKEN: "${{ github.token }}" }
@@ -83,9 +89,9 @@ jobs:
   scope:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - name: BASE...HEAD ⊆ the base's ticket scope (fleet's globs; never .adlc/**)
         env: { GH_TOKEN: "${{ github.token }}" }
@@ -93,30 +99,32 @@ jobs:
   tamper:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       # The node's minor (lib/diff-gates.sh DG_TAMPERGUARD_PYTHON) and pin (DG_TAMPERGUARD_PIN).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with: { python-version: "3.14" }
       - name: tamperguard 0.2.0 on the node's Python minor
         run: pipx install --python python3.14 tamperguard==0.2.0
       - name: tamperguard --range BASE...HEAD --json (a parsed tamper verdict fails; any other error too)
         env: { GH_TOKEN: "${{ github.token }}" }
         run: ./.base/factory/bin/tamper-check.sh
+  # On every path (I18): base-ref/head-ref are what the action reads for any event but pull_request
+  # (its README: "only used for event types other than pull_request and pull_request_target").
   dependencies:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with: { base-ref: "${{ env.GATE_BASE }}", head-ref: "${{ env.GATE_HEAD }}" }
   commit-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - name: Signed-off-by + Assisted-by trailers on every commit of a ticket branch
         env: { GH_TOKEN: "${{ github.token }}" }
@@ -126,9 +134,9 @@ jobs:
   depends-on:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - name: every parent of the base's ticket is completed in the base store (exit 2 holds, naming them)
         env: { GH_TOKEN: "${{ github.token }}" }
@@ -138,9 +146,9 @@ jobs:
   tier-order:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - name: no approved, green, open ticket PR of a lower tier (exit 2 waits, naming them)
         env: { GH_TOKEN: "${{ github.token }}" }
@@ -151,22 +159,47 @@ jobs:
   desk:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22 }
       - name: make tickets, adlc ticket doctor, the manifest chain and the ready records (the base's desk-gates.sh)
         env: { GH_TOKEN: "${{ github.token }}" }
         run: ./.base/factory/bin/desk-gates.sh --check
+  # Two distinct code-owner approvals, on the PR's current head, for a PR touching factory/**, .adlc/**,
+  # .github/**, .claude/** or CODEOWNERS (ci:G12, merge:G6; GitHub counts one owner per path).
+  # reviews.yml re-runs it on every review.
+  owners:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { ref: "${{ env.GATE_BASE }}", path: .base }
+      - name: two distinct owner approvals on the factory's own paths (exit 2 names each short path)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: ./.base/factory/bin/owners-check.sh
+  # The kill switch's asymmetry (ADR-0004 C + D; ci:G11, merge:G17): removing factory/HALT needs two
+  # owner approvals; adding it needs none, and halt.yml commits it with the App, never through the queue.
+  halt-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { ref: "${{ env.GATE_BASE }}", path: .base }
+      - name: a PR removing factory/HALT has two owner approvals on its head
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: ./.base/factory/bin/halt-guard.sh
   attest-verify:
     runs-on: ubuntu-latest
     needs: [build-test, rails-proof, scope, tamper, commit-check]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - name: gate manifest (attest verify is a required check; build order 3)
         env: { GH_TOKEN: "${{ github.token }}" }

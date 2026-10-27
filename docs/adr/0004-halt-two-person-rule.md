@@ -1,6 +1,7 @@
 # ADR-0004: GitHub cannot express "zero approvals to add factory/HALT, two to remove it"
 
-- Status: accepted 2026-10-25 (option A now, option D at build order 3; RULINGS.md Q2)
+- Status: accepted 2026-10-25 (option A now, option D at build order 3; RULINGS.md Q2); amended
+  2026-10-27: C and D built (specs/factory-step3-v1 TB10)
 - Date: 2026-10-24
 - Deciders: @musicofhel
 
@@ -83,6 +84,36 @@ every run. One new fact: the factory App, the ruleset's only bypass actor when `
 set, can push to `main` without a review, so it can add or delete `factory/HALT` too. Only
 post-merge holds the App token, and it pushes its completion commit only. Option C above is the
 same mechanism used on purpose.
+
+## Amendment (2026-10-27, specs/factory-step3-v1 TB10, ticket T29): C and D are built
+
+The step-3 spec (TB10) orders "halt-guard job and halt.yml per ADR-0004 option C", so build order
+3 ships **D and C together**, on the user-owned repo:
+
+- **D:** `gates.yml` job `halt-guard` (`factory/bin/halt-guard.sh`), a required check named by its
+  bare job id (records/TB0.md of specs/factory-step3-v1, (b)), on `pull_request` and the queue
+  path. It fails a PR whose BASE...HEAD deletes `factory/HALT` unless two distinct code owners of
+  `factory/HALT` in the base's CODEOWNERS approved the PR's current head; the author never counts.
+  `owners-check.sh --only factory/HALT` counts, not GitHub: the ruleset requires zero approvals
+  (below), and GitHub counts one owner per path anyway. `reviews.yml` re-runs the job on every
+  submitted or dismissed review. Adding or editing HALT passes.
+- **C:** `.github/workflows/halt.yml`. A collaborator with write access dispatches it, or puts the
+  label `factory:halt` on an Issue or a PR. `halt-guard.sh --add` commits `factory/HALT` straight
+  onto `main` on the App token (the ruleset's only bypass actor) as `github-actions[bot]`, so a
+  halt never waits for a review, a check or the queue. The workflow checks out main only, never a
+  PR head. Without the App it runs `--dry-run` and says so. A dispatch has no Issue to label, so
+  only the label path leaves a `factory:halt` label behind.
+- **The interim ends when the desk lands TB10's note** (I15: `factory/policy/**` is the desk's).
+  The note is `tests/sim/desk/factory/policy/branch-protection.json`: zero required approvals,
+  code-owner review, last-push approval, and the bare job ids. Until it lands, main's policy keeps
+  the interim's one approval, and its `gates / <job>` contexts match no check run.
+- **Two owners:** the root CODEOWNERS names one owner. Until a second one is added there, a HALT
+  removal (and every PR touching `factory/**`, `.adlc/**`, `.github/**`, `.claude/**` or
+  CODEOWNERS, gated by `owners`) cannot merge. That is the spec's rule (Aaron's kit). The
+  CODEOWNERS comment about this ADR still describes the interim. CODEOWNERS is outside T29's
+  scope, so the desk updates it with the second owner.
+
+B stays open for when an organization exists.
 
 ## Consequences
 

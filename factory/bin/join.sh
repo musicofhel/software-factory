@@ -12,8 +12,8 @@
 #                backend (bwrap on Linux, sandbox-exec on macOS; the install line is printed),
 #                slots < 1, --dangerously-skip-permissions in a shell rc or Claude settings file,
 #                no authenticated adapter that factory/policy/adapters.json pins, a fleet.gate that
-#                runs `make lint` with no shellcheck under a system root (fleet's sandbox sees
-#                nothing else; the install line is printed, never run). A timed run of
+#                runs `make lint` with no shellcheck or no actionlint under a system root
+#                (fleet's sandbox sees nothing else; the install line is printed, never run). A timed run of
 #                `make test` in the clone (timeout: budget.json weights.light.suiteMinutesMax)
 #                sets heavy_gates. Warnings: the bwrap shim (ADR-0006) cannot run (no real bwrap,
 #                no /usr), or the host is not merged usr (/bin a real directory: fleet 1.12.0's
@@ -27,7 +27,8 @@
 #                never sudo.
 #   3. register  prints the fine-grained token and self-hosted runner instructions; it never
 #                creates either. --token-file stores a fine-grained token at $FACTORY_HOME/token
-#                (0600); a classic token is refused. Prints the `cux add --no-alias` line the
+#                (0600), which $FACTORY_HOME/env exports as GH_TOKEN, so gh and git run as the node;
+#                a classic token is refused. Prints the `cux add --no-alias` line the
 #                owner runs for the governor's quota reading; join never runs it.
 #   4. manifest  nodes/<handle>.json, validated against factory/nodes/manifest.schema.json,
 #                committed on top of <remote>/nodes and pushed without force (a moved tip is a
@@ -46,7 +47,7 @@ PROG="join"
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 SCHEMA="$FACTORY_ROOT/factory/nodes/manifest.schema.json"
 PINS_FILE="$FACTORY_ROOT/factory/policy/adapters.json"
@@ -229,6 +230,40 @@ lint_refusal="$(jq -r '.lint // {} | if .needed != true then empty
 lint_version="$(jq -r '.lint // {} | select(.needed == true and .shellcheck != null and .in_plane != false) | .version // "unknown"' <<<"$PROBE")"
 [ -z "$lint_version" ] || [ "$lint_version" = "$SHELLCHECK_PIN" ] ||
   warning "shellcheck $lint_version is not the pin $SHELLCHECK_PIN (CI's, gates.yml build-test): make lint may report differently on this node and in CI"
+# actionlint, the other tool `make lint` requires (ci:G18, ticket T29): the same rule as shellcheck, the
+# first actionlint on PATH whose directory and real path lie under a system root (FACTORY_PROBE_ROOT
+# prefixes them in tests, as in lib/probe.sh). CI installs actionlint-py ${ACTIONLINT_PIN}.24 (gates.yml
+# build-test); a node takes the release binary (sha256 of the linux amd64 tarball below). Not measured
+# on macOS, where fleet's plane differs.
+ACTIONLINT_PIN=1.7.12
+ACTIONLINT_SHA256_LINUX_AMD64=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+if [ "$(jq -r '.lint.needed // false' <<<"$PROBE")" = true ] && [ "$(uname -s)" != Darwin ]; then
+  al_root="${FACTORY_PROBE_ROOT:-}" al_first="" al_plane=""
+  al_in_roots() { case "$1" in "$al_root"/usr/*|"$al_root"/lib/*|"$al_root"/lib64/*) return 0 ;; esac; return 1; }
+  IFS=: read -ra al_dirs <<<"${PATH:-}"
+  for d in "${al_dirs[@]}"; do
+    [ -n "$d" ] && [ -f "$d/actionlint" ] && [ -x "$d/actionlint" ] || continue
+    [ -n "$al_first" ] || al_first="$d/actionlint"
+    if al_in_roots "$(readlink -f "$d" 2>/dev/null)/" && al_in_roots "$(readlink -f "$d/actionlint" 2>/dev/null)"; then
+      al_plane="$d/actionlint"; break
+    fi
+  done
+  if [ "$(uname -m)" = x86_64 ]; then
+    al_tgz="actionlint_${ACTIONLINT_PIN}_linux_amd64.tar.gz"
+    al_install="curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_PIN}/$al_tgz && echo '$ACTIONLINT_SHA256_LINUX_AMD64  $al_tgz' | sha256sum -c - && sudo tar -xzf $al_tgz -C /usr/local/bin actionlint"
+  else
+    al_install="the actionlint ${ACTIONLINT_PIN} release binary for $(uname -m) from https://github.com/rhysd/actionlint/releases, under /usr/local/bin"
+  fi
+  if [ -z "$al_first" ]; then
+    refusal "fleet.gate runs make lint, which needs actionlint, and none is on PATH. Install: $al_install"
+  elif [ -z "$al_plane" ]; then
+    refusal "actionlint at $al_first is not visible in fleet's sandbox, which binds only the system roots (/usr, /lib, /lib64), so fleet.gate's make lint fails on this node. Install: $al_install"
+  else
+    al_version="$("$al_plane" -version 2>/dev/null | head -n 1)" || al_version=""
+    [ "$al_version" = "$ACTIONLINT_PIN" ] ||
+      warning "actionlint ${al_version:-of unknown version} is not the pin $ACTIONLINT_PIN (CI's, gates.yml build-test): make lint may report differently on this node and in CI"
+  fi
+fi
 
 if [ "$suite" = 0 ]; then
   HEAVY=false SUITE='{"ran": false, "reason": "--no-suite"}'
@@ -339,7 +374,7 @@ if has uv; then
 fi
 plan_add tamperguard 0.2.0 "$(state_of "$tg_found" 0.2.0)" "$tg_found" \
   "$(has uv || echo "uv not found: install uv (https://docs.astral.sh/uv/), then re-run")" \
-  "UV_TOOL_DIR=$qfh/uv/tools UV_TOOL_BIN_DIR=$qfh/bin UV_CACHE_DIR=$qfh/uv/cache UV_PYTHON_INSTALL_DIR=$qfh/uv/python UV_PYTHON_BIN_DIR=$qfh/uv/python-bin uv tool install tamperguard==0.2.0"
+  "UV_TOOL_DIR=$qfh/uv/tools UV_TOOL_BIN_DIR=$qfh/bin UV_CACHE_DIR=$qfh/uv/cache UV_PYTHON_INSTALL_DIR=$qfh/uv/python UV_PYTHON_BIN_DIR=$qfh/uv/python-bin uv tool install --python 3.14 tamperguard==0.2.0"
 release_cmd() {  # release_cmd <tool> <asset-file> <url> <member|''>
   local a="$2" sha="${SHA[$2]}" get
   get="d=\$(mktemp -d $qfh/tmp/$1.XXXXXX) && curl -fsSL -o \"\$d/$a\" $(q "$3") && printf '%s  %s\\n' $sha \"\$d/$a\" | $sumcheck"
@@ -415,7 +450,7 @@ fi
 REGISTER="$(jq -cn --arg repo "$REPO" --arg h "$handle" --arg fh "$FH" --argjson given "$([ -n "$token" ] && echo true || echo false)" \
   --argjson unknown_min "$(budget .governor.unknownStateSleepMinutes)" '
   {token: {url: "https://github.com/settings/personal-access-tokens/new", repository: $repo,
-           permissions: {contents: "read and write", metadata: "read"}, expiry_days: 90,
+           permissions: {contents: "read and write", issues: "read and write", pull_requests: "read and write", metadata: "read"}, expiry_days: 90,
            ref_patterns: ["ticket/**", "nodes/**", "refs/locks/**"], store: "\($fh)/token", given: $given},
    runner: {url: "https://github.com/\($repo)/settings/actions/runners/new", labels: ["factory-node"],
             command: "./config.sh --url https://github.com/\($repo) --token <registration token from that page> --labels factory-node --name \($h)"},
@@ -424,7 +459,7 @@ REGISTER="$(jq -cn --arg repo "$REPO" --arg h "$handle" --arg fh "$FH" --argjson
            no_alias: "the factory counts accounts and never names them, so no alias is taken from the account display name"}}')"
 if [ "$json" = 0 ]; then
   jq -r '"  a. Fine-grained personal access token: \(.token.url)",
-         "     Repository access: only \(.token.repository). Repository permissions: Contents read and write (Metadata read is added).",
+         "     Repository access: only \(.token.repository). Repository permissions: Contents, Issues and Pull requests read and write (Metadata read is added).",
          "     Expiration: \(.token.expiry_days) days. It may write only \(.token.ref_patterns | join(", ")): the token form has no ref field,",
          "     so the repo rules hold that line (whether GitHub scopes it is measured at first join).",
          "     Store it: re-run with --apply --token-file <file> (kept at \(.token.store), mode 0600).",
@@ -513,6 +548,9 @@ if [ "$apply" = 1 ]; then
     printf 'export FACTORY_HANDLE=%s\n' "$(q "$handle")"
     printf 'export npm_config_cache=%s\n' "$(q "$FH/npm")"
     printf 'export PATH=%s:"$PATH"\n' "$(q "$FH/bin")"
+    # gh and git run as this node, never as whoever is logged in to gh (node:G7): the token is read
+    # from its 0600 file when the env is sourced, never written here.
+    [ ! -f "$FH/token" ] || printf '[ ! -r %s ] || export GH_TOKEN="$(cat %s)"\n' "$(q "$FH/token")" "$(q "$FH/token")"
   } >"$FH/env"
 
   step "apply: commit nodes/$handle.json to $remote/nodes (compare-and-swap, never force)"

@@ -417,23 +417,57 @@ judge S.built-plus-claim "#$B2 lock $( [ -n "$(lock_of "$B2")" ] && echo kept ||
   test -n "$(lock_of "$B2")"
 
 # ------------------------------------------------------------------ HALT (last: it halts the factory)
-# A collaborator adds factory/HALT: it must not wait on approvals or ticket gates.
+# A collaborator halts the line with zero approvals: the `factory:halt` label on a PR fires halt.yml
+# (pull_request_target labeled), which commits factory/HALT onto main on the App token (ADR-0004 C + D;
+# merge:G17). The PR that carries the label passes its own required checks with no approval either,
+# with attest-verify, still the ci:G6 stub until TB11, under the walk's stand-in (SIM_STANDIN_GREEN).
 scn_start human/halt-add
 scn_put factory/HALT 'sim: stop the line'
 git -C "$SCN" commit -qm "$(printf 'halt: stop the line\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>')"
-pr="$(scn_pr human/halt-add - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+pr="$(scn_pr human/halt-add - sim-owner)"; SIM_STANDIN_GREEN="attest-verify" pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.class-halt-add "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" '.class == "halt" and .author_association == "OWNER"'
 miss="$(required_report "$(main_sha)" "$h")"
 approvals="$(git -C "$ORIGIN" show "$(main_sha):factory/policy/branch-protection.json" |
   jq '[.rulesets[]?.rules[]? | select(.type == "pull_request") | .parameters.required_approving_review_count] | max // 0')"
-judge S.halt-add "${miss:-every required check green}; $approvals approval(s) required" eval 'test -z "$miss" && test "$approvals" = 0'
+gh_state '(.pulls[] | select(.number == $n)).labels += [{name: "factory:halt"}]' --argjson n "$pr"
+jq -n --argjson n "$pr" --argjson p "$(FAKE_GH_LOG=/dev/null "$SIM_FAKES/gh" api "repos/$REPO/pulls/$pr")" \
+  '{action: "labeled", number: $n, label: {name: "factory:halt"}, sender: {login: "sim-owner"}, pull_request: $p}' >"$SIM/ev-halt.json"
+drive pull_request_target "$SIM/ev-halt.json" "$(main_sha)"
+halt_commit="$(git -C "$ORIGIN" log -1 --format='%an|%s' main -- factory/HALT)"
+judge S.halt-add "${miss:-every required check green}; $approvals approval(s) required; HALT on main by: ${halt_commit:-nobody}" \
+  eval 'test -z "$miss" && test "$approvals" = 0 && git -C "$ORIGIN" cat-file -e main:factory/HALT &&
+        test "$halt_commit" = "github-actions[bot]|halt: stop the line (@sim-owner)"'
 
-# HALT is on main (the desk pushed it); a PR removing it with ONE approval: halt-guard fails.
-desk_sync; printf 'sim: stop the line\n' >"$SIM/desk/factory/HALT"
-desk_push "desk: factory/HALT"
+# HALT is on main. A PR removing it (by a collaborator, so its author's review could not count) with
+# ONE owner approval (@musicofhel, factory/HALT's one owner in the seed's CODEOWNERS): halt-guard fails,
+# counting that one approval.
+if ! git -C "$ORIGIN" cat-file -e main:factory/HALT 2>/dev/null; then
+  standin "halt.yml did not halt: the desk pushes factory/HALT for the removal scenarios"
+  desk_sync; printf 'sim: stop the line\n' >"$SIM/desk/factory/HALT"; desk_push "desk: factory/HALT"
+fi
 scn_start human/halt-remove
 git -C "$SCN" rm -q factory/HALT
-git -C "$SCN" commit -qm "$(printf 'halt: resume\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>')"
-pr="$(scn_pr human/halt-remove - sim-owner)"; approve "$pr"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+git -C "$SCN" commit -qm "$(printf 'halt: resume\n\nSigned-off-by: node-b-owner <node-b-owner@sim.invalid>')"
+pr="$(scn_pr human/halt-remove - node-b-owner)"; approve "$pr" musicofhel; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.class-halt-remove "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" '.class == "halt"'
-judge S.halt-remove "$(scn_detail halt-guard "$h")" check_fails_naming halt-guard "$h" 'approv'
+judge S.halt-remove "$(scn_detail halt-guard "$h")" check_fails_naming halt-guard "$h" '"approvals":\["musicofhel"\].*"result":"short"'
+
+# The same removal with TWO owner approvals. The desk names a second owner of factory/HALT in
+# CODEOWNERS (the sim's owners: the seed's CODEOWNERS names the real repo's owner); the PR's first run
+# is short, then each review fires reviews.yml (pull_request_review), which re-runs halt-guard, and
+# the re-run counts both approvals on the head.
+desk_sync; printf '\nfactory/HALT @sim-owner @desk\n' >>"$SIM/desk/CODEOWNERS"
+desk_push "desk: a second owner of factory/HALT (sim)"
+scn_start human/halt-remove-two
+git -C "$SCN" rm -q factory/HALT
+git -C "$SCN" commit -qm "$(printf 'halt: resume\n\nSigned-off-by: node-b-owner <node-b-owner@sim.invalid>')"
+pr="$(scn_pr human/halt-remove-two - node-b-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+first="$(check_of halt-guard "$h")"
+for who in sim-owner desk; do
+  approve "$pr" "$who"
+  jq -n --argjson p "$(FAKE_GH_LOG=/dev/null "$SIM_FAKES/gh" api "repos/$REPO/pulls/$pr")" --arg u "$who" --arg h "$h" \
+    '{action: "submitted", review: {user: {login: $u}, state: "approved", commit_id: $h}, pull_request: $p}' >"$SIM/ev-review.json"
+  drive pull_request_review "$SIM/ev-review.json" "$(git -C "$ORIGIN" rev-parse "refs/pull/$pr/merge")"
+done
+judge S.halt-remove-two "first run: halt-guard $first; after two approvals, re-run: $(rerun_of halt-guard "$h"); check now $(check_of halt-guard "$h")" \
+  eval 'test "$first" = failure && test "$(rerun_of halt-guard "$h")" = success && test "$(check_of halt-guard "$h")" = success'

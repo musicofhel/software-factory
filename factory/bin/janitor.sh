@@ -127,15 +127,30 @@ lease_lost() { grep -q 'stale info' "$PUSH_ERR"; }
 push_detail() { tail -n1 "$PUSH_ERR"; }
 
 # ------------------------------------------------------------------------------------- read
+# A remote without the nodes branch (a fresh repo before apply-branch-protection.sh --bootstrap; ci:G22)
+# reads as an empty one: $NS/nodes is then a local commit of the empty tree, never pushed, and
+# nodes_commit creates the branch with a parentless commit if it ever has a file to write.
+NODES_ABSENT=0
 fetch_nodes() {
-  git fetch --quiet --no-tags --no-write-fetch-head "$remote" "+refs/heads/nodes:$NS/nodes" ||
-    die "cannot fetch $remote nodes (the nodes branch must exist)"
+  local rc=0
+  git ls-remote --exit-code --heads "$remote" refs/heads/nodes >/dev/null || rc=$?
+  case "$rc" in
+    0) NODES_ABSENT=0
+       git fetch --quiet --no-tags --no-write-fetch-head "$remote" "+refs/heads/nodes:$NS/nodes" ||
+         die "cannot fetch $remote nodes" ;;
+    2) NODES_ABSENT=1
+       warn "$remote has no nodes branch: read as empty (apply-branch-protection.sh --bootstrap creates it)"
+       git update-ref "$NS/nodes" "$(GIT_AUTHOR_NAME=janitor GIT_AUTHOR_EMAIL=janitor@localhost GIT_COMMITTER_NAME=janitor \
+         GIT_COMMITTER_EMAIL=janitor@localhost git commit-tree "$(git mktree </dev/null)" -m 'no nodes branch (read as empty)')" ;;
+    *) die "cannot list the refs of $remote" ;;
+  esac
 }
 fetch_all() {
   drop_ns
-  git fetch --quiet --no-tags --no-write-fetch-head "$remote" "+refs/heads/nodes:$NS/nodes" \
+  git fetch --quiet --no-tags --no-write-fetch-head "$remote" \
       "+refs/heads/ticket/*:$NS/ticket/*" "+refs/locks/*:$NS/locks/*" ||
-    die "cannot fetch $remote (nodes, ticket/**, refs/locks/*)"
+    die "cannot fetch $remote (ticket/**, refs/locks/*)"
+  fetch_nodes
 }
 
 json_files() {  # json_files <dir/>: [{path, name, data}] for the *.json blobs directly in dir/ on nodes
@@ -357,7 +372,8 @@ nodes_commit() {
     [ "$changed" != '{}' ] || return 0
     msg="$(jq -r --arg at "$(epoch_to_iso "$NOW")" '"janitor: \(keys | length) file(s) at \($at)\n\n" + (to_entries | map("\(.value) \(.key)") | join("\n"))' <<<"$changed")"
     if [ "$apply" = 0 ]; then emit "$(jq -c '{action: "nodes-commit", files: .}' <<<"$changed")" planned; return 0; fi
-    new="$(git commit-tree "$tree" -p "$tip" -m "$msg")"
+    if [ "$NODES_ABSENT" = 1 ]; then new="$(git commit-tree "$tree" -m "$msg")"
+    else new="$(git commit-tree "$tree" -p "$tip" -m "$msg")"; fi
     if push_ref refs/heads/nodes "" "$new"; then
       emit "$(jq -c --arg sha "$new" '{action: "nodes-commit", sha: $sha, files: .}' <<<"$changed")" "done"
       return 0

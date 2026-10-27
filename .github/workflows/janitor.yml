@@ -27,15 +27,17 @@ defaults:
 jobs:
   janitor:
     runs-on: ubuntu-latest
+    # The App key lives in environment `main`, readable only by a job running on main (ci:G13).
+    environment: main
     timeout-minutes: 15
     # The secrets context cannot appear in a step's `if:`; its presence is read here.
     env:
       FACTORY_APP_ID: ${{ vars.FACTORY_APP_ID }}
       HAS_APP_KEY: ${{ secrets.FACTORY_APP_KEY != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22 }
       # 0 absent → sweep; 3 halted → skip the sweep (green, with a notice); anything else is
       # unknown → red.

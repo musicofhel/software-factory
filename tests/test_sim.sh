@@ -34,11 +34,14 @@ flip() {  # flip <stage> <new expected cell> < EXPECTED: one line rewritten
 }
 case_compare_both_directions() {
   local out rc=0
-  flip world.seed 'red: ci:G1 flipped' <"$SIMDIR/EXPECTED.md" | flip janitor.no-nodes pass >"$W/exp-flip.md"
-  out="$("$SIMDIR/lib/compare.sh" "$W/exp-flip.md" "$W/results.tsv")" || rc=$?
+  # One stage each way: world.seed passes but EXPECTED says red; janitor.no-nodes is expected to pass,
+  # and the results say red (built on the results side, so it holds whichever gaps are still open).
+  flip world.seed 'red: ci:G1 flipped' <"$SIMDIR/EXPECTED.md" >"$W/exp-flip.md"
+  sed -E 's/^(janitor\.no-nodes)\tpass\t/\1\tred\t/' "$W/results.tsv" >"$W/res-flip.tsv"
+  out="$("$SIMDIR/lib/compare.sh" "$W/exp-flip.md" "$W/res-flip.tsv")" || rc=$?
   check "a flipped EXPECTED.md fails with exit 2" eq "$rc" 2
   check "a pass stage marked red reads as green early" grep -q '^green early: world.seed passed' <<<"$out"
-  check "a red stage marked pass reads as regressed" grep -q '^regressed: janitor.no-nodes is red' <<<"$out"
+  check "a stage expected to pass that ran red reads as regressed" grep -q '^regressed: janitor.no-nodes is red' <<<"$out"
   check "nothing else differs" eq "$(wc -l <<<"$out" | tr -d ' ')" 2
 }
 case_compare_missing_and_malformed() {

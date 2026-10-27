@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The factory:halt label and a push of factory/HALT are both a halt notice; summon.sh skips
       # a push whose commit no longer has factory/HALT (a lift is digest news, not a summons).
       - name: one message, one human

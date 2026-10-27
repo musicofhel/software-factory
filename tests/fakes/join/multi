@@ -22,7 +22,7 @@
 #   cargo install --locked [--root R] <crate>@<v>
 #                  R/bin/<crate> printing "<crate> <v>" (no --root: $CARGO_HOME or ~/.cargo);
 #                  the crate cache under $CARGO_HOME (default ~/.cargo)/registry
-#   uv tool list | uv tool install <pkg>==<v>
+#   uv tool list | uv tool install [--python <v>] <pkg>==<v>  (<v> kept in the tool dir's `python`)
 #                  tools in $UV_TOOL_DIR (~/.local/share/uv/tools), executables in $UV_TOOL_BIN_DIR
 #                  (~/.local/bin), cache in $UV_CACHE_DIR (~/.cache/uv); list prints "<pkg> v<v>"
 #   npx -y @adlc/cli@<v> --version | init --root R --harness H
@@ -107,7 +107,11 @@ case "$me" in
         [ -d "$tools" ] || { echo "No tools installed"; exit 0; }
         for d in "$tools"/*/; do [ -f "$d/version" ] && printf '%s v%s\n- %s\n' "$(basename "$d")" "$(command cat "$d/version")" "$(basename "$d")"; done ;;
       install)
-        pkg="${3%%==*}" ver="${3#*==}"
+        shift 2; py=""
+        [ "${1:-}" != --python ] || { py="${2:-}"; shift 2; }
+        case "${1:-}" in -*|"") nope tool install "$@" ;; esac
+        pkg="${1%%==*}" ver="${1#*==}"
+        [ -z "$py" ] || { mkdir -p "$tools/$pkg"; echo "$py" >"$tools/$pkg/python"; }
         mkdir -p "$tools/$pkg" "${UV_CACHE_DIR:-$HOME/.cache/uv}"
         echo "$ver" >"$tools/$pkg/version"
         echo "$pkg" >"${UV_CACHE_DIR:-$HOME/.cache/uv}/fetched-$pkg"

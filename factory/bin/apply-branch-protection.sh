@@ -3,6 +3,8 @@
 #
 #   apply-branch-protection.sh [--json] [--repo owner/name] [--policy FILE]     plan (dry run)
 #   apply-branch-protection.sh --apply [--json] [--repo owner/name] [--policy FILE]
+#   apply-branch-protection.sh --check [--policy FILE] [--gates FILE]           I18, offline
+#   apply-branch-protection.sh --bootstrap [--apply] [--repo owner/name]        a fresh repo's refs
 #
 # Reads the current state (GET branch protection, GET each repository ruleset), compares it with
 # the policy, and prints one `gh api` call per write it would make: PUT the branch protection (or
@@ -22,19 +24,45 @@
 # the output is unchanged. A ruleset bypass does not lift classic protection, so FACTORY_APP_ID
 # with a policy that keeps classic protection is refused.
 #
-# Exit 0: planned, or applied every call. 1: a read or a write failed. 2: the policy has a field
-# that is not a real GitHub REST field, or breaks the rules above (refused before any call).
+# Merge queue (specs/factory-step3-v1 TB10, ticket T29): a ruleset's `merge_queue` rule is sent only
+# when the repo is organization-owned (GET repos/<repo> .owner.type), because GitHub's merge queue is
+# for organization-owned repos (records/TB0.md (a), `native-queue: no` on a user-owned one). On any
+# other repo the rule is left out of the plan and printed as skipped: the first-party serial queue
+# (docs/adr/0007-merge-queue.md) lands with the App, the ruleset's only bypass actor.
+#
+# --check (I18; offline, needs yq): every required status check of the policy is a job id of
+# .github/workflows/gates.yml (the bare id: a check run is named by its job id, records/TB0.md (b))
+# with integration_id 15368 (GitHub Actions), and every gates.yml job that reports on both paths is
+# required. A job reports on both paths when gates.yml runs on pull_request, merge_group and
+# workflow_call (the serial queue) and the job has no job-level `if:`; a required job's `needs` must be
+# required too, since a job skipped for a failed need reports as skipped, which a required check
+# accepts. Prints {required, both_paths, missing, extra, no_integration, needs_unrequired, result}.
+#
+# --bootstrap (Aaron's kit, run once before the first --apply; merge:G15): creates what a fresh repo
+# lacks and the factory reads: the `nodes` branch (janitor.sh, join.sh) and the `flaky-history`
+# branch, each a one-commit orphan holding a README (POST git/trees, git/commits, git/refs), and the
+# `main` environment that holds FACTORY_APP_KEY (ci:G13): PUT environments/main with custom
+# deployment branch policies and the one policy `main` (type branch), so only a job running on main
+# can read the key. What exists already is a noop. Dry run unless --apply.
+#
+# Exit 0: planned, or applied every call; --check: the sets agree. 1: a read or a write failed. 2: the
+# policy has a field that is not a real GitHub REST field, or breaks the rules above (refused before
+# any call); --check: the sets disagree.
 set -euo pipefail
 PROG="apply-branch-protection"
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
-apply=0 json=0 repo="" policy="$FACTORY_ROOT/factory/policy/branch-protection.json"
+apply=0 json=0 repo="" policy="$FACTORY_ROOT/factory/policy/branch-protection.json" mode=plan
+gates="$FACTORY_ROOT/.github/workflows/gates.yml"
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) apply=1 ;;
+    --check) mode=check ;;
+    --bootstrap) mode=bootstrap ;;
+    --gates) gates="${2:-}"; shift ;;
     --dry-run) apply=0 ;;
     --json) json=1 ;;
     --repo) repo="${2:-}"; shift ;;
@@ -44,7 +72,115 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# GitHub Actions' app id: the integration a required check run must come from (records/TB0.md (b)).
+ACTIONS_APP_ID=15368
+
+if [ "$mode" = check ]; then
+  need jq yq
+  [ -f "$policy" ] || die "policy not found: $policy"
+  [ -f "$gates" ] || die "gates workflow not found: $gates"
+  wf="$(yq -o=json '.' "$gates")" || die "cannot parse $gates"
+  out="$(jq -c --argjson wf "$wf" --argjson app "$ACTIONS_APP_ID" '
+    ($wf.on | if type == "string" then {(.): null} elif type == "array" then (map({(.): null}) | add) else . end) as $on
+    | (($on | has("pull_request")) and ($on | has("merge_group")) and ($on | has("workflow_call"))) as $paths
+    | [(.rulesets // [])[] | (.rules // [])[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]] as $checks
+    | ([$checks[].context] | unique) as $req
+    | [$wf.jobs | to_entries[] | select($paths and (.value | has("if") | not)) | .key] as $both
+    | {required: $req, both_paths: $both, triggers: ($on | keys),
+       missing: ($both - $req), extra: ($req - $both),
+       no_integration: [$checks[] | select(.integration_id != $app) | .context] | unique,
+       needs_unrequired: [$wf.jobs | to_entries[] | select(.key | IN($req[])) | .key as $j
+                          | (.value.needs // [] | if type == "string" then [.] else . end)[] | select(IN($req[]) | not)
+                          | "\($j) needs \(.)"]}
+    | .result = (if .missing == [] and .extra == [] and .no_integration == [] and .needs_unrequired == []
+                 and ($req | length) > 0 then "pass" else "fail" end)' "$policy")" || die "cannot read $policy"
+  printf '%s\n' "$out"
+  if [ "$(jq -r .result <<<"$out")" = pass ]; then
+    jq -r '"apply-branch-protection: I18 holds: the \(.required | length) required checks are exactly the gates.yml jobs that report on pull_request and the queue path"' <<<"$out" >&2
+    exit 0
+  fi
+  jq -r '(.missing[] | "apply-branch-protection: I18: gates.yml job \(.) reports on both paths but is not required"),
+         (.extra[] | "apply-branch-protection: I18: required check \(.) is no gates.yml job that reports on both paths (a check run is named by its bare job id)"),
+         (.no_integration[] | "apply-branch-protection: I18: required check \(.) lacks integration_id \($app) (GitHub Actions)"),
+         (.needs_unrequired[] | "apply-branch-protection: I18: \(.), which is not required: a skipped need reports green"),
+         (if (.required | length) == 0 then "apply-branch-protection: I18: the policy requires no check" else empty end)' \
+    --argjson app "$ACTIONS_APP_ID" <<<"$out" >&2
+  exit 2
+fi
+
 need gh jq
+
+if [ "$mode" = bootstrap ]; then
+  REPO="$(resolve_repo "$repo")"
+  errf="$(mktemp)" resf="$(mktemp)"; trap 'rm -f "$errf" "$resf"' EXIT
+  plan='[]'
+  bs_step() {  # bs_step <what> <action> <json detail>
+    plan="$(jq -c --arg w "$1" --arg a "$2" --argjson d "$3" '. + [{what: $w, action: $a} + $d]' <<<"$plan")"
+  }
+  # bs_send <what> <cmd...>: run one write (--apply only); its result goes to a file, since a caller may
+  # run it inside $(...) or a pipeline. stdout is the command's, stderr is kept apart from it.
+  bs_send() {
+    local what="$1" o; shift
+    if o="$("$@" 2>"$errf")"; then jq -cn --arg w "$what" '{what: $w, result: "ok"}' >>"$resf"; printf '%s' "$o"
+    else jq -cn --arg w "$what" --arg e "$(tail -n1 "$errf")" '{what: $w, result: "failed", error: $e}' >>"$resf"
+         warn "$what failed: $(tail -n1 "$errf")"; return 1; fi
+  }
+  for b in nodes flaky-history; do
+    if gh api "repos/$REPO/git/ref/heads/$b" >/dev/null 2>"$errf"; then bs_step "branch $b" noop '{}'; continue; fi
+    grep -q '(HTTP 404)' "$errf" || die "cannot read branch $b: $(tail -n1 "$errf")"
+    case "$b" in
+      nodes) readme="# nodes\n\nThe factory's node registry (factory/bin/join.sh writes nodes/<handle>.json; factory/bin/janitor.sh keeps janitor/state.json and archive/). Written only by compare-and-swap pushes, never by hand.\n" ;;
+      *) readme="# flaky-history\n\nJUnit history for the flaky-test classifier (specs/factory-step3-v1 TB11). Written by CI, never by hand.\n" ;;
+    esac
+    body="$(jq -cn --arg c "$(printf '%b' "$readme")" '{tree: [{path: "README.md", mode: "100644", type: "blob", content: $c}]}')"
+    bs_step "branch $b" create "$(jq -cn --arg b "$b" --argjson t "$body" \
+      '{calls: ["POST git/trees", "POST git/commits", "POST git/refs refs/heads/\($b)"], tree: $t}')"
+    [ "$apply" = 1 ] || continue
+    tree="$(bs_send "tree of $b" gh api -X POST "repos/$REPO/git/trees" --input - --jq .sha <<<"$body")" || continue
+    commit="$(jq -cn --arg t "$tree" --arg b "$b" '{message: "\($b): start the branch (apply-branch-protection.sh --bootstrap)", tree: $t, parents: []}' |
+              bs_send "commit of $b" gh api -X POST "repos/$REPO/git/commits" --input - --jq .sha)" || continue
+    jq -cn --arg r "refs/heads/$b" --arg s "$commit" '{ref: $r, sha: $s}' |
+      bs_send "branch $b" gh api -X POST "repos/$REPO/git/refs" --input - >/dev/null || true
+  done
+  # The environment of the App key: deployments (jobs) only from the branch main.
+  env_want='{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}'
+  if cur="$(gh api "repos/$REPO/environments/main" 2>"$errf")"; then
+    if jq -e '.deployment_branch_policy == {"protected_branches": false, "custom_branch_policies": true}' <<<"$cur" >/dev/null; then
+      env_action=noop; else env_action=update; fi
+  else
+    grep -q '(HTTP 404)' "$errf" || die "cannot read environment main: $(tail -n1 "$errf")"
+    env_action=create
+  fi
+  bs_step "environment main" "$env_action" "$(jq -cn --argjson b "$env_want" '{calls: ["PUT environments/main"], body: $b}')"
+  if [ "$apply" = 1 ] && [ "$env_action" != noop ]; then
+    bs_send "environment main" gh api -X PUT "repos/$REPO/environments/main" --input - <<<"$env_want" >/dev/null || true
+  fi
+  if [ "$env_action" = create ] && [ "$apply" = 0 ]; then pols='[]'
+  else pols="$(gh api "repos/$REPO/environments/main/deployment-branch-policies" --jq '[.branch_policies[] | {name, type: (.type // "branch")}]' 2>"$errf")" ||
+         { [ "$apply" = 1 ] || die "cannot read the deployment branch policies of environment main: $(tail -n1 "$errf")"; pols='[]'; }
+  fi
+  if jq -e 'any(.[]; .name == "main" and .type == "branch")' <<<"$pols" >/dev/null; then bs_step "environment main: branch policy main" noop '{}'
+  else
+    bs_step "environment main: branch policy main" create '{"calls": ["POST environments/main/deployment-branch-policies"], "body": {"name": "main", "type": "branch"}}'
+    [ "$apply" = 0 ] || jq -cn '{name: "main", type: "branch"}' |
+      bs_send "environment main: branch policy main" gh api -X POST "repos/$REPO/environments/main/deployment-branch-policies" --input - >/dev/null || true
+  fi
+  results="$(jq -sc . "$resf")"
+  extra="$(jq -cn '{unpinned: "FACTORY_APP_KEY is set by hand: Settings > Environments > main > Environment secrets (never a repo secret, ci:G13)"}')"
+  out="$(jq -cn --arg m "$([ "$apply" = 1 ] && echo apply || echo dry-run)" --arg r "$REPO" --argjson p "$plan" --argjson res "$results" --argjson x "$extra" \
+    '{mode: $m, repo: $r, bootstrap: $p, results: $res} + $x')"
+  if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
+    jq -r '(.bootstrap[] | "# \(.action): \(.what)" + (if .action == "noop" then " (exists; not sent)" else " (" + (.calls | join(", ")) + ")" end)),
+           (.results[] | "# \(.result): \(.what)" + (if .error then " (\(.error))" else "" end)),
+           "# \(.unpinned)",
+           (if .mode == "dry-run" then "# dry run: \([.bootstrap[] | select(.action != "noop")] | length) step(s) planned, none sent; --bootstrap --apply to send"
+            else "# applied \([.results[] | select(.result == "ok")] | length) of \(.results | length) write(s)" end)' <<<"$out"
+  fi
+  if jq -e '[.results[] | select(.result != "ok")] | length > 0' <<<"$out" >/dev/null; then exit 1; fi
+  exit 0
+fi
+
 [ -f "$policy" ] || die "policy not found: $policy"
 jq -e 'type == "object"' "$policy" >/dev/null 2>&1 || die "policy is not a JSON object: $policy"
 
@@ -167,6 +303,8 @@ else
   current_prot=null
 fi
 existing="$(gh api --paginate "repos/$REPO/rulesets?includes_parents=false")" || die "cannot list rulesets of $REPO"
+OWNER_TYPE="$(gh api "repos/$REPO" --jq .owner.type)" || die "cannot read the owner of $REPO"
+if [ "$OWNER_TYPE" = Organization ]; then NATIVE_QUEUE=yes; else NATIVE_QUEUE=no; fi
 existing="$(jq -c '[.[] | select((.source_type // "Repository") == "Repository") | {id, name}]' <<<"$existing")"
 
 # --- plan: one entry per write, noops included so the reader sees every rule was checked ---
@@ -199,9 +337,13 @@ while IFS= read -r rs; do
   cur="$(jq -c '{name, target, enforcement, bypass_actors: (.bypass_actors // []), conditions, rules}' <<<"$cur")"
   if jq -e --argjson w "$rs" "$JQ_LIB same(\$w)" <<<"$cur" >/dev/null; then action=noop; else action=update; fi
   add_call "$action" PUT "repos/$REPO/rulesets/$id" "$rs" "ruleset $name"
-done < <(jq -c --arg app "$APP_ID" "$JQ_LIB (.rulesets // [])[] | strip
+done < <(jq -c --arg app "$APP_ID" --arg nq "$NATIVE_QUEUE" "$JQ_LIB (.rulesets // [])[] | strip
   | .bypass_actors = (if \$app == \"\" then []
-                      else [{actor_id: (\$app | tonumber), actor_type: \"Integration\", bypass_mode: \"always\"}] end)" "$policy")
+                      else [{actor_id: (\$app | tonumber), actor_type: \"Integration\", bypass_mode: \"always\"}] end)
+  | if \$nq == \"yes\" then . else .rules |= map(select(.type != \"merge_queue\")) end" "$policy")
+skipped="$(jq -c --arg nq "$NATIVE_QUEUE" --arg ot "$OWNER_TYPE" '[if $nq == "yes" then empty else
+  (.rulesets // [])[] | .name as $n | (.rules // [])[] | select(.type == "merge_queue")
+  | {ruleset: $n, rule: "merge_queue", why: "native-queue: no (the repo owner is a \($ot); GitHub merge queues are for organization-owned repos, records/TB0.md (a)): the first-party serial queue lands with the App (docs/adr/0007-merge-queue.md)"} end]' "$policy")"
 
 unmanaged="$(jq -c --argjson want "$(jq -c '[(.rulesets // [])[].name]' "$policy")" \
   '[.[] | select(.name | IN($want[]) | not) | .name]' <<<"$existing")"
@@ -222,10 +364,10 @@ fi
 
 out="$(jq -cn --arg mode "$([ "$apply" = 1 ] && echo apply || echo dry-run)" --arg repo "$REPO" \
   --arg branch "$BRANCH" --argjson calls "$plan" --argjson results "$results" \
-  --argjson unmanaged "$unmanaged" --argjson unexpressed "$unexpressed" \
+  --argjson unmanaged "$unmanaged" --argjson unexpressed "$unexpressed" --argjson skipped "$skipped" \
   --arg app "$APP_ID" --argjson rulesets "$(jq -c '[(.rulesets // [])[].name]' "$policy")" \
   '{mode: $mode, repo: $repo, branch: $branch, calls: $calls, results: $results,
-    unmanaged_rulesets: $unmanaged, unexpressed: $unexpressed}
+    unmanaged_rulesets: $unmanaged, unexpressed: $unexpressed, skipped_rules: $skipped}
    + (if $app == "" then {} else {app_bypass: {actor_id: ($app | tonumber), actor_type: "Integration",
         bypass_mode: "always", rulesets: $rulesets}} end)')"
 if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
@@ -236,6 +378,7 @@ if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
                  else "gh api -X \(.method) \(.path) --input - <<< \(.body | tojson | @sh)" end)),
     (.results[] | "# \(.result): \(.method) \(.path)" + (if .error then " (\(.error))" else "" end)),
     (.unmanaged_rulesets[] | "# unmanaged ruleset on GitHub, not in the policy (left alone): \(.)"),
+    (.skipped_rules[] | "# skipped: rule \(.rule) of ruleset \(.ruleset), not sent: \(.why)"),
     (.unexpressed[] | "# NOT EXPRESSIBLE on GitHub, not enforced: \(.rule). \(.why) See \(.adr // "the policy").") ,
     (.app_bypass // empty | "# bypass actor: GitHub App \(.actor_id) (\(.actor_type), \(.bypass_mode)), the only one, on ruleset(s) \(.rulesets | join(", ")) (FACTORY_APP_ID)"),
     (if .mode == "dry-run" then

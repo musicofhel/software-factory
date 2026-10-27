@@ -53,8 +53,11 @@ if [ -n "$KEEP" ]; then rm -rf "$KEEP"; mkdir -p "$KEEP"; SIM="$(cd "$KEEP" && p
 else SIM="$(mktemp -d "${TMPDIR:-/tmp}/sim.XXXXXX")"; trap 'rm -rf "$SIM"' EXIT; fi
 export SIM ORIGIN="$SIM/origin.git" REPO=sim-owner/factory
 # The factory App is configured (FACTORY_APP_ID, FACTORY_APP_KEY): its pushes start workflows, and the
-# serial queue (enqueue.yml) lands with it (lib/driver.sh, "GitHub's push events").
-export SIM_VARS='{"JANITOR_DRY_RUN":"false","FACTORY_APP_ID":"1"}' SIM_SECRETS='{"FACTORY_APP_KEY":"sim-key"}'
+# serial queue (enqueue.yml) lands with it (lib/driver.sh, "GitHub's push events"). The key is a secret
+# of environment `main`, deployable only from main (apply-branch-protection.sh --bootstrap; ci:G13), so a
+# pull_request run never sees it.
+export SIM_VARS='{"JANITOR_DRY_RUN":"false","FACTORY_APP_ID":"1"}' SIM_SECRETS='{}'
+export SIM_ENVIRONMENTS='{"main":{"branches":["main"],"secrets":{"FACTORY_APP_KEY":"sim-key"}}}'
 R="$SIM/results.tsv"; : >"$R"
 LOG="$SIM/sim.log"; : >"$LOG"
 
@@ -189,8 +192,8 @@ admin_merge() {  # admin_merge <n>: a merge commit of PR <n> on main as a repo a
   merge_standin "$n" "$sha"
   desk_sync
 }
-approve() {  # approve <pr> [login]: one APPROVED review
-  gh_state '(.pulls[] | select(.number == $n)).reviews += [{author: {login: $u}, state: "APPROVED"}]' \
+approve() {  # approve <pr> [login]: one APPROVED review, given on the PR's current head (owners-check counts that)
+  gh_state '(.pulls[] | select(.number == $n)) |= (.reviews += [{author: {login: $u}, state: "APPROVED", commit: {oid: .headRefOid}}])' \
     --argjson n "$1" --arg u "${2:-sim-owner}"
 }
 queue_line() {  # queue_line <job> <pr>: enqueue.sh's verdict line in the latest enqueue.yml <job> (pick|land) log naming PR <n>, or {}

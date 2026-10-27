@@ -46,6 +46,14 @@ world_build() {
     case "$f" in .adlc/tickets/*|.adlc/ticket-archive/*|.adlc/ticket-transactions/*|.adlc/manifest.jsonl) continue ;; esac
     mkdir -p "$seed/$(dirname "$f")" && command cp -p "$SIM_ROOT/$f" "$seed/$f"
   done
+  # The desk notes (I15): a row may not edit factory/policy/**, so the file it needs the desk to write
+  # lies under tests/sim/desk/ with the same path. The seed takes it, as the desk commit would.
+  (cd "$SIM_ROOT/tests/sim/desk" && find . -type f | sed 's|^\./||') | while IFS= read -r f; do
+    if ! cmp -s "$SIM_ROOT/tests/sim/desk/$f" "$seed/$f"; then
+      mkdir -p "$seed/$(dirname "$f")" && command cp -p "$SIM_ROOT/tests/sim/desk/$f" "$seed/$f"
+      say "  stand-in: the desk applies its note tests/sim/desk/$f over $f"
+    fi
+  done
   mkdir -p "$seed/.adlc/tickets" "$seed/.adlc/ticket-archive"
   # Each directory's own format marker, as `adlc init` writes them (real `ticket doctor` refuses the
   # archive with the directory's marker: "store:archive: unsupported ticket store manifest").
@@ -77,7 +85,11 @@ world_build() {
     '  mkdir -p "$PIPX_BIN_DIR" && printf "%s\\n" "#!/usr/bin/env bash" "printf \"ShellCheck (sim)\\\\nversion: 0.11.0\\\\n\"" >"$PIPX_BIN_DIR/shellcheck"' \
     '  chmod +x "$PIPX_BIN_DIR/shellcheck"; echo "  installed package shellcheck-py 0.11.0.1 (sim)"; exit 0' \
     'fi' \
-    'echo "sim pipx: only tamperguard==0.2.0 on python3.14 and shellcheck-py==0.11.0.1 are simulated: $*" >&2; exit 127' >"$SIM/runner-bin/pipx"
+    'if [ "$*" = "install actionlint-py==1.7.12.24" ]; then' \
+    '  mkdir -p "$PIPX_BIN_DIR" && printf "%s\\n" "#!/usr/bin/env bash" "printf \"1.7.12\\\\ninstalled by pipx (sim)\\\\n\"" >"$PIPX_BIN_DIR/actionlint"' \
+    '  chmod +x "$PIPX_BIN_DIR/actionlint"; echo "  installed package actionlint-py 1.7.12.24 (sim)"; exit 0' \
+    'fi' \
+    'echo "sim pipx: only tamperguard==0.2.0 on python3.14, shellcheck-py==0.11.0.1 and actionlint-py==1.7.12.24 are simulated: $*" >&2; exit 127' >"$SIM/runner-bin/pipx"
   printf '%s\n' '#!/usr/bin/env bash' \
     'if [ "$*" = test ] && [ -e sim/r/main-side ] && [ -e sim/r/pr-side ]; then echo "sim make: \`make test\` fails: sim/r/main-side and sim/r/pr-side together (S.queue-red)" >&2; exit 2; fi' \
     'case "$*" in test|lint) echo "sim make: \`make $*\` stubbed (the suite runs the sim itself)"; exit 0 ;; esac' \

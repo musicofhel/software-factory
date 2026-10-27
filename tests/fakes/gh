@@ -69,6 +69,14 @@
 #        .merged list (the commit the PR landed as), else the entry's own mergeCommitOid, else null;
 #        merged is state == MERGED. 404 for an unknown number.
 #        node_id is "PR_<n>"; draft is the entry's isDraft (default false).
+# api:   (specs/factory-step3-v1 TB10) GET repos/<repo>: {full_name, name, default_branch, owner: {login,
+#        type: FAKE_GH_OWNER_TYPE, default User}}. GET collaborators/<login>/permission: admin for the
+#        repo's owner, write for a login in .collaborators not in .removed_collaborators, else read.
+#        GET pulls/<n>/reviews: the entry's reviews in order as REST answers them, {id, user.login, state,
+#        commit_id (the review's commit.oid, else the PR's headRefOid), submitted_at, author_association}.
+#        POST git/trees: top-level blobs from `content` (mode 100644), no base_tree; answers {sha}.
+#        GET/PUT environments/<name>, GET/POST environments/<name>/deployment-branch-policies on the
+#        .environments of FAKE_GH_SETTINGS (see environments()).
 # api:   POST graphql (-f query=..., -F vars; specs/factory-step3-v1 TB9), two documents only:
 #        a query reading repository(owner, name).mergeQueue(branch: "main") — null when the state's
 #        .merge_queue is null or absent (no native queue), else {id, entries: {totalCount}} from
@@ -161,9 +169,39 @@ api() {
   local query=""; case "$path" in *\?*) query="${path#*\?}" ;; esac
   path="${path%%\?*}"
   if [ "$path" = graphql ]; then graphql "$fields" "$jqx"; return; fi
+  if [ "$path" = "repos/$REPO" ]; then
+    [ "$method" = GET ] || unsupported "fake gh api: only GET repos/<repo> is modeled"
+    out="$(jq -cn --arg r "$REPO" --arg t "${FAKE_GH_OWNER_TYPE:-User}" \
+      '{full_name: $r, name: ($r | split("/")[1]), default_branch: "main", owner: {login: ($r | split("/")[0]), type: $t}}')"
+    if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+    return 0
+  fi
   case "$path" in "repos/$REPO/"*) path="${path#"repos/$REPO/"}" ;; *) http_err 404 "Not Found" ;; esac
   case "$path" in
     branches/*/protection|rulesets|rulesets/*) settings "$method" "$path" "$fields" "$jqx"; return ;;
+    environments/*) environments "$method" "$path" "$fields" "$jqx"; return ;;
+    collaborators/*/permission)
+      [ "$method" = GET ] || unsupported "fake gh api: only GET collaborators/<login>/permission is modeled"
+      local who="${path#collaborators/}"; who="${who%/permission}"
+      out="$(jq -c --arg u "$who" --arg owner "${REPO%%/*}" '(.collaborators // []) as $c | (.removed_collaborators // []) as $gone
+        | (if $u == $owner then "admin" elif ($u | IN($c[])) and (($u | IN($gone[])) | not) then "write" else "read" end) as $p
+        | {permission: $p, role_name: $p, user: {login: $u}}' "${FAKE_GH_ISSUES:?fake gh api collaborators needs FAKE_GH_ISSUES}")"
+      if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+      return 0 ;;
+    pulls/*/reviews)
+      [ "$method" = GET ] || unsupported "fake gh api: only GET pulls/<n>/reviews is modeled"
+      local rn="${path#pulls/}"; rn="${rn%/reviews}"
+      [[ "$rn" =~ ^[0-9]+$ ]] && jq -e --argjson n "$rn" 'any((.pulls // [])[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
+        http_err 404 "Not Found"
+      out="$(jq -c --argjson n "$rn" --arg owner "${REPO%%/*}" '(.collaborators // []) as $c
+        | .pulls[] | select(.number == $n) | (.headRefOid // "") as $h
+        | [(.reviews // []) | to_entries[] | .key as $i | .value
+           | {id: ($n * 1000 + $i + 1), user: {login: .author.login}, state, commit_id: (.commit.oid // $h),
+              submitted_at: (.submittedAt // null),
+              author_association: (if .author.login == $owner then "OWNER" elif (.author.login | IN($c[])) then "COLLABORATOR" else "NONE" end)}]' \
+        "$FAKE_GH_ISSUES")"
+      if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+      return 0 ;;
     collaborators/*)
       [ "$method" = DELETE ] || unsupported "fake gh api: only DELETE collaborators/<login> is modeled"
       : "${FAKE_GH_ISSUES:?fake gh api collaborators needs FAKE_GH_ISSUES}"
@@ -226,6 +264,19 @@ api() {
              GIT_COMMITTER_EMAIL="$ME@fake" GIT_AUTHOR_DATE="$(server_date)" GIT_COMMITTER_DATE="$(server_date)" \
              g commit-tree "$tree" "${pargs[@]}")"
       out="$(commit_json "$sha")" ;;
+    "POST git/trees")
+      # Top-level blobs from `content` only (no base_tree, no nested path): what --bootstrap sends.
+      [ "$(jq -r '.base_tree // empty' <<<"$fields")" = "" ] || unsupported "fake gh api: POST git/trees with base_tree is not modeled"
+      local ent blob mk=""
+      while IFS= read -r ent; do
+        [ -n "$ent" ] || continue
+        [[ "$(jq -r .path <<<"$ent")" =~ ^[^/]+$ ]] || unsupported "fake gh api: POST git/trees with a nested path is not modeled"
+        [ "$(jq -r '.mode + " " + .type' <<<"$ent")" = "100644 blob" ] || http_err 422 "Invalid tree entry"
+        blob="$(jq -j .content <<<"$ent" | g hash-object -w --stdin)"
+        mk+="$(printf '100644 blob %s\t%s' "$blob" "$(jq -r .path <<<"$ent")")"$'\n'
+      done < <(jq -c '.tree // [] | .[]' <<<"$fields")
+      tree="$(printf '%s' "$mk" | g mktree)"
+      out="$(jq -n --arg t "$tree" '{sha: $t}')" ;;
     "POST git/refs")
       ref="$(f ref)"; sha="$(f sha)"
       [[ "$ref" =~ ^refs/[^/]+/.+ ]] || http_err 422 "Reference name is invalid"
@@ -312,6 +363,45 @@ RULE_TYPES='["creation","update","deletion","required_linear_history","merge_que
   "commit_author_email_pattern","committer_email_pattern","branch_name_pattern","tag_name_pattern",
   "file_path_restriction","max_file_path_length","file_extension_restriction","max_file_size","workflows",
   "code_scanning","copilot_code_review"]'
+
+# environments <method> <path below repos/R/> <body-json> <jq> (specs/factory-step3-v1 TB10): the
+# .environments object of FAKE_GH_SETTINGS, {<name>: {deployment_branch_policy, branch_policies: [{id,
+# name, type}]}}. GET environments/<name> (404 unknown), PUT environments/<name> (creates or sets
+# deployment_branch_policy), GET and POST environments/<name>/deployment-branch-policies (404 for an
+# unknown environment; POST 422 for a policy name it holds, or when custom_branch_policies is not on).
+environments() {
+  : "${FAKE_GH_SETTINGS:?fake gh api needs FAKE_GH_SETTINGS for environments}"
+  local method="$1" path="$2" body="$3" jqx="$4" out="" name sub="" tmp
+  name="${path#environments/}"
+  case "$name" in */*) sub="${name#*/}"; name="${name%%/*}" ;; esac
+  [ -s "$FAKE_GH_SETTINGS" ] || echo '{}' >"$FAKE_GH_SETTINGS"
+  local has; has="$(jq --arg n "$name" '(.environments // {}) | has($n)' "$FAKE_GH_SETTINGS")"
+  case "$method $sub" in
+    "GET ")
+      [ "$has" = true ] || http_err 404 "Not Found"
+      out="$(jq -c --arg n "$name" '.environments[$n] | {name: $n, deployment_branch_policy, protection_rules: []}' "$FAKE_GH_SETTINGS")" ;;
+    "PUT ")
+      tmp="$(jq -c --arg n "$name" --argjson b "$body" '.environments[$n] = ((.environments[$n] // {branch_policies: []})
+        + {deployment_branch_policy: ($b.deployment_branch_policy // null)})' "$FAKE_GH_SETTINGS")"
+      printf '%s\n' "$tmp" >"$FAKE_GH_SETTINGS"
+      out="$(jq -c --arg n "$name" '.environments[$n] | {name: $n, deployment_branch_policy}' "$FAKE_GH_SETTINGS")" ;;
+    "GET deployment-branch-policies")
+      [ "$has" = true ] || http_err 404 "Not Found"
+      out="$(jq -c --arg n "$name" '.environments[$n].branch_policies // [] | {total_count: length, branch_policies: .}' "$FAKE_GH_SETTINGS")" ;;
+    "POST deployment-branch-policies")
+      [ "$has" = true ] || http_err 404 "Not Found"
+      jq -e --arg n "$name" '.environments[$n].deployment_branch_policy.custom_branch_policies == true' "$FAKE_GH_SETTINGS" >/dev/null ||
+        http_err 422 "Validation Failed"
+      jq -e --arg n "$name" --argjson b "$body" 'any(.environments[$n].branch_policies[]?; .name == $b.name)' "$FAKE_GH_SETTINGS" >/dev/null &&
+        http_err 422 "Validation Failed"
+      tmp="$(jq -c --arg n "$name" --argjson b "$body" '.environments[$n].branch_policies += [{id: ((.environments[$n].branch_policies | length) + 1),
+        name: $b.name, type: ($b.type // "branch_policy")}]' "$FAKE_GH_SETTINGS")"
+      printf '%s\n' "$tmp" >"$FAKE_GH_SETTINGS"
+      out="$(jq -c --arg n "$name" '.environments[$n].branch_policies[-1]' "$FAKE_GH_SETTINGS")" ;;
+    *) unsupported "fake gh api: $method environments/$name${sub:+/$sub} is not modeled" ;;
+  esac
+  if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+}
 
 settings() {  # settings <method> <path below repos/R/> <body-json> <jq>
   : "${FAKE_GH_SETTINGS:?fake gh api needs FAKE_GH_SETTINGS for protection and rulesets}"
@@ -665,7 +755,10 @@ forms() {
     "api POST git/refs" "api PATCH git/refs/*" "api DELETE git/refs/*" \
     "api GET branches/*/protection" "api PUT branches/*/protection" "api DELETE branches/*/protection" \
     "api GET rulesets" "api GET rulesets/*" "api POST rulesets" "api PUT rulesets/*" "api DELETE collaborators/*" \
-    "api GET pulls/*" "api GET actions/runs" "api GET actions/runs/*/jobs" "api POST actions/jobs/*/rerun"
+    "api GET pulls/*" "api GET actions/runs" "api GET actions/runs/*/jobs" "api POST actions/jobs/*/rerun" \
+    "api GET repos/<repo>" "api GET collaborators/*/permission" "api GET pulls/*/reviews" "api POST git/trees" \
+    "api GET environments/*" "api PUT environments/*" "api GET environments/*/deployment-branch-policies" \
+    "api POST environments/*/deployment-branch-policies"
 }
 
 case "${1:-}" in

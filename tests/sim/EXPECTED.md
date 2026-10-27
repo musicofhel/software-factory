@@ -29,7 +29,7 @@ not model.
 | stage | expected |
 |---|---|
 | world.seed | pass |
-| janitor.no-nodes | red: ci:G22 — janitor.sh dies on a missing `nodes` branch (the branch itself is kit: merge:G15) |
+| janitor.no-nodes | pass |
 | desk.write | pass |
 | push.mirror | pass |
 | P.mirror-ready | pass |
@@ -56,8 +56,10 @@ not model.
 | P.pr.depends-on | pass |
 | P.pr.tier-order | pass |
 | P.pr.desk | pass |
+| P.pr.owners | pass |
+| P.pr.halt-guard | pass |
 | P.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
-| P.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
+| P.pr.required-checks | pass |
 | P.hold | pass |
 | P.tier-order | pass |
 | P.enqueue | pass |
@@ -66,11 +68,13 @@ not model.
 | P.q.rails-proof | pass |
 | P.q.scope | pass |
 | P.q.tamper | pass |
-| P.q.dependencies | red: ci:G1 — `if: pull_request` skips it on the queue path (a called workflow sees the caller's event), so a required check never runs there (I18, TB10) |
+| P.q.dependencies | pass |
 | P.q.commit-check | pass |
 | P.q.depends-on | pass |
 | P.q.tier-order | pass |
 | P.q.desk | pass |
+| P.q.owners | pass |
+| P.q.halt-guard | pass |
 | P.q.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built`; GitHub's view of it is the sim's labeled stand-in (TB11) |
 | P.q.identity | pass |
 | P.merge | pass |
@@ -100,8 +104,10 @@ not model.
 | C.pr.depends-on | pass |
 | C.pr.tier-order | pass |
 | C.pr.desk | pass |
+| C.pr.owners | pass |
+| C.pr.halt-guard | pass |
 | C.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
-| C.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
+| C.pr.required-checks | pass |
 | C.hold | pass |
 | C.tier-order | pass |
 | C.enqueue | pass |
@@ -110,11 +116,13 @@ not model.
 | C.q.rails-proof | pass |
 | C.q.scope | pass |
 | C.q.tamper | pass |
-| C.q.dependencies | red: ci:G1 — `if: pull_request` skips it on the queue path (a called workflow sees the caller's event), so a required check never runs there (I18, TB10) |
+| C.q.dependencies | pass |
 | C.q.commit-check | pass |
 | C.q.depends-on | pass |
 | C.q.tier-order | pass |
 | C.q.desk | pass |
+| C.q.owners | pass |
+| C.q.halt-guard | pass |
 | C.q.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built`; GitHub's view of it is the sim's labeled stand-in (TB11) |
 | C.q.identity | pass |
 | C.merge | pass |
@@ -147,7 +155,7 @@ not model.
 | S.rebase-strike | pass |
 | S.queue-red | pass |
 | S.native-enqueue | pass |
-| S.native-merge | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id, so the merge group never reports green (TB10) |
+| S.native-merge | pass |
 | S.native-dequeue | pass |
 | S.foreign-trailer | pass |
 | S.foreign-trailer-refused | pass |
@@ -155,7 +163,8 @@ not model.
 | S.child-released | pass |
 | S.built-plus-claim | pass |
 | S.class-halt-add | pass |
-| S.halt-add | red: merge:G17 — adding HALT waits on `gates / <job>` contexts and one approval (TB10) |
+| S.halt-add | pass |
 | S.class-halt-remove | pass |
-| S.halt-remove | red: ci:G11 — no `halt-guard` job; one approval would do (TB10) |
+| S.halt-remove | pass |
+| S.halt-remove-two | pass |
 | gh.forms | pass |

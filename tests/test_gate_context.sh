@@ -482,14 +482,14 @@ case_gates_yml_base_scripts() {
   # Every run: step that calls a factory/bin script calls the base's copy, ./.base/factory/bin/...
   bad="$(yq -r '.jobs[].steps[] | select(has("run")) | .run' "$wf" | grep -E 'factory/bin/' | grep -vE '(^|[ ;&|])\./\.base/factory/bin/' || true)"
   check "no gate step runs the head's factory/bin" eq "$bad" ""
-  check "context, rails-proof, scope, tamper, commit-check, attest-verify, build-test (T24), desk (T26), depends-on and tier-order (T27) run a base script" \
+  check "context, rails-proof, scope, tamper, commit-check, attest-verify, build-test (T24), desk (T26), depends-on and tier-order (T27), owners and halt-guard (T29) run a base script" \
     eq "$(yq -r '.jobs | to_entries[] | select([.value.steps[] | select(has("run")) | .run] | join(" ") | test("\\./\\.base/factory/bin/")) | .key' "$wf" | sort | tr '\n' ' ')" \
-       "attest-verify build-test commit-check context depends-on desk rails-proof scope tamper tier-order "
+       "attest-verify build-test commit-check context depends-on desk halt-guard owners rails-proof scope tamper tier-order "
   # Each such job: the head (full history) checked out first, then the base into .base.
   local j
-  for j in context rails-proof scope tamper commit-check attest-verify build-test desk depends-on tier-order; do
+  for j in context rails-proof scope tamper commit-check attest-verify build-test desk depends-on tier-order owners halt-guard; do
     check "$j: checkout head (fetch-depth 0), then base into .base" \
-      eq "$(yq -o=json -I=0 ".jobs[\"$j\"].steps | map(select(.uses == \"actions/checkout@v4\") | .with)" "$wf")" \
+      eq "$(yq -o=json -I=0 ".jobs[\"$j\"].steps | map(select((.uses // \"\") | test(\"^actions/checkout@\")) | .with)" "$wf")" \
          '[{"ref":"${{ env.GATE_HEAD }}","fetch-depth":0},{"ref":"${{ env.GATE_BASE }}","path":".base"}]'
     check "$j: no if: (it reports on pull_request and merge_group)" eq "$(yq -r ".jobs[\"$j\"] | has(\"if\")" "$wf")" false
   done

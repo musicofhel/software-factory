@@ -273,9 +273,9 @@ case_gates_yml_tamper() {
   pin="$(bash -c '. "$1"; echo "$DG_TAMPERGUARD_PIN"' _ "$BIN/lib/diff-gates.sh")"
   py="$(bash -c '. "$1"; echo "$DG_TAMPERGUARD_PYTHON"' _ "$BIN/lib/diff-gates.sh")"
   check "tamper: checkout head (fetch-depth 0), then base into .base" \
-    eq "$(yq -o=json -I=0 '.jobs.tamper.steps | map(select(.uses == "actions/checkout@v4") | .with)' "$wf")" \
+    eq "$(yq -o=json -I=0 '.jobs.tamper.steps | map(select((.uses // "") | test("^actions/checkout@")) | .with)' "$wf")" \
        '[{"ref":"${{ env.GATE_HEAD }}","fetch-depth":0},{"ref":"${{ env.GATE_BASE }}","path":".base"}]'
-  check "tamper: setup-python is the node's minor ($py)" eq "$(yq -r '.jobs.tamper.steps[] | select(.uses == "actions/setup-python@v5") | .with."python-version"' "$wf")" "$py"
+  check "tamper: setup-python is the node's minor ($py)" eq "$(yq -r '.jobs.tamper.steps[] | select((.uses // "") | test("^actions/setup-python@")) | .with."python-version"' "$wf")" "$py"
   check "tamper: pipx installs tamperguard==$pin on python$py" \
     eq "$(yq -r '.jobs.tamper.steps[] | select(has("run")) | .run' "$wf" | grep -c "^pipx install --python python$py tamperguard==$pin\$")" 1
   check "tamper: runs the base's tamper-check.sh" \

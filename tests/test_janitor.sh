@@ -720,6 +720,81 @@ lock 6 gamma $((NOW - H))"
   check "no release line" eq "$(lines '.action == "release-lock"')" 0
 }
 
+# ci:G22 (T29): a remote with no nodes branch (a fresh repo before --bootstrap) reads as empty. The
+# lock work still runs; the branch is created only when there is a file to write, as a parentless
+# commit. With no state on the remote every successful --apply has one: janitor/state.json (STATE is
+# null, so the ready duty always recomputes and saves the sets).
+case_no_nodes_branch() {
+  jan_setup <<EOF
+lock 90 alpha $((NOW - H))
+lock 91 alpha $((NOW - 25 * H))
+lock 92 alpha $((NOW - H))
+EOF
+  for n in 90 91 92; do fakegh_issue "$n" "$((NOW - 3 * D))" ready,in-progress; done
+  fakegh_close 90
+  git -C "$FAKE_GH_GIT" update-ref -d refs/heads/nodes
+  check "the fixture: the origin has no nodes branch" no_ref refs/heads/nodes
+  local before; before="$(snapshot)"
+  jan
+  check "dry run: exit 0" eq "$RC" 0
+  check "dry run: the warning on stderr" eval '[[ "$ERR" == *"origin has no nodes branch: read as empty"* ]]'
+  check "dry run: the locks are planned (issue-closed, stale-lock), the fresh one held" \
+    eq "$(pick '.action | test("lock")' 'map([.action, .issue, .reason, .result])')" \
+       '[["release-lock",90,"issue-closed","planned"],["release-lock",91,"stale-lock","planned"]]'
+  check "dry run: the ready duty reads no previous state" eq "$(pick '.action == "ready-recompute"' 'map([.previous, .result])')" '[[null,"planned"]]'
+  check "dry run: no nodes-commit line, nothing changed" \
+    eval '[ "$(lines ".action == \"nodes-commit\"")" = 0 ] && [ "$(snapshot)" = "$before" ]'
+  # Nothing to write on the nodes branch: the mirror fails, so the sets are not saved (exit 1 for that).
+  FAKE_MIRROR_FAIL=1 jan --apply
+  check "nothing to write: exit 1 from the mirror only, the warning on stderr" \
+    eval '[ "$RC" = 1 ] && [[ "$ERR" == *"has no nodes branch: read as empty"* ]] && [ "$(pick ".result == \"failed\"" "map(.action)")" = "[\"ready-recompute\"]" ]'
+  check "nothing to write: the locks are released anyway" \
+    eq "$(pick '.action == "release-lock"' 'map([.issue, .reason, .result])')" '[[90,"issue-closed","done"],[91,"stale-lock","done"]]'
+  check "nothing to write: refs gone, the fresh lock kept" \
+    eval 'no_ref refs/locks/issue-90 && no_ref refs/locks/issue-91 && has_ref refs/locks/issue-92'
+  check "nothing to write: no nodes branch created, no nodes-commit line" \
+    eval 'no_ref refs/heads/nodes && [ "$(lines ".action == \"nodes-commit\"")" = 0 ]'
+  jan --apply
+  check "state to write: exit 0, recomputed and committed" \
+    eq "$RC $(pick '.action | test("ready|nodes")' 'map([.action, .files, .result])')" \
+       '0 [["ready-recompute",null,"done"],["nodes-commit",{"janitor/state.json":"A"},"done"]]'
+  check "the nodes branch is created as a parentless commit" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-list --parents -n1 nodes | wc -w | tr -d ' ')" 1
+  check "holding janitor/state.json only, the sets saved" \
+    eq "$(git -C "$FAKE_GH_GIT" ls-tree -r --name-only nodes) $(on_nodes janitor/state.json | jq -c '[.open_set, .in_review]')" \
+       'janitor/state.json [[],[]]'
+  jan --apply
+  check "the next run: the branch is read, no warning, nothing to do" \
+    eval '[ "$RC" = 0 ] && [ -z "$OUT" ] && [[ "$ERR" != *"no nodes branch"* ]]'
+}
+
+# Only a missing nodes branch reads as empty: an unreachable remote, or a ref listing that fails after
+# the fetch, is exit 1, never 0, and writes nothing.
+case_unreachable_remote() {
+  jan_setup <<EOF
+lock 93 alpha $((NOW - 25 * H))
+EOF
+  fakegh_issue 93 "$((NOW - 3 * D))" ready,in-progress
+  local before; before="$(git -C "$FAKE_GH_GIT" for-each-ref)"
+  git -C "$WORLD/ci" remote set-url origin "$WORLD/missing.git"
+  jan
+  check "missing remote, dry run: exit 1" eq "$RC" 1
+  jan --apply
+  check "missing remote, --apply: exit 1, no action line" eval '[ "$RC" = 1 ] && [ -z "$OUT" ]'
+  check "the error names the fetch" eval '[[ "$ERR" == *"cannot fetch origin"* ]]'
+  git -C "$WORLD/ci" remote set-url origin "$FAKE_GH_GIT"
+  # The fetch succeeds, then the remote goes away before the nodes ls-remote (not exit 2: a failure).
+  printf '#!/usr/bin/env bash\n[ "$1" = committed ] || exit 0\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\nif grep -q refs/janitor/locks/issue-93 && [ ! -e "%s/gone" ]; then\n  touch "%s/gone"; git -C "%s/ci" remote set-url origin "%s/missing.git"\nfi\n' \
+    "$WORLD" "$WORLD" "$WORLD" "$WORLD" >"$WORLD/ci/.git/hooks/reference-transaction"
+  chmod +x "$WORLD/ci/.git/hooks/reference-transaction"
+  jan --apply
+  check "the remote went away after the fetch" test -e "$WORLD/gone"
+  check "ls-remote fails: exit 1, no action line, not read as empty" \
+    eval '[ "$RC" = 1 ] && [ -z "$OUT" ] && [[ "$ERR" == *"cannot list the refs of origin"* ]] && [[ "$ERR" != *"read as empty"* ]]'
+  check "nothing changed on the origin, no gh write" \
+    eval '[ "$(git -C "$FAKE_GH_GIT" for-each-ref)" = "$before" ] && [ "$(issue_writes)" = 0 ]'
+}
+
 # The fakes' new verbs: gh pr list, gh issue list state/body as gh answers them, adlc, mirror.
 case_fake_semantics() {
   fakegh_setup
@@ -756,7 +831,8 @@ case_fake_semantics() {
 echo "test_janitor"
 for c in stale-lock stale-node over-slots fresh-branch-kept no-pr-48h branch-sweep node-lifecycle preview-ttl \
          ready-recompute ready-open-only ready-all-completed held-pr-stale fork-pr-no-hold built-plus-new-claim \
-         issue-closed in-review-change-recomputes revoke-hook-wired dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
+         issue-closed in-review-change-recomputes revoke-hook-wired dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured \
+         no-nodes-branch unreachable-remote fake-semantics; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

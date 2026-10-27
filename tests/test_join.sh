@@ -7,7 +7,10 @@
 # is a merged-usr host unless a case says otherwise. T15: the reviewer pinned by npm integrity and
 # failing closed (case review-pin, AC1), the manifest's review field (case review-field, AC2), the
 # printed cux line and no credential in any argv join hands a tool (case cux-line, AC3). T24: a
-# fleet.gate running `make lint` needs a shellcheck under a system root (case lint-shellcheck).
+# fleet.gate running `make lint` needs a shellcheck under a system root (case lint-shellcheck). T29:
+# and an actionlint there too (case lint-actionlint); the token asks for Contents, Issues and Pull
+# requests write, and ~/.factory/env exports GH_TOKEN from the stored token (cases cux-line,
+# home-diff, review-field); tamperguard is installed on the CPython diff-gates.sh pins (case plan).
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -48,6 +51,18 @@ join_setup() {
            dirname basename id sleep readlink cut touch tar xz install ls stat ln; do
     ln -s "$(command -v "$t")" "$WORLD/sys/$t"
   done
+  # Real uv takes `uv tool install --python <v> <pkg>==<v>`; the multi-call fake knows no --python,
+  # so this wrapper records each requested interpreter in $WORLD/uv-python and hands the fake the rest.
+  rm "$WORLD/bin/uv"; mkdir -p "$WORLD/fakeuv"; ln -s "$MULTI" "$WORLD/fakeuv/uv"
+  command cat >"$WORLD/bin/uv" <<EOF
+#!/usr/bin/env bash
+a=()
+while [ \$# -gt 0 ]; do
+  case "\$1" in --python) printf '%s\n' "\$2" >>'$WORLD/uv-python'; shift 2 ;; *) a+=("\$1"); shift ;; esac
+done
+exec '$WORLD/fakeuv/uv' "\${a[@]}"
+EOF
+  chmod +x "$WORLD/bin/uv"
   JPATH="$WORLD/bin:$WORLD/tools:$WORLD/sys"
 }
 meminfo() {  # meminfo <total-GB> <free-GB> (decimals allowed): /proc/meminfo in kB
@@ -263,6 +278,7 @@ case_heavy_gates() {
   jn --handle node-a --json --suite-timeout-seconds 30
   check "a fast green suite: heavy_gates true" eq "$(jq -c '[.heavy_gates, .suite.exit, .suite.timed_out, .manifest.heavy_gates]' <<<"$OUT")" '[true,0,false,true]'
   local tmp
+  # shellcheck disable=SC2034  # read inside the eval'd check below
   tmp="$(jq -r 'select(.suite_tmpdir) | .suite_tmpdir' "$FAKE_JOIN_LOG")"
   check "the suite ran in the clone" eq "$(jq -r 'select(.suite_tmpdir) | .pwd' "$FAKE_JOIN_LOG")" "$WORLD/clone"
   check "with its own TMPDIR, removed after" eval '[ -n "$tmp" ] && [ ! -e "$tmp" ]'
@@ -290,7 +306,9 @@ case_plan() {
   local fh="$HOME/.factory"
   check "cargo installs under FACTORY_HOME, locked, at the pin" \
     eq "$(jq -r '.plan[] | select(.tool == "vetto") | .commands[0]' <<<"$OUT")" "CARGO_HOME=$fh/cargo cargo install --locked --root $fh vetto@0.6.5"
-  check "uv installs under FACTORY_HOME" eval 'jq -r ".plan[] | select(.tool == \"tamperguard\") | .commands[0]" <<<"$OUT" | grep -q "UV_TOOL_BIN_DIR=$fh/bin .* uv tool install tamperguard==0.2.0$"'
+  check "uv installs under FACTORY_HOME, on CPython 3.14" eval 'jq -r ".plan[] | select(.tool == \"tamperguard\") | .commands[0]" <<<"$OUT" | grep -q "UV_TOOL_BIN_DIR=$fh/bin .* uv tool install --python 3\.14 tamperguard==0\.2\.0$"'
+  check "  3.14 is diff-gates.sh's DG_TAMPERGUARD_PYTHON (CI's minor)" \
+    eq "$(sed -n 's/^DG_TAMPERGUARD_PYTHON=//p' "$BIN/lib/diff-gates.sh")" 3.14
   check "dcg: the musl asset, the pinned sha256" eval 'jq -r ".plan[] | select(.tool == \"dcg\") | .commands[0]" <<<"$OUT" | grep -q "dcg-x86_64-unknown-linux-musl.tar.xz.*dc7dcec9679f74ac3e6990959771ca0c84168eba658eff64fe9e63f917a84cc4"'
   check "cux: the pinned sha256" eval 'jq -r ".plan[] | select(.tool == \"cux\") | .commands[0]" <<<"$OUT" | grep -q "v0.4.1/cux-linux-amd64.*d336d1f8a6175265977f5a08ce53c20403e13752b90826df1128c29d89401df6"'
   check "no command uses sudo" eval '! jq -r ".plan[].commands[]" <<<"$OUT" | grep -q sudo'
@@ -326,6 +344,17 @@ case_home_diff() {
   check "apply: ~/.factory is 0700" eq "$(stat -c %a "$HOME/.factory")" 700
   check "apply: env puts ~/.factory/bin first and names the manifest" eval \
     'grep -q "^export PATH=$HOME/.factory/bin:\"\$PATH\"$" "$HOME/.factory/env" && grep -q "^export FACTORY_MANIFEST=$HOME/.factory/manifest.json$" "$HOME/.factory/env"'
+  local envf="$HOME/.factory/env" tokf="$HOME/.factory/token"
+  check "apply: env exports GH_TOKEN by reading the token file" \
+    grep -qxF "[ ! -r $(printf %q "$tokf") ] || export GH_TOKEN=\"\$(cat $(printf %q "$tokf"))\"" "$envf"
+  check "  the token itself is not in the env file" eval '! grep -q 11ABCDEFG0123456789 "$envf"'
+  check "  sourcing the env yields GH_TOKEN = the stored token" \
+    eq "$(env -u GH_TOKEN PATH="$JPATH" bash -c 'set -eu; . "$1"; printf %s "$GH_TOKEN"' _ "$envf")" github_pat_11ABCDEFG0123456789_abcdefghijklmnop
+  mv "$tokf" "$WORLD/token.away"
+  check "  an unreadable token: sourcing still succeeds, GH_TOKEN unset" \
+    eq "$(env -u GH_TOKEN PATH="$JPATH" bash -c 'set -eu; . "$1"; printf %s "${GH_TOKEN-unset}"' _ "$envf")" unset
+  mv "$WORLD/token.away" "$tokf"
+  check "apply: tamperguard was installed on CPython 3.14" eq "$(command cat "$WORLD/uv-python")" 3.14
   check "apply: ~/.factory/manifest.json is valid" eval 'PATH="$JPATH" "$JOIN" --validate "$HOME/.factory/manifest.json" >/dev/null'
   check "apply: no tmp debris" eval '[ -z "$(ls -A "$HOME/.factory/tmp")" ]'
   export FAKE_SHA_MISMATCH=1
@@ -493,15 +522,21 @@ case_shim_prereqs() {
   check "macOS: no shim" eq "$(jq -c '.probe.sandbox.shim' <<<"$OUT")" null
 }
 
+sc() {  # sc <dir> <version>: a shellcheck there that reports the version
+  mkdir -p "$1"; printf '#!/usr/bin/env bash\nprintf "ShellCheck\\nversion: %s\\n"\n' "$2" >"$1/shellcheck"; chmod +x "$1/shellcheck"
+}
+al() {  # al <dir> <version|''>: an actionlint there whose -version prints the version first
+  mkdir -p "$1"; printf '#!/usr/bin/env bash\n[ "${1:-}" = -version ] || exit 2\nprintf "%%s\\ninstalled by downloading from release page\\n" %q\n' "$2" >"$1/actionlint"
+  chmod +x "$1/actionlint"
+}
+
 # T24: a clone whose fleet.gate runs `make lint` needs a shellcheck fleet's repo-command plane can
 # see, which binds only the system roots (records/TB5.md of specs/factory-step3-v1).
 case_lint_shellcheck() {
   join_setup; all_installed
   local cfg="$WORLD/clone/.adlc/config.json" usr="$WORLD/root/usr/bin" loc="$HOME/.local/bin" base="$JPATH"
   jq -n '{fleet: {gate: {build: "make lint", test: "make test"}}}' >"$cfg"
-  sc() {  # sc <dir> <version>: a shellcheck there that reports the version
-    mkdir -p "$1"; printf '#!/usr/bin/env bash\nprintf "ShellCheck\\nversion: %s\\n"\n' "$2" >"$1/shellcheck"; chmod +x "$1/shellcheck"
-  }
+  al "$usr" 1.7.12   # make lint's other tool, at its pin in the plane: this case is about shellcheck
   jn --handle node-a --no-suite --json
   check "make lint, no shellcheck: refused with the install line, never run" \
     eq "$(jq -c '[.exit, .probe.lint.needed, .probe.lint.shellcheck, .probe.lint.in_plane]' <<<"$OUT")" '[2,true,null,false]'
@@ -547,6 +582,60 @@ case_lint_shellcheck() {
   jq -n '{fleet: {gate: {build: "make lint-docs"}}}' >"$cfg"
   jn --handle node-a --no-suite --json
   check "make lint-docs is not make lint" eq "$(jq -c '.probe.lint.needed' <<<"$OUT")" false
+}
+
+# T29: make lint also requires actionlint (ci:G18), so a fleet.gate running it needs one under a
+# system root, the same rule as shellcheck; the install line is printed, never run.
+case_lint_actionlint() {
+  join_setup; all_installed
+  local cfg="$WORLD/clone/.adlc/config.json" usr="$WORLD/root/usr/bin" loc="$HOME/.local/bin" base="$JPATH" sha tgz install
+  sha="$(sed -n 's/^ACTIONLINT_SHA256_LINUX_AMD64=//p' "$JOIN")" tgz=actionlint_1.7.12_linux_amd64.tar.gz
+  install="curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/$tgz && echo '$sha  $tgz' | sha256sum -c - && sudo tar -xzf $tgz -C /usr/local/bin actionlint"
+  jq -n '{fleet: {gate: {build: "make lint", test: "make test"}}}' >"$cfg"
+  sc "$usr" 0.11.0; JPATH="$usr:$base"
+  check "join pins actionlint 1.7.12 and a 64-hex sha256" eq "$(sed -n 's/^ACTIONLINT_PIN=//p' "$JOIN") ${#sha}" "1.7.12 64"
+  jn --handle node-a --no-suite --json
+  check "make lint, no actionlint: refused with the install line, the only refusal" \
+    eq "$(jq -c '[.exit, .refusals]' <<<"$OUT")" "$(jq -cn --arg i "$install" '[2, ["fleet.gate runs make lint, which needs actionlint, and none is on PATH. Install: \($i)"]]')"
+  check "  join ran no install (no curl, no sudo, no tar)" eval '! jq -e "select(.tool | IN(\"curl\",\"sudo\",\"tar\"))" "$FAKE_JOIN_LOG" >/dev/null'
+  FAKE_UNAME_M=aarch64 jn --handle node-a --no-suite --json
+  check "  another arch: the release binary named, no amd64 sha" eval \
+    'jq -e ".refusals == [\"fleet.gate runs make lint, which needs actionlint, and none is on PATH. Install: the actionlint 1.7.12 release binary for aarch64 from https://github.com/rhysd/actionlint/releases, under /usr/local/bin\"]" <<<"$OUT" >/dev/null'
+
+  al "$loc" 1.7.12; JPATH="$loc:$usr:$base"
+  jn --handle node-a --no-suite --json
+  check "only under ~/.local: refused, not visible in fleet's sandbox" \
+    eq "$(jq -c '[.exit, (.refusals | length)]' <<<"$OUT")" '[2,1]'
+  check "  the refusal says why and prints the install line" eval \
+    'jq -e --arg i "$install" ".refusals[0] | startswith(\"actionlint at $loc/actionlint is not visible in fleet'"'"'s sandbox\") and endswith(\"Install: \" + \$i)" <<<"$OUT" >/dev/null'
+
+  ln -s "$loc/actionlint" "$usr/actionlint"
+  jn --handle node-a --no-suite --json
+  check "a link under /usr into ~/.local: still refused (its real path is outside the plane)" eval \
+    '[ "$RC" = 2 ] && jq -e ".refusals == [] | not" <<<"$OUT" >/dev/null && jq -e ".refusals[0] | startswith(\"actionlint at $loc/actionlint is not visible\")" <<<"$OUT" >/dev/null'
+  rm "$usr/actionlint"
+
+  al "$usr" 1.7.12
+  jn --handle node-a --no-suite --json
+  check "$HOME/.local first, the pin under \$ROOT/usr/bin too: ok, no refusal, no warning" \
+    eq "$(jq -c '[.exit, .refusals, .warnings]' <<<"$OUT")" '[0,[],[]]'
+
+  al "$usr" 1.7.11
+  jn --handle node-a --no-suite --json
+  check "another version under /usr: ok, one warning names the pin" \
+    eq "$(jq -c '[.exit, .refusals, .warnings]' <<<"$OUT")" '[0,[],["actionlint 1.7.11 is not the pin 1.7.12 (CI'"'"'s, gates.yml build-test): make lint may report differently on this node and in CI"]]'
+  check "  the pin is the one gates.yml installs" \
+    grep -qF "actionlint-py==$(sed -n 's/^ACTIONLINT_PIN=//p' "$JOIN").24" "$REPO_ROOT/.github/workflows/gates.yml"
+  al "$usr" ''
+  jn --handle node-a --no-suite --json
+  check "a version it cannot read: ok, warned as unknown" \
+    eq "$(jq -c '[.exit, (.warnings | length), (.warnings[0] | startswith("actionlint of unknown version is not the pin 1.7.12"))]' <<<"$OUT")" '[0,1,true]'
+
+  rm -f "$usr/actionlint" "$loc/actionlint"
+  jq -n '{fleet: {gate: {test: "bash tests/test_hello.sh"}}}' >"$cfg"
+  jn --handle node-a --no-suite --json
+  check "a gate without make lint: no actionlint needed, no refusal" \
+    eq "$(jq -c '[.exit, .probe.lint.needed, .refusals, .warnings]' <<<"$OUT")" '[0,false,[],[]]'
 }
 
 case_review_pin() {
@@ -639,6 +728,8 @@ case_review_field() {
     eq "$(jq -c .review "$WORLD/pushed.json")" '{"tool":"adversarial-review","pin":"2.11.1","same_family":true}'
   check "  and validates against the schema" eval 'PATH="$JPATH" "$JOIN" --validate "$WORLD/pushed.json" >/dev/null'
   check "the schema's review pin is join's pin" eq "$(sed -n 's/^ADV_VERSION=//p' "$JOIN")" "$(jq -r .review.pin "$WORLD/pushed.json")"
+  check "no token stored: the env file has no GH_TOKEN line" eval \
+    '[ ! -e "$HOME/.factory/token" ] && grep -q "^export FACTORY_HANDLE=node-a$" "$HOME/.factory/env" && ! grep -q GH_TOKEN "$HOME/.factory/env"'
 }
 
 case_cux_line() {
@@ -652,9 +743,13 @@ case_cux_line() {
      grep -qF "Why: the run loop'"'"'s governor (factory/bin/lib/governor.sh) reads \`cux usage show\` before every claim and never claims on an unknown reading: with no cux account every slot sleeps 10 minutes" <<<"$OUT" &&
      grep -qF -- "--no-alias: the factory counts accounts and never names them" <<<"$OUT"'
   check "  it sits in step 3, before the manifest" eval 'sed -n "/^== 3\/5/,/^== 4\/5/p" <<<"$OUT" | grep -qF "cux add --no-alias"'
+  check "the token line asks for Contents, Issues and Pull requests write" \
+    grep -qF "     Repository access: only test/repo. Repository permissions: Contents, Issues and Pull requests read and write (Metadata read is added)." <<<"$OUT"
   jn --handle node-a --no-suite --json
   check "--json: register.quota carries the exact command" \
     eq "$(jq -c '.register.quota | [.command, .after, .run_by]' <<<"$OUT")" "[\"cux add --no-alias\",\". $fh/env\",\"owner\"]"
+  check "--json: register.token.permissions, exactly" eq "$(jq -c .register.token.permissions <<<"$OUT")" \
+    '{"contents":"read and write","issues":"read and write","pull_requests":"read and write","metadata":"read"}'
   check "  the sleep it names is budget.json's" eval \
     'jq -r .register.quota.why <<<"$OUT" | grep -qF "sleeps $(jq .governor.unknownStateSleepMinutes "$REPO_ROOT/factory/policy/budget.json") minutes"'
 
@@ -675,7 +770,7 @@ case_cux_line() {
 
 for c in dry-run-ok slots refuse-no-sandbox refuse-macos-sandbox refuse-skip-permissions-rc \
          refuse-skip-permissions-settings refuse-no-adapter refuse-schema refuse-other heavy-gates plan \
-         home-diff nodes-cas no-nodes-branch validator usage shim-prereqs lint-shellcheck review-pin review-field cux-line; do
+         home-diff nodes-cas no-nodes-branch validator usage shim-prereqs lint-shellcheck lint-actionlint review-pin review-field cux-line; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

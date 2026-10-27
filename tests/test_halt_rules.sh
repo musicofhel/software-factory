@@ -4,15 +4,27 @@
 # sends no write; --apply sends them; a second --apply sends nothing. Every rule on main is a rule
 # of ruleset `main`; classic protection is empty, and one found on GitHub is deleted. Plus the
 # fake's own protection/ruleset semantics.
+# TB10 (ticket T29) adds: the policy requires the bare gates.yml job ids with integration_id 15368, and
+# --check (I18) proves the set equals the jobs that report on both paths, failing on a missing, extra or
+# needs-unrequired job; merge_queue is sent only on an organization-owned repo; --bootstrap creates the
+# nodes and flaky-history orphan branches and environment `main`; every job reading FACTORY_APP_KEY runs
+# in environment `main`, and every remote action is pinned by commit sha with its tag in a comment.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
 
-POLICY="$REPO_ROOT/factory/policy/branch-protection.json"
+# I15: this ticket may not edit factory/policy/**. The new policy is a desk note the desk copies over
+# main's file; while main still holds the pre-note file (that exact sha256), the cases read the note.
+MAIN_POLICY="$REPO_ROOT/factory/policy/branch-protection.json"
+NOTE="$REPO_ROOT/tests/sim/desk/factory/policy/branch-protection.json"
+PRE_NOTE_SHA=ae2cc39516e1071e1b38434e7c473a3331debb51a503e948fb17b0063d4a5c54
+if [ "$(sha256sum "$MAIN_POLICY" | cut -d' ' -f1)" = "$PRE_NOTE_SHA" ]; then PRE_NOTE=1 POLICY="$NOTE"; else PRE_NOTE=0 POLICY="$MAIN_POLICY"; fi
+GATES="$REPO_ROOT/.github/workflows/gates.yml"
+unset FAKE_GH_OWNER_TYPE  # the fake's default (User) unless a case says otherwise
 WRITES='.[0] == "api" and (index("PUT") or index("POST") or index("PATCH") or index("DELETE"))'
-abp() {  # abp <args>: sets RC, OUT, ERR
+abp() {  # abp <args>: sets RC, OUT, ERR; runs on $POLICY unless the args name another --policy (the last wins)
   RC=0
-  OUT="$("$BIN/apply-branch-protection.sh" "$@" 2>"$WORLD/err")" || RC=$?
+  OUT="$("$BIN/apply-branch-protection.sh" --policy "$POLICY" "$@" 2>"$WORLD/err")" || RC=$?
   # shellcheck disable=SC2034  # ERR is read inside the eval strings passed to check
   ERR="$(command cat "$WORLD/err")"
 }
@@ -83,15 +95,22 @@ case_dry_run_prints_calls() {
   local rs; rs="$(body_of 'POST repos/test/repo/rulesets')"
   check "the POST is ruleset main, on refs/heads/main, active" \
     eq "$(jq -c '[.name, .target, .enforcement, .conditions.ref_name.include]' <<<"$rs")" '["main","branch","active",["refs/heads/main"]]'
-  check "it carries the moved rules: deletion, non_fast_forward, pull_request, required_status_checks, and the merge queue" \
-    eq "$(jq -c '[.rules[].type]' <<<"$rs")" '["deletion","non_fast_forward","pull_request","required_status_checks","merge_queue"]'
-  check "pull_request: one approval, code-owner review, stale reviews dismissed" \
+  check "it carries the moved rules: deletion, non_fast_forward, pull_request, required_status_checks (no merge queue on a user-owned repo)" \
+    eq "$(jq -c '[.rules[].type]' <<<"$rs")" '["deletion","non_fast_forward","pull_request","required_status_checks"]'
+  check "pull_request: no approval count, code-owner review, stale reviews dismissed, last push approved, merge commits only" \
     eq "$(jq -c '.rules[] | select(.type == "pull_request") | .parameters
-                 | [.required_approving_review_count, .require_code_owner_review, .dismiss_stale_reviews_on_push]' <<<"$rs")" '[1,true,true]'
-  check "required_status_checks: the seven gates, strict" \
+                 | [.required_approving_review_count, .require_code_owner_review, .dismiss_stale_reviews_on_push,
+                    .require_last_push_approval, .allowed_merge_methods]' <<<"$rs")" '[0,true,true,true,["merge"]]'
+  # I18: the required set is --check's idea of the gates.yml jobs that report on both paths, and --check
+  # holds on this policy, so the list cannot drift from gates.yml unnoticed.
+  local i18; i18="$("$BIN/apply-branch-protection.sh" --check --policy "$POLICY" 2>/dev/null)"
+  check "--check holds on the policy under test" eq "$(jq -r .result <<<"$i18")" pass
+  check "required_status_checks: the bare gates.yml job ids that report on both paths, strict" \
     eq "$(jq -c '.rules[] | select(.type == "required_status_checks") | .parameters
-                 | [.strict_required_status_checks_policy, [.required_status_checks[].context]]' <<<"$rs")" \
-       '[true,["gates / build-test","gates / rails-proof","gates / scope","gates / tamper","gates / dependencies","gates / attest-verify","gates / commit-check"]]'
+                 | [.strict_required_status_checks_policy, ([.required_status_checks[].context] | sort)]' <<<"$rs")" \
+       "$(jq -c '[true, (.both_paths | sort)]' <<<"$i18")"
+  check "... each from GitHub Actions (integration_id 15368)" \
+    eq "$(jq -c '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].integration_id] | unique' <<<"$rs")" '[15368]'
   check "no bypass actor (admins included)" eq "$(jq -c .bypass_actors <<<"$rs")" '[]'
   check "no _comment or _halt key is sent" eq "$(jq '[.. | objects | keys[] | select(startswith("_"))] | length' <<<"$rs")" 0
   check "names the rule GitHub cannot express, and its ADR" \
@@ -100,9 +119,10 @@ case_dry_run_prints_calls() {
   # what --apply makes.
   grep '^gh api ' <<<"$OUT" | bash >/dev/null
   check "the printed commands, run by hand, leave classic protection empty" eq "$(jq -c '.protection' "$FAKE_GH_SETTINGS")" '{}'
-  check "... and create the rulesets (without _ keys)" \
+  check "... and create the rulesets (without _ keys, without the merge queue)" \
     eq "$(jq -c '[.rulesets[] | del(.id)]' "$FAKE_GH_SETTINGS")" \
-       "$(jq -c '[.rulesets[] | walk(if type == "object" then with_entries(select(.key | startswith("_") | not)) else . end)]' "$POLICY")"
+       "$(jq -c '[.rulesets[] | walk(if type == "object" then with_entries(select(.key | startswith("_") | not)) else . end)
+                 | .rules |= map(select(.type != "merge_queue"))]' "$POLICY")"
   abp
   check "after the printed commands ran, the plan is all noop" eq "$(grep -c '^gh api ' <<<"$OUT" || true)" 0
 
@@ -232,7 +252,8 @@ case_refuses_made_up_fields() {
   FACTORY_APP_ID=987654 abp --policy "$bad"
   check "... and refused with FACTORY_APP_ID set (exit 2)" eq "$RC" 2
   check "... naming why" eval '[[ "$ERR" == *"keeps classic protection, which a ruleset bypass does not lift"* ]]'
-  check "the shipped policy itself is accepted" eval '"$BIN/apply-branch-protection.sh" >/dev/null 2>&1'
+  check "the policy under test is accepted" eval '"$BIN/apply-branch-protection.sh" --policy "$POLICY" >/dev/null 2>&1'
+  check "main's policy is accepted too" eval '"$BIN/apply-branch-protection.sh" --policy "$MAIN_POLICY" >/dev/null 2>&1'
 }
 
 case_read_errors_fail() {
@@ -298,9 +319,183 @@ case_app_bypass_actor() {
   check "App ID 0: exit 2" eq "$RC" 2
 }
 
+# TB10 (ticket T29): the policy names the I18 set. Main's file is either the pre-note file (the desk
+# has not landed the note yet) or one --check passes on, so this stays right after the desk copies it.
+need_yq() {  # --check and the workflow checks parse YAML with yq: missing, the case fails (never skips)
+  command -v yq >/dev/null 2>&1 && return 0
+  check "yq is on PATH" false
+  return 1
+}
+check_i18() {  # check_i18 <policy> [gates]: --check, sets RC, OUT (its JSON), ERR
+  RC=0
+  OUT="$("$BIN/apply-branch-protection.sh" --check --policy "$1" --gates "${2:-$GATES}" 2>"$WORLD/err")" || RC=$?
+  # shellcheck disable=SC2034  # ERR is read inside the eval strings passed to check
+  ERR="$(command cat "$WORLD/err")"
+}
+
+case_check_i18() {
+  fakegh_setup
+  need_yq || return 0
+  : >"$FAKE_GH_LOG"
+  check_i18 "$NOTE"
+  check "--check on the desk note: exit 0, pass, nothing missing or extra" \
+    eq "$RC:$(jq -c '[.result, .missing, .extra, .no_integration, .needs_unrequired]' <<<"$OUT")" '0:["pass",[],[],[],[]]'
+  check "... the required set is the both-paths set" eq "$(jq -c '(.required | sort) == (.both_paths | sort)' <<<"$OUT")" true
+  check "... and says so on stderr" eval '[[ "$ERR" == *"I18 holds"* ]]'
+  check "--check is offline: no gh call" eq "$(wc -l <"$FAKE_GH_LOG" | tr -d ' ')" 0
+  check "main's policy is the pre-note file or passes --check" \
+    eval '[ "$PRE_NOTE" = 1 ] || "$BIN/apply-branch-protection.sh" --check --policy "$MAIN_POLICY" >/dev/null 2>&1'
+  if [ "$PRE_NOTE" = 1 ]; then
+    check_i18 "$MAIN_POLICY"
+    check "--check on main's pre-note policy: exit 2, fail" eq "$RC:$(jq -r .result <<<"$OUT")" 2:fail
+    check "... its extra checks are the old \`gates / <job>\` contexts" \
+      eq "$(jq -c '[.extra[] | startswith("gates / ")] | (length > 0 and all)' <<<"$OUT")" true
+    check "... with no integration_id" eq "$(jq -c '.no_integration | length > 0' <<<"$OUT")" true
+    check "... and names them on stderr" eval '[[ "$ERR" == *"required check gates / "*"is no gates.yml job"* ]]'
+  fi
+}
+
+# --check fails when gates.yml and the policy part: a new both-paths job, a required job made
+# conditional, a required job needing an unrequired one.
+case_check_i18_drift() {
+  fakegh_setup
+  need_yq || return 0
+  local g="$WORLD/gates.yml" j
+  cp "$GATES" "$g"
+  check_i18 "$POLICY" "$g"
+  check "an unedited copy of gates.yml passes" eq "$RC:$(jq -r .result <<<"$OUT")" 0:pass
+  j="$(jq -r '.required[0]' <<<"$OUT")"
+
+  yq -i '.jobs.new-gate = {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}' "$g"
+  check_i18 "$POLICY" "$g"
+  check "a new job with no if: that the policy does not require: exit 2, missing" \
+    eq "$RC:$(jq -c '[.result, .missing, .extra]' <<<"$OUT")" '2:["fail",["new-gate"],[]]'
+  check "... named on stderr" eval '[[ "$ERR" == *"gates.yml job new-gate reports on both paths but is not required"* ]]'
+
+  cp "$GATES" "$g"
+  J="$j" yq -i '.jobs[strenv(J)].if = "github.event_name == '"'"'pull_request'"'"'"' "$g"
+  check_i18 "$POLICY" "$g"
+  check "a required job with a job-level if: exit 2, extra" \
+    eq "$RC:$(jq -c --arg j "$j" '[.result, .missing, .extra == [$j]]' <<<"$OUT")" '2:["fail",[],true]'
+
+  cp "$GATES" "$g"
+  J="$j" yq -i '.jobs.helper = {"runs-on": "ubuntu-latest", "if": "always()", "steps": [{"run": "true"}]}
+                | .jobs[strenv(J)].needs = ([.jobs[strenv(J)].needs // []] | flatten) + ["helper"]' "$g"
+  check_i18 "$POLICY" "$g"
+  check "a required job needing a job that is not required: exit 2, needs_unrequired" \
+    eq "$RC:$(jq -c --arg j "$j" '[.result, .missing, .extra, .needs_unrequired == ["\($j) needs helper"]]' <<<"$OUT")" '2:["fail",[],[],true]'
+  check "... named on stderr" eval '[[ "$ERR" == *"$j needs helper, which is not required"* ]]'
+}
+
+# Merge-queue settings are written only when native-queue: yes (an organization-owned repo).
+case_merge_queue_gated() {
+  fakegh_setup
+  check "the policy under test has a merge_queue rule" eq "$(jq '[.rulesets[].rules[] | select(.type == "merge_queue")] | length' "$POLICY")" 1
+  FAKE_GH_OWNER_TYPE=User abp
+  check "user-owned: the planned ruleset has no merge_queue rule" \
+    eq "$(body_of 'POST repos/test/repo/rulesets' | jq '[.rules[] | select(.type == "merge_queue")] | length')" 0
+  check "... and it is printed as skipped" \
+    eval 'grep -q "^# skipped: rule merge_queue of ruleset main, not sent: native-queue: no (the repo owner is a User" <<<"$OUT"'
+  FAKE_GH_OWNER_TYPE=User abp --json
+  check "... and listed in skipped_rules" eq "$(jq -c '[.skipped_rules[] | [.ruleset, .rule]]' <<<"$OUT")" '[["main","merge_queue"]]'
+  FAKE_GH_OWNER_TYPE=User abp --apply
+  check "... and --apply stores none" eq "$(jq '[.rulesets[].rules[] | select(.type == "merge_queue")] | length' "$FAKE_GH_SETTINGS")" 0
+
+  fakegh_setup
+  FAKE_GH_OWNER_TYPE=Organization abp --json
+  check "organization-owned: the merge_queue rule is planned, with the policy's parameters, none skipped" \
+    eq "$(jq -c '[.calls[] | select(.what == "ruleset main") | .body.rules[] | select(.type == "merge_queue") | .parameters] + [.skipped_rules]' <<<"$OUT")" \
+       "$(jq -c '[.rulesets[].rules[] | select(.type == "merge_queue") | .parameters] + [[]]' "$POLICY")"
+  FAKE_GH_OWNER_TYPE=Organization abp
+  check "... no skipped line" eq "$(grep -c '^# skipped:' <<<"$OUT" || true)" 0
+  FAKE_GH_OWNER_TYPE=Organization abp --apply
+  check "... and --apply sends it" eq "$RC:$(jq '[.rulesets[].rules[] | select(.type == "merge_queue")] | length' "$FAKE_GH_SETTINGS")" 0:1
+  : >"$FAKE_GH_LOG"
+  FAKE_GH_OWNER_TYPE=Organization abp --apply --json
+  check "... idempotent: a second --apply sends nothing" eq "$RC:$(fakegh_calls "$WRITES")" 0:0
+}
+
+# --bootstrap: a fresh repo's nodes and flaky-history branches and the App key's environment `main`.
+case_bootstrap() {
+  fakegh_setup
+  git -C "$FAKE_GH_GIT" update-ref -d refs/heads/nodes  # fakegh_setup seeds nodes; a fresh repo lacks it
+  : >"$FAKE_GH_LOG"
+  abp --bootstrap --json
+  check "dry run: exit 0, plans both branches, the environment and its branch policy" \
+    eq "$RC:$(jq -c '[.mode, [.bootstrap[] | [.action, .what]]]' <<<"$OUT")" \
+       '0:["dry-run",[["create","branch nodes"],["create","branch flaky-history"],["create","environment main"],["create","environment main: branch policy main"]]]'
+  check "dry run sends nothing" eq "$(fakegh_calls "$WRITES"):$(fakegh_ref refs/heads/nodes):$(jq -c '.environments // {}' "$FAKE_GH_SETTINGS")" '0::{}'
+  abp --bootstrap
+  check "plain dry run says 4 steps, none sent" eval 'grep -q "^# dry run: 4 step(s) planned, none sent" <<<"$OUT"'
+
+  abp --bootstrap --apply --json
+  check "--apply: exit 0, every write ok" eq "$RC:$(jq -c '[.results[].result] | unique' <<<"$OUT")" '0:["ok"]'
+  local b sha
+  for b in nodes flaky-history; do
+    sha="$(fakegh_ref "refs/heads/$b")"
+    check "branch $b exists" eval '[ -n "$sha" ]'
+    check "... a parentless commit" eq "$(git -C "$FAKE_GH_GIT" rev-list --parents -n1 "$sha" | wc -w | tr -d ' ')" 1
+    check "... holding README.md only" eq "$(git -C "$FAKE_GH_GIT" ls-tree --name-only "$sha" | paste -sd,)" README.md
+    check "... which names the branch" eval 'git -C "$FAKE_GH_GIT" show "$sha:README.md" | head -n1 | grep -qx "# $b"'
+  done
+  check "environment main: custom branch policies only" \
+    eq "$(jq -c '.environments.main.deployment_branch_policy' "$FAKE_GH_SETTINGS")" '{"protected_branches":false,"custom_branch_policies":true}'
+  check "... and the one branch policy main" \
+    eq "$(jq -c '[.environments.main.branch_policies[] | {name, type}]' "$FAKE_GH_SETTINGS")" '[{"name":"main","type":"branch"}]'
+
+  : >"$FAKE_GH_LOG"
+  abp --bootstrap --apply --json
+  check "a second --bootstrap: exit 0, all noop, nothing sent" \
+    eq "$RC:$(jq -c '[.bootstrap[].action] | unique' <<<"$OUT"):$(fakegh_calls "$WRITES")" '0:["noop"]:0'
+
+  fakegh_setup
+  FAKE_GH_FAIL='-X PUT repos/test/repo/environments/main' abp --bootstrap --apply --json
+  check "a failed write: exit 1, reported failed" \
+    eq "$RC:$(jq -c '[.results[] | select(.what == "environment main") | .result]' <<<"$OUT")" '1:["failed"]'
+}
+
+# The App key lives in environment `main`, and every remote action is pinned by commit sha.
+case_workflows_static() {
+  need_yq || return 0
+  local f wf jobs_env outside inherit uses_vals v lines n=0 bad=""
+  for f in "$REPO_ROOT"/.github/workflows/*.yml; do
+    wf="$(yq -o=json '.' "$f")"
+    jobs_env="$(jq -c '[.jobs | to_entries[] | select(.value | tojson | test("secrets\\.FACTORY_APP_KEY"))
+                        | select((.value.environment | if type == "object" then .name else . end) != "main") | .key]' <<<"$wf")"
+    [ "$jobs_env" = '[]' ] || bad+=" ${f##*/}:jobs-without-environment-main:$jobs_env"
+    n=$((n + $(jq '[.jobs[] | select(tojson | test("secrets\\.FACTORY_APP_KEY"))] | length' <<<"$wf")))
+    outside="$(jq 'del(.jobs) | tojson | test("secrets\\.FACTORY_APP_KEY")' <<<"$wf")"
+    [ "$outside" = false ] || bad+=" ${f##*/}:read-outside-a-job"
+    inherit="$(jq -c '[.jobs | to_entries[] | select(.value.secrets == "inherit") | .key]' <<<"$wf")"
+    [ "$inherit" = '[]' ] || bad+=" ${f##*/}:secrets-inherit:$inherit"
+  done
+  check "some job reads FACTORY_APP_KEY (the check is not vacuous)" eval '[ "$n" -gt 0 ]'
+  check "every job reading FACTORY_APP_KEY runs in environment main; no workflow-level read, no secrets: inherit" eq "$bad" ""
+
+  bad="" n=0
+  for f in "$REPO_ROOT"/.github/workflows/*.yml; do
+    uses_vals="$(yq -o=json '.' "$f" | jq -r '[.jobs[] | .uses // empty, (.steps // [] | .[].uses // empty)] | unique[]')"
+    while IFS= read -r v; do
+      [ -n "$v" ] || continue
+      case "$v" in ./*) continue ;; esac  # a local reusable workflow: exempt
+      n=$((n + 1))
+      [[ "$v" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$ ]] || { bad+=" ${f##*/}:$v"; continue; }
+      # YAML drops comments: every raw line using it must carry the tag (and there must be one).
+      lines="$(/usr/bin/grep -E "^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+${v//./\\.}([[:space:]]|$)" "$f" || true)"
+      if [ -z "$lines" ]; then bad+=" ${f##*/}:$v(no plain uses: line)"
+      elif /usr/bin/grep -Evq "uses:[[:space:]]+[^[:space:]]+[[:space:]]+#[[:space:]]*v[0-9][0-9A-Za-z.+-]*[[:space:]]*$" <<<"$lines"; then
+        bad+=" ${f##*/}:$v(no # v<tag>)"
+      fi
+    done <<<"$uses_vals"
+  done
+  check "some remote action is used (the check is not vacuous)" eval '[ "$n" -gt 0 ]'
+  check "every remote action is owner/repo@<40-hex> with a # v<tag> comment on its line" eq "$bad" ""
+}
+
 echo "test_halt_rules"
 for c in fake-gh-settings dry-run-prints-calls classic-protection-removed drift-is-corrected unmanaged-left-alone \
-         refuses-made-up-fields read-errors-fail app-bypass-actor; do
+         refuses-made-up-fields read-errors-fail app-bypass-actor check-i18 check-i18-drift merge-queue-gated bootstrap \
+         workflows-static; do
   run_case "$c"
 done
 exit "$FAILED"

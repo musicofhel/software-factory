@@ -365,8 +365,8 @@ case_trailers() {
 case_workflow() {
   local wf="$REPO_ROOT/.github/workflows/post-merge.yml"
   check "post-merge.yml runs post-merge.sh --apply (the script is dry-run by default)" grep -q "./factory/bin/post-merge.sh --apply" "$wf"
-  check "it checks out main with full history" eval 'grep -A4 "uses: actions/checkout@v4" "$wf" | head -n5 | grep -q "fetch-depth: 0" &&
-    grep -A4 "uses: actions/checkout@v4" "$wf" | head -n5 | grep -q "ref: main"'
+  check "it checks out main with full history" eval 'grep -A4 "uses: actions/checkout@" "$wf" | head -n5 | grep -q "fetch-depth: 0" &&
+    grep -A4 "uses: actions/checkout@" "$wf" | head -n5 | grep -q "ref: main"'
   # T10 acceptance 5 and ruling Q6: the App token, pinned by commit, with the GITHUB_TOKEN fallback.
   local jw="$REPO_ROOT/.github/workflows/janitor.yml" f
   for f in "$wf" "$jw"; do

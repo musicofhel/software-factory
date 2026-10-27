@@ -37,6 +37,8 @@ defaults:
 jobs:
   labeler:
     runs-on: ubuntu-latest
+    # The App key lives in environment `main`, readable only by a job running on main (ci:G13).
+    environment: main
     timeout-minutes: 10
     # The secrets context cannot appear in a step's `if:`; its presence is read here.
     env:
@@ -54,7 +56,7 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
           permission-actions: write
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: main, fetch-depth: 0 }
       - name: tier labels, the display block, and the re-run of held jobs (factory/bin/labeler.sh)
         env:

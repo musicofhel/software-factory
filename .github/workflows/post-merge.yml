@@ -28,6 +28,8 @@ defaults:
 jobs:
   complete:
     runs-on: ubuntu-latest
+    # The App key lives in environment `main`, readable only by a job running on main (ci:G13).
+    environment: main
     timeout-minutes: 10
     # The secrets context cannot appear in a step's `if:`; its presence is read here.
     env:
@@ -47,12 +49,12 @@ jobs:
         if: steps.app.outcome == 'skipped'
         run: |
           echo "post-merge: FACTORY_APP_ID or FACTORY_APP_KEY is not set, so the completion commit is pushed on GITHUB_TOKEN (not a ruleset bypass actor; a protected main refuses it)" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: main
           fetch-depth: 0
           token: ${{ steps.app.outputs.token || github.token }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22 }
       - name: adlc ticket complete --write for every ticket the merged PRs carried; append ledger
         env:
@@ -75,9 +77,9 @@ jobs:
       group: mirror
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: main }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22 }
       - name: re-mirror the store post-merge just wrote
         env:

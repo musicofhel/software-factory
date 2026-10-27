@@ -1,0 +1,33 @@
+# GitHub re-runs no check on a review. A review that is submitted or dismissed changes what the
+# `owners` and `halt-guard` gates count (two distinct code-owner approvals on the PR head;
+# specs/factory-step3-v1 TB10, ticket T29), so this re-runs those two jobs of the head's latest
+# gates.yml run (factory/bin/owners-check.sh --rerun). It runs the BASE's script (I16) and checks out
+# no PR head. Whether a re-run requested with GITHUB_TOKEN starts the job is a kit line (TB12).
+name: reviews
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+# One re-run at a time per PR, none cancelled: each review's re-run counts the reviews as they are then.
+concurrency:
+  group: reviews-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  pull-requests: read
+  actions: write
+defaults:
+  run:
+    shell: bash
+jobs:
+  rerun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { ref: "${{ github.event.pull_request.base.sha }}" }
+      - name: re-run the owners and halt-guard jobs of the PR head's latest gates run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_BASE: ${{ github.event.pull_request.base.sha }}
+          GATE_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: ./factory/bin/owners-check.sh --rerun

@@ -1,0 +1,135 @@
+{
+  "_comment": "Branch rules as code for `main`, applied by factory/bin/apply-branch-protection.sh (repo admin; dry-run by default, --apply writes, a second run is a no-op; re-run after any change here). Only real GitHub REST fields live here: `protection` is the body of PUT repos/{r}/branches/{branch}/protection (null: the branch has no classic protection, and one found on GitHub is DELETEd), and each `rulesets` entry is the body of POST/PUT repos/{r}/rulesets (keys starting with `_` are stripped). A rule GitHub cannot express is listed under `unexpressed`, printed on every run, and never silently dropped. Bypass OFF for everyone, admins included: no ruleset names a bypass actor, and the only one ever added is the factory GitHub App, from FACTORY_APP_ID.",
+  "_desk_note": "specs/factory-step3-v1 TB10 (ticket T29), a desk note under I15: this file replaces factory/policy/branch-protection.json in a desk commit. Until then tests/test_halt_rules.sh reads it here, and make sim's desk applies it to its world (a logged stand-in).",
+  "branch": "main",
+  "protection": null,
+  "_protection": "Step-2 ruling Q2 (specs/factory-step2-v1/RULINGS.md): every rule classic protection held now lives in ruleset `main`, where the App's bypass applies, so post-merge's direct push on the App token is not refused. Classic `required_pull_request_reviews` became the `pull_request` rule, `required_status_checks` the `required_status_checks` rule, `allow_force_pushes: false` the `non_fast_forward` rule, `allow_deletions: false` the `deletion` rule, and `enforce_admins: true` is a ruleset's default (only `bypass_actors` bypass, and there are none). Nothing was left for classic protection.",
+  "rulesets": [
+    {
+      "name": "main",
+      "_comment": "Every rule on main. Parameter names are GitHub's REST ruleset schema (docs.github.com/rest/repos/rules#create-a-repository-ruleset; components repository-rule-*). Required checks are the bare job ids of .github/workflows/gates.yml that report on pull_request and on the queue path (I18; a check run is named by its job id, records/TB0.md (b)), each from GitHub Actions (integration_id 15368); `apply-branch-protection.sh --check` proves the set. Approvals: none required globally; a code owner's review is (CODEOWNERS), and the two-owner rule on the factory's own paths is the required `owners` check (GitHub counts one owner). Merge commits only: post-merge.sh reads the merge commit. The merge_queue rule is sent only when the repo is organization-owned (native-queue: yes): one entry built and merged at a time, merge commits.",
+      "_halt": "ADR-0004 options C and D (specs/factory-step3-v1 TB10): adding factory/HALT needs no approval, because .github/workflows/halt.yml commits it onto main with the App, the only bypass actor, never through a PR or the queue; removing it needs two distinct code-owner approvals, counted by the required check `halt-guard`, which reviews.yml re-runs on every review.",
+      "target": "branch",
+      "enforcement": "active",
+      "bypass_actors": [],
+      "conditions": {
+        "ref_name": {
+          "include": [
+            "refs/heads/main"
+          ],
+          "exclude": []
+        }
+      },
+      "rules": [
+        {
+          "type": "deletion"
+        },
+        {
+          "type": "non_fast_forward"
+        },
+        {
+          "type": "pull_request",
+          "parameters": {
+            "required_approving_review_count": 0,
+            "require_code_owner_review": true,
+            "dismiss_stale_reviews_on_push": true,
+            "require_last_push_approval": true,
+            "required_review_thread_resolution": false,
+            "allowed_merge_methods": [
+              "merge"
+            ]
+          }
+        },
+        {
+          "type": "required_status_checks",
+          "parameters": {
+            "strict_required_status_checks_policy": true,
+            "required_status_checks": [
+              {
+                "context": "context",
+                "integration_id": 15368
+              },
+              {
+                "context": "build-test",
+                "integration_id": 15368
+              },
+              {
+                "context": "rails-proof",
+                "integration_id": 15368
+              },
+              {
+                "context": "scope",
+                "integration_id": 15368
+              },
+              {
+                "context": "tamper",
+                "integration_id": 15368
+              },
+              {
+                "context": "dependencies",
+                "integration_id": 15368
+              },
+              {
+                "context": "commit-check",
+                "integration_id": 15368
+              },
+              {
+                "context": "depends-on",
+                "integration_id": 15368
+              },
+              {
+                "context": "tier-order",
+                "integration_id": 15368
+              },
+              {
+                "context": "desk",
+                "integration_id": 15368
+              },
+              {
+                "context": "attest-verify",
+                "integration_id": 15368
+              },
+              {
+                "context": "owners",
+                "integration_id": 15368
+              },
+              {
+                "context": "halt-guard",
+                "integration_id": 15368
+              }
+            ]
+          }
+        },
+        {
+          "type": "merge_queue",
+          "parameters": {
+            "merge_method": "MERGE",
+            "max_entries_to_build": 1,
+            "max_entries_to_merge": 1,
+            "min_entries_to_merge": 1,
+            "min_entries_to_merge_wait_minutes": 5,
+            "grouping_strategy": "ALLGREEN",
+            "check_response_timeout_minutes": 60
+          }
+        }
+      ]
+    }
+  ],
+  "unexpressed": [
+    {
+      "rule": "factory/HALT: zero approvals to add, two to remove",
+      "why": "GitHub has no rule keyed on file deletion, and ruleset `required_reviewers` needs a Team, which a user-owned repo has none of. The factory expresses it instead: halt.yml commits factory/HALT with the App (zero approvals, never queued), and the required check `halt-guard` fails a PR deleting it without two distinct code-owner approvals on its head.",
+      "adr": "docs/adr/0004-halt-two-person-rule.md"
+    },
+    {
+      "rule": "two distinct code-owner approvals on factory/**, .adlc/**, .github/**, .claude/** and CODEOWNERS",
+      "why": "`require_code_owner_review` counts one code owner, and `required_reviewers` needs a Team. The required check `owners` (factory/bin/owners-check.sh) counts two distinct owners' approvals on the PR's current head; until a second owner is in CODEOWNERS no such PR can merge (the spec's rule; Aaron's kit).",
+      "adr": "specs/factory-step3-v1/SPEC.md TB10"
+    },
+    {
+      "rule": "only the App merges a ticket PR (the first-party serial queue)",
+      "why": "A rule cannot be scoped to a PR class, and restricting updates of main to the App (rule `update`) would also stop desk, human and HALT-removal PRs, which the queue does not land. A person can still merge a PR that is up to date with main (strict) and passes every required check, which are the gates the queue runs; the queue lands with the App, the only bypass actor, after the same gates on the merge commit.",
+      "adr": "docs/adr/0007-merge-queue.md"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+# The kill switch, add side (docs/adr/0004-halt-two-person-rule.md options C + D; specs/factory-step3-v1
+# TB10, ticket T29; ci:G11, merge:G17). A collaborator with write access halts the factory with zero
+# approvals: by dispatching this workflow, or by putting the `factory:halt` label on an Issue or a PR.
+# factory/bin/halt-guard.sh --add commits factory/HALT straight onto main on the App token (the
+# ruleset's only bypass actor): a halt never waits in a PR or the queue (merge §19). Removing HALT is
+# an ordinary PR, which gates.yml's `halt-guard` holds until two code owners approved it.
+#
+# pull_request_target runs main's code with the repo's secrets: this job checks out main only, never a
+# PR head, and reads nothing from the PR but the label. The App's push starts the push workflows, so
+# the summoner's halt notice fires on it. Without the App the job runs --dry-run and says so.
+name: halt
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "why the line stops (written into factory/HALT)"
+        type: string
+        required: false
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [labeled]
+concurrency:
+  group: halt
+  cancel-in-progress: false
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  halt:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'factory:halt'
+    runs-on: ubuntu-latest
+    # The App key lives in environment `main`, readable only by a job running on main (ci:G13).
+    environment: main
+    timeout-minutes: 5
+    env:
+      FACTORY_APP_ID: ${{ vars.FACTORY_APP_ID }}
+      HAS_APP_KEY: ${{ secrets.FACTORY_APP_KEY != '' }}
+    steps:
+      - name: mint the factory App token (ruleset bypass actor)
+        id: app
+        if: env.FACTORY_APP_ID != '' && env.HAS_APP_KEY == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_KEY }}
+          permission-contents: write
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+      - name: commit factory/HALT onto main (the actor needs write access)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          APPLY: ${{ steps.app.outcome == 'success' }}
+          ACTOR: ${{ github.event.sender.login || github.actor }}
+          REASON: "${{ inputs.reason || format('the factory:halt label on #{0}', github.event.issue.number || github.event.pull_request.number) }}"
+        run: |
+          if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
+          [ "$mode" = --apply ] || echo "halt: FACTORY_APP_ID or FACTORY_APP_KEY is not set, so the halt runs --dry-run (only the App may push to a protected main)" >> "$GITHUB_STEP_SUMMARY"
+          ./factory/bin/halt-guard.sh --add --actor "$ACTOR" --reason "$REASON" "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${PIPESTATUS[0]}"

@@ -18,6 +18,8 @@
 #         push          {ref, before, after}
 #         schedule      {schedule: <cron>}       (only-workflow-file names the workflow)
 #         issues        {action, label: {name}, issue: {number}}
+#         pull_request_review  {action: submitted|dismissed, review: {...}, pull_request: {number, head, base}}:
+#                       GITHUB_SHA/REF as pull_request (refs/pull/<n>/merge)
 #         pull_request_target  {action, number, pull_request: {...}, [reason]}: GITHUB_SHA/REF = the base
 #                       branch's tip (workflows from there: the caller passes main's sha)
 #         workflow_run  {action: completed, workflow_run: {id, name, path, event, head_sha, head_branch,
@@ -52,6 +54,10 @@
 #       GITHUB_REF (git ref) of the original event", GitHub docs, re-run workflows and jobs), a new
 #       job id replaces the old one in its run, run_attempt + 1, and a new check run is recorded; a
 #       second request for a job already re-run is skipped (GitHub refuses a re-run of a queued run).
+#       A job with `environment: <name>` runs only from a ref SIM_ENVIRONMENTS[<name>].branches allows
+#       (a JSON object {<name>: {branches: [..] | null (any), secrets: {..}}}; an environment it does not
+#       name allows any ref and adds no secret), and fails as GitHub does otherwise; the environment's
+#       secrets join the job's secrets context.
 #       Each job's `run:` steps see PATH = <job>.pipx-bin:RUNNER_PATH and PIPX_BIN_DIR = that dir,
 #       fresh per job (GitHub: PIPX_BIN_DIR=/opt/pipx_bin on PATH, one VM per job).
 #       Appends one JSON line per job to $SIM/jobs.jsonl: {workflow, job, event, conclusion, head_sha,
@@ -131,6 +137,11 @@ drive() {
       ref="refs/pull/$pn/merge"; base_ref="$(jq -r .pull_request.base.ref <<<"$payload")"
       head_ref="$(jq -r .pull_request.head.ref <<<"$payload")"; head_sha="$(jq -r .pull_request.head.sha <<<"$payload")"
       files="$(git -C "$ORIGIN" diff --name-only "$(jq -r .pull_request.base.sha <<<"$payload")...$head_sha" | jq -Rsc 'split("\n")[:-1]')" ;;
+    pull_request_review)
+      local rn; rn="$(jq -r .pull_request.number <<<"$payload")"
+      sha="$(git -C "$ORIGIN" rev-parse "refs/pull/$rn/merge")" || drv_die "no refs/pull/$rn/merge"
+      ref="refs/pull/$rn/merge"; base_ref="$(jq -r .pull_request.base.ref <<<"$payload")"
+      head_ref="$(jq -r .pull_request.head.ref <<<"$payload")"; head_sha="$(jq -r .pull_request.head.sha <<<"$payload")" ;;
     pull_request_target)
       base_ref="$(jq -r .pull_request.base.ref <<<"$payload")"; head_ref="$(jq -r .pull_request.head.ref <<<"$payload")"
       sha="$(git -C "$ORIGIN" rev-parse "refs/heads/$base_ref")" || drv_die "pull_request_target: no base branch $base_ref"
@@ -440,6 +451,18 @@ run_job() {
   if jq -e 'has("uses")' <<<"$jdef" >/dev/null; then
     run_call "$file" "$job" "$jdef" "$ctx" "$event" "$sha" "$ref" "$base_ref" "$head_ref"; return
   fi
+  # environment: (specs/factory-step3-v1 TB10): a job runs only from a ref its deployment branch policy
+  # allows, and only then sees the environment's secrets (SIM_ENVIRONMENTS).
+  local envname
+  envname="$(jq -r '.environment // "" | if type == "object" then .name else . end' <<<"$jdef")"
+  if [ -n "$envname" ]; then
+    local edef; edef="$(jq -c --arg n "$envname" '.[$n] // {branches: null, secrets: {}}' <<<"${SIM_ENVIRONMENTS:-"{}"}")"
+    if ! jq -e --arg r "$ref" '.branches == null or ($r | startswith("refs/heads/") and (ltrimstr("refs/heads/") | IN($r_b[]?)))'          --argjson r_b "$(jq -c '.branches // []' <<<"$edef")" <<<"$edef" >/dev/null; then
+      echo "job failed: $ref is not allowed to deploy to $envname due to environment protection rules" >>"$log"; echo failure; return
+    fi
+    jq --argjson s "$(jq -c '.secrets // {}' <<<"$edef")" '.secrets += $s' "$ctx" >"$ctx.n" && mv "$ctx.n" "$ctx"
+    echo "environment $envname: $ref may deploy; its secrets are in the context" >>"$log"
+  fi
   # env: workflow env, then job env, each value an expression template.
   local envj
   envj="$(jq -c --argjson w "$(jq -c '.env // {}' <<<"$wf")" '$w + (.env // {})' <<<"$jdef")"
@@ -518,7 +541,7 @@ run_uses() {
   with="$(jq -c '{ctx: ., status: {success: true, failure: false}}' "$ctx" |
           jq -c -L "$SIM_LIB" --argjson st "$step" 'include "expr"; . as $in | ($st.with // {}) | map_values(tostring as $v | $in | tmpl($v))')"
   case "$uses" in
-    actions/checkout@v4)
+    actions/checkout@*)
       local r depth path dir
       r="$(jq -r '.ref // ""' <<<"$with")"; depth="$(jq -r '."fetch-depth" // "1"' <<<"$with")"; path="$(jq -r '.path // ""' <<<"$with")"
       dir="$ws${path:+/$path}"
@@ -543,8 +566,17 @@ run_uses() {
       [ "$r" = "$sha" ] || ! git -C "$ORIGIN" show-ref -q --verify "refs/heads/$r" || name="$r"
       [ -z "$name" ] || git -C "$dir" checkout -q -B "$name" HEAD
       echo "checkout $r (fetch-depth $depth) at $(git -C "$dir" rev-parse HEAD)" ;;
-    actions/setup-node@v4|actions/setup-python@v5) echo "$uses: the runner's own (no-op in the sim)" ;;
-    actions/dependency-review-action@v4) echo "dependency-review: the repo has no dependency manifest; no change reviewed" ;;
+    actions/setup-node@*|actions/setup-python@*) echo "$uses: the runner's own (no-op in the sim)" ;;
+    actions/dependency-review-action@*)
+      # Outside pull_request(_target) the action reads base-ref and head-ref and fails without them
+      # ("Both a base ref and head ref must be provided", its README: "only used for event types other
+      # than pull_request and pull_request_target").
+      case "$event" in
+        pull_request|pull_request_target) ;;
+        *) [ -n "$(jq -r '."base-ref" // ""' <<<"$with")" ] && [ -n "$(jq -r '."head-ref" // ""' <<<"$with")" ] ||
+             { echo "dependency-review: Both a base ref and head ref must be provided, either via the \`base_ref\`/\`head_ref\` config options, \`base-ref\`/\`head-ref\` workflow action options, or by running a \`pull_request\`/\`pull_request_target\` workflow."; return 1; } ;;
+      esac
+      echo "dependency-review: the repo has no dependency manifest; no change reviewed" ;;
     actions/create-github-app-token@*)
       [ "$(jq -r '."private-key" // ""' <<<"$with")" != "" ] || { echo "create-github-app-token: no private key"; return 1; }
       echo "token=ghs_sim_app_token" >>"$out"; echo "minted the App token (sim)" ;;

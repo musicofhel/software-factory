@@ -26,14 +26,17 @@ sim:
 # measured, records/TB5.md). shellcheck is $SHELLCHECK, else the one on PATH, and is required: a lint
 # that skips itself is a false green. On a node it must sit under a system root for fleet's sandbox to
 # see it (join.sh refuses otherwise); CI installs the pinned shellcheck-py (gates.yml build-test).
-# actionlint ($ACTIONLINT, else PATH) is best-effort until CI pins it (TB10).
+# actionlint ($ACTIONLINT, else PATH) is required the same way (ci:G18; specs/factory-step3-v1 TB10): CI
+# installs the pinned actionlint-py, and join.sh refuses a node whose actionlint is outside the system roots.
 lint:
 	@set -e; SC="$${SHELLCHECK:-$$(command -v shellcheck || true)}"; \
 	[ -n "$$SC" ] || { echo "lint: shellcheck not found: install it (join.sh prints how), or set SHELLCHECK" >&2; exit 1; }; \
 	echo "lint: shellcheck $$("$$SC" --version | sed -n 's/^version: //p') at $$SC"; \
 	"$$SC" -S warning $(SH_FILES); \
 	AL="$${ACTIONLINT:-$$(command -v actionlint || true)}"; \
-	if [ -n "$$AL" ]; then "$$AL" -shellcheck "$$SC"; else echo "lint: actionlint not installed; workflows not linted"; fi
+	[ -n "$$AL" ] || { echo "lint: actionlint not found: install it (join.sh prints how), or set ACTIONLINT" >&2; exit 1; }; \
+	echo "lint: actionlint $$("$$AL" -version | head -n 1) at $$AL"; \
+	"$$AL" -shellcheck "$$SC"
 
 # The store, then the desk's contract lint on it (factory/bin/ticket-check.sh: exit 2 on an open
 # ticket without rails, a bad header, a scope glob that matches nothing tracked or declared new, an
