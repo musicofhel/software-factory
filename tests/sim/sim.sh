@@ -273,6 +273,12 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   head="$(pr_field "$pr" .headRefOid)"; base="$(git -C "$ORIGIN" merge-base "$(main_sha)" "$head")"
   local commits; commits="$(git -C "$ORIGIN" rev-list "$base..$head" | wc -l | tr -d ' ')"
   judge "$X.commit-shape" "$commits commit(s) over the merge-base" one_trailered_commit "$base" "$head" "$id"
+  # The gate manifest (ticket T30): the node pushed its attest note on that head with the branch.
+  local note; note="$(git -C "$ORIGIN" notes --ref=refs/notes/factory-attest show "$head" 2>/dev/null | jq -c . 2>/dev/null || true)"
+  judge "$X.attest-note" "note on ${head:0:12}: $(jq -c '{ticket, node, outcome, base: (.base // "" | .[0:12]), verdicts}' <<<"${note:-null}")" \
+    jq -e --arg t "$id" --arg h "$head" --arg b "$ngb" '.format == "factory-attest/1" and .ticket == $t and .node == "dev-box"
+      and .outcome == "built" and .head == $h and .base == $b and .tests_run == .gate_commands
+      and .verdicts == {tamperguard: {verdict: "ok", score: 0, findings: 0}, "rails-proof": "pass", scope: "pass"}' <<<"${note:-null}"
   stage "$X.pr-open" pass "PR #$pr"
   lock="$(lock_of "$n")"
   judge "$X.claim-released" "lock ${lock:+kept }${lock:-released}; Issue labels $(ghq --argjson n "$n" '.issues[] | select(.number == $n) | [.labels[].name] | join(",")')" \
@@ -340,7 +346,9 @@ ci_trace() {  # ci_trace <head> <job>: the `diff-gates:` lines that job printed 
   grep -h '^diff-gates: ' "$log" || true
 }
 ci_tg_argv() {  # ci_tg_argv <lines-before> <head>: tamperguard's argv as CI called it on ...<head> since then (one
-                # JSON array per call; the queue's own call on base...<queue commit> follows in the same pr_event)
+                # JSON array per call; the queue's own call on base...<queue commit> follows in the same pr_event).
+                # The tamper job and attest-verify (T30, recomputing the note) both call it: i17_same wants every
+                # such call to be the node's argv
   tail -n +"$(($1 + 1))" "$FAKE_TAMPERGUARD_LOG" | jq -c --arg h "$2" 'select(any(.[]; endswith("..." + $h)))'
 }
 i17_same() {  # i17_same <run-id> <gate-base> <gate-head> <pr-base> <pr-head> <node tg argv> <ci tg lines before>
@@ -350,7 +358,7 @@ i17_same() {  # i17_same <run-id> <gate-base> <gate-head> <pr-base> <pr-head> <n
     n="$(node_trace "$1" "$g")"
     [ -n "$n" ] && [ "$n" = "$(ci_trace "$5" "$g")" ] || return 1
   done
-  [ -n "$6" ] && [ "$6" = "$(ci_tg_argv "$7" "$5")" ] &&
+  [ -n "$6" ] && [ "$6" = "$(ci_tg_argv "$7" "$5" | sort -u)" ] &&
     [ "$6" = "$(jq -cn --arg r "$4...$5" '["--range", $r, "--json"]')" ]
 }
 i17_detail() {
@@ -410,16 +418,12 @@ judge C.mirror-blocked "#$C_ISSUE labels $(ghq --argjson n "$C_ISSUE" '.issues[]
 judge C.depends-link "$(ghq --argjson n "$C_ISSUE" '.issues[] | select(.number == $n) | .body' | grep -m1 '^Depends-on:' || echo 'no Depends-on line')" \
   eval "ghq --argjson n \"\$C_ISSUE\" '.issues[] | select(.number == \$n) | .body' | grep -qE '^Depends-on: T-sim-parent \\(#$P_ISSUE\\)$'"
 
-# GitHub's view of the attest-verify stub (ci:G6, TB11) is a labeled stand-in for the walk: without
-# it no PR is ever green and nothing reaches the queue (lib/driver.sh SIM_STANDIN_GREEN).
-export SIM_STANDIN_GREEN="attest-verify"
 walk P T-sim-parent sim/parent skip-ready
 
 # The child: the mirror on post-merge's run should make it ready.
 walk C T-sim-child sim/child
 
 # ================================================================== failure scenarios
-unset SIM_STANDIN_GREEN
 . "$SIM_LIB/scenarios.sh"
 
 [ ! -s "$FAKE_GH_UNKNOWN" ] || { say "fake gh refused forms:"; command cat "$FAKE_GH_UNKNOWN" >>"$LOG"; }

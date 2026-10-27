@@ -59,10 +59,17 @@
 #                                   tamperguard (dg_tamper_argv, under vetto + the claim's render of
 #                                   build.toml, $FACTORY_HOME/run/policy/<run id>.build.toml,
 #                                   lib/policy-render.sh; dg_tamper_judge), rails-proof.sh, then
-#                                   scope-check.sh. All pass → check this node still holds the
+#                                   scope-check.sh. All pass → the gate manifest: one JSON note
+#                                   (lib/attest.sh, format factory-attest/1, unsigned under the
+#                                   store's unsigned-fallback; T30) on GATE_HEAD with the ticket,
+#                                   node, adapter, base, head, tree, fleet run, the base's gate
+#                                   commands, the tests fleet ran, the three verdicts and hashes.
+#                                   Check this node still holds the
 #                                   lock (heartbeat.sh dry run; gone or another node's →
 #                                   lock-lost, no push, node:G13), push that same sha to
-#                                   ticket/<id>/<handle>, open the PR, comment; then hand the claim
+#                                   ticket/<id>/<handle> and the note to refs/notes/factory-attest
+#                                   in one atomic push (lib/run.sh run_push_attested; CI's
+#                                   attest-verify recomputes it), open the PR, comment; then hand the claim
 #                                   to the PR (T25): label the Issue in-review (ready and
 #                                   in-progress removed), release the lock. The PR is the claim from
 #                                   here: claim.sh and the mirror skip a ticket with an open PR, so
@@ -119,8 +126,10 @@ PROG=run
 . "$(dirname "$0")/lib/policy-render.sh"
 # shellcheck source=factory/bin/lib/diff-gates.sh
 . "$(dirname "$0")/lib/diff-gates.sh"
+# shellcheck source=factory/bin/lib/attest.sh
+. "$(dirname "$0")/lib/attest.sh"
 
-usage() { sed -n '2,109p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,116p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -330,6 +339,16 @@ push_sha() {  # push_sha <sha>: push it to ticket/<id>/<handle>; sets PUSHED_SHA
     act push-failed; warn "push of ticket/$TICKET/$HANDLE failed (see $LOGBASE.git.err)"; return 1
   fi
 }
+push_attested() {  # push_attested <sha> <note-file>: the branch and its attest note in one atomic push (T30)
+  local sha="$1"
+  PUSHED_SHA=""
+  if run_push_attested "$sha" "$2" "refs/notes/factory-run/slot-$slot"; then
+    PUSHED_SHA="$sha"; act "push ticket/$TICKET/$HANDLE"; act "push $ATTEST_REF"
+    rec --arg b "ticket/$TICKET/$HANDLE" --arg s "$sha" '.pushed = {branch: $b, sha: $s}'
+  else
+    act push-failed; warn "push of ticket/$TICKET/$HANDLE with its attest note failed (see $LOGBASE.git.err)"; return 1
+  fi
+}
 worker_tip() {  # fleet's worker branch for the ticket, else the run's base
   git -C "$CLONE" rev-parse -q --verify "refs/heads/fleet/$(tr '[:upper:]' '[:lower:]' <<<"$TICKET")^{commit}" || printf '%s\n' "$BASE"
 }
@@ -470,7 +489,8 @@ on_success() {
 }
 # gate_push <tip>: the tail every built commit takes (a fleet success, or a clean rebase strike):
 # tamperguard, rails-proof and scope-check on GATE_BASE...GATE_HEAD (I17), the lock check, the push of
-# GATE_HEAD, the PR and the hand-off. <tip> is the commit the gate-manifest hashes are read from.
+# GATE_HEAD with its attest note, the PR and the hand-off. <tip> (fleet's tip, or the rebased commit)
+# is kept in the slot state with the pushed sha.
 gate_push() {
   local tip="$1" tg_out tg verdict score findings rc a
   rec --arg b "$GATE_BASE" --arg h "$GATE_HEAD" '.gate_base = $b | .gate_head = $h'
@@ -517,9 +537,9 @@ gate_push() {
   case "$rc" in
     0) rec '.rails_proof = "pass"' ;;
     2) rec '.rails_proof = "fail"'
-       REASON=rails-fail; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
+       REASON="rails-fail"; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
     *) rec '.rails_proof = "error"'
-       REASON=rails-proof-error; outcome released; finish_release 1 0 1; return ;;
+       REASON="rails-proof-error"; outcome released; finish_release 1 0 1; return ;;
   esac
   rc=0
   (cd "$WT" && "$FACTORY_ROOT/factory/bin/scope-check.sh" --ticket "$TICKET" --base "$GATE_BASE" --head "$GATE_HEAD") >/dev/null 2>"$LOGBASE.scope.err" || rc=$?
@@ -527,10 +547,28 @@ gate_push() {
   case "$rc" in
     0) rec '.scope_check = "pass"' ;;
     2) rec '.scope_check = "fail"'
-       REASON=scope-fail; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
+       REASON="scope-fail"; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
     *) rec '.scope_check = "error"'
-       REASON=scope-check-error; outcome released; finish_release 1 0 1; return ;;
+       REASON="scope-check-error"; outcome released; finish_release 1 0 1; return ;;
   esac
+  # The gate manifest (T30, lib/attest.sh): the attest note on GATE_HEAD, pushed with it; CI's
+  # attest-verify recomputes it. Only ids, shas, codes, counts, the base's gate commands and hashes.
+  local note="$LOGBASE.attest.json" facts outc=built fdoc=null tgh=null
+  if [ -n "$REBASE_E" ] && [ "$(jq -r '.result // empty' <<<"${REBASE:-null}")" = clean ]; then outc=rebased
+  elif [ -s "$LOGBASE.fleet.json" ]; then fdoc="\"$(run_sha256 "$LOGBASE.fleet.json")\""; fi
+  [ ! -s "$LOGBASE.tamperguard.json" ] || tgh="\"$(run_sha256 "$LOGBASE.tamperguard.json")\""
+  facts="$(jq -cn --arg t "$TICKET" --arg n "$HANDLE" --arg a "$ADAPTER@$ADAPTER_VERSION" --arg o "$outc" \
+    --arg b "$GATE_BASE" --arg h "$GATE_HEAD" --arg run "$FLEET_RUN" --argjson st "$STRIKES" --argjson fd "$fdoc" \
+    --arg v "$verdict" --argjson s "$score" --argjson f "$findings" --argjson tgh "$tgh" \
+    '{ticket: $t, node: $n, adapter: $a, outcome: $o, base: $b, head: $h,
+      fleet: {run: $run, strikes: $st, doc_sha256: $fd},
+      verdicts: {tamperguard: {verdict: $v, score: $s, findings: $f}, "rails-proof": "pass", scope: "pass"},
+      hashes: {tamperguard_json: $tgh}}')"
+  if ! (cd "$CLONE" && attest_manifest "$facts") >"$note" 2>>"$LOGBASE.err" || ! jq -e 'type == "object"' "$note" >/dev/null 2>&1; then
+    act attest-note-failed
+    REASON="attest-error"; outcome released; finish_release 1 0 1; return
+  fi
+  act attest-note
   local lrc=0
   lock_check || lrc=$?
   case "$lrc" in
@@ -538,10 +576,11 @@ gate_push() {
     2) lock_lost; return ;;
     *) REASON=lock-check-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return ;;
   esac
-  push_sha "$GATE_HEAD" || { REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
+  push_attested "$GATE_HEAD" "$note" || { REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
   PR_PENDING="$(jq -cn --arg sha "$PUSHED_SHA" --arg tip "$tip" --arg v "$verdict" --argjson s "$score" --argjson f "$findings" \
-    --arg run "$FLEET_RUN" --argjson st "$STRIKES" \
-    '{sha: $sha, tip: $tip, tamperguard: {verdict: $v, score: $s, findings: $f}, fleet_run: $run, strikes: $st, tries: 0}')"
+    --arg run "$FLEET_RUN" --argjson st "$STRIKES" --arg ah "$(run_sha256 "$note")" --arg af "$ATTEST_FORMAT" \
+    '{sha: $sha, tip: $tip, tamperguard: {verdict: $v, score: $s, findings: $f}, fleet_run: $run, strikes: $st,
+      attest: {format: $af, sha256: $ah}, tries: 0}')"
   wt_remove   # the pushed sha is all the PR needs; fleet's tip stays under refs/factory/fleet/<run id>
   pr_open
 }
@@ -556,7 +595,7 @@ pr_open() {
   if [ -n "$found" ]; then prn="$found"; act pr-exists
   else
     facts_pr="$(facts "ticket/$TICKET/$HANDLE" "$PUSHED_SHA" | jq -c --argjson p "$PR_PENDING" \
-      --argjson g "$(run_gate_hashes "$(jq -r .tip <<<"$PR_PENDING")")" '. + {tamperguard: $p.tamperguard, gates: $g}')"
+      '. + {tamperguard: $p.tamperguard, attest: ($p.attest // null)}')"
     if url="$(run_pr_body "$facts_pr" | gh pr create --repo "$REPO" --base main --head "ticket/$TICKET/$HANDLE" \
                  --title "$TICKET: built by $HANDLE (issue #$ISSUE)" --body-file - 2>>"$LOGBASE.err")"; then
       prn="$(sed -nE 's#.*/pull/([0-9]+)$#\1#p' <<<"$url" | tail -n1)"; act pr-open

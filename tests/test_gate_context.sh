@@ -13,10 +13,12 @@
 #     unreadable PR or a base/head outside the checkout is exit 1; identity and the classes as on
 #     merge_group (a desk PR stays desk on a main that moved);
 #   - common.sh's id validator refuses `/`;
-#   - the remaining gate stub (attest-verify) resolves the context first, and keeps run.sh's `not
-#     built` contract (rails-proof and scope-check are built: tests/test_diff_gates.sh; commit-check:
+#   - attest-verify (built in TB11, ticket T30; its body: tests/test_attest.sh) resolves the context
+#     first: a refused PR exits 2 before any note is fetched or read, and a missing note (origin has
+#     no refs/notes/factory-attest; no local note on the node's call) is exit 2 after the context line;
+#     no gate stub is left (rails-proof and scope-check: tests/test_diff_gates.sh; commit-check:
 #     tests/test_commit_check.sh);
-#   - gates.yml runs every factory/bin script from the base checkout ./.base (I16), and takes the queue's
+#   - gates.yml runs every factory/bin script from the base checkout ./.base (I16; flaky too, T30), and takes the queue's
 #     pr, base and head as workflow_call inputs (GATE_QUEUE_PR, GATE_BASE, GATE_HEAD).
 # Offline; every repo is a temp dir, gh is the fake.
 set -euo pipefail
@@ -291,25 +293,32 @@ case_id_validator() {
   check "valid ids pass, ids with / (and flags, blanks) are refused" eq "$bad" 0
 }
 
-case_gate_stubs() {
+case_attest_context() {
+  # attest-verify is built (TB11, ticket T30; its body: tests/test_attest.sh). Here: it resolves the
+  # gate context first, and a refused PR exits 2 before any note is fetched or read.
   setup
-  local h s
+  local h s=attest-verify
+  git init -q --bare "$WORLD/origin.git"   # an origin with no refs/notes/factory-attest
+  git -C "$R" remote add origin "$WORLD/origin.git"
   h="$(change ticket/T20/dev-box "$(printf 'work\n\nTicket: T20')" +sim/t20/a.sh)"
-  # shellcheck disable=SC2043  # attest-verify is the last stub (TB11 builds it)
-  for s in attest-verify; do
-    pr_event pull_request-opened.json "$h" ticket/T20/dev-box 'Ticket: T20'
-    RC=0; (cd "$R" && "$BIN/$s.sh") >/dev/null 2>"$WORLD/err" || RC=$?
-    check "$s: exit 2, the context first, then 'not built'" \
-      eq "$RC:$(sed -n '1s/^\([a-z-]*\): ticket gate from .* on {.*"ticket":"T20".*}$/\1/p' "$WORLD/err"):$(sed -n 2p "$WORLD/err")" \
-         "2:$s:$s: not built"
-    pr_event pull_request-opened.json "$h" ticket/T20/dev-box 'Ticket: T21'
-    RC=0; (cd "$R" && "$BIN/$s.sh") >/dev/null 2>"$WORLD/err" || RC=$?
-    check "$s: a body naming T21 is refused before the gate body" \
-      eq "$RC:$(grep -c 'not built' "$WORLD/err" || true):$(grep -c "says 'Ticket: T21'" "$WORLD/err")" 2:0:1
-    unset GITHUB_EVENT_NAME GITHUB_EVENT_PATH
-    RC=0; (cd "$R" && "$BIN/$s.sh" --ticket T20 --base "$BASE" --head "$h") >/dev/null 2>"$WORLD/err" || RC=$?
-    check "$s: run.sh's node call (--ticket --base --head) keeps exit 2 'not built'" eq "$RC:$(tail -n1 "$WORLD/err")" "2:$s: not built"
-  done
+  pr_event pull_request-opened.json "$h" ticket/T20/dev-box 'Ticket: T20'
+  RC=0; (cd "$R" && "$BIN/$s.sh") >/dev/null 2>"$WORLD/err" || RC=$?
+  check "$s: the context first, then exit 2: origin has no attest notes ref" \
+    eq "$RC:$(sed -n '1s/^\([a-z-]*\): ticket gate from .* on {.*"ticket":"T20".*}$/\1/p' "$WORLD/err"):$(sed -n 2p "$WORLD/err")" \
+       "2:$s:$s: FAIL: origin has no refs/notes/factory-attest, so $h carries no attest note"
+  pr_event pull_request-opened.json "$h" ticket/T20/dev-box 'Ticket: T21'
+  RC=0; (cd "$R" && "$BIN/$s.sh") >/dev/null 2>"$WORLD/err" || RC=$?
+  check "$s: a body naming T21 is refused (exit 2) before any note is fetched or read" \
+    eq "$RC:$(grep -c 'note' "$WORLD/err" || true):$(grep -c "says 'Ticket: T21'" "$WORLD/err")" 2:0:1
+  pr_event pull_request-opened.json "$h" ticket/T20/dev-box 'Ticket: T20' NONE stranger/Hello-World
+  RC=0; (cd "$R" && "$BIN/$s.sh") >/dev/null 2>"$WORLD/err" || RC=$?
+  check "$s: a fork's ticket ref is refused (exit 2) before any note is fetched or read" \
+    eq "$RC:$(grep -c 'note' "$WORLD/err" || true):$(grep -c 'a fork is never a ticket PR' "$WORLD/err")" 2:0:1
+  unset GITHUB_EVENT_NAME GITHUB_EVENT_PATH
+  RC=0; (cd "$R" && "$BIN/$s.sh" --ticket T20 --base "$BASE" --head "$h") >/dev/null 2>"$WORLD/err" || RC=$?
+  check "$s: run.sh's node call (--ticket --base --head): the context first, then exit 2 on a missing local note" \
+    eq "$RC:$(sed -n '1s/^\([a-z-]*\): ticket gate from .* on {.*"event":"node".*}$/\1/p' "$WORLD/err"):$(tail -n1 "$WORLD/err")" \
+       "2:$s:$s: FAIL: no attest note (refs/notes/factory-attest) on $h, or it is not one JSON object"
 }
 
 # queue_pr <n> <head-sha> <head-ref> <body> [base-ref] [head-repo] [author]: PR n in the fake's store
@@ -482,12 +491,12 @@ case_gates_yml_base_scripts() {
   # Every run: step that calls a factory/bin script calls the base's copy, ./.base/factory/bin/...
   bad="$(yq -r '.jobs[].steps[] | select(has("run")) | .run' "$wf" | grep -E 'factory/bin/' | grep -vE '(^|[ ;&|])\./\.base/factory/bin/' || true)"
   check "no gate step runs the head's factory/bin" eq "$bad" ""
-  check "context, rails-proof, scope, tamper, commit-check, attest-verify, build-test (T24), desk (T26), depends-on and tier-order (T27), owners and halt-guard (T29) run a base script" \
+  check "context, rails-proof, scope, tamper, commit-check, attest-verify, build-test (T24), desk (T26), depends-on and tier-order (T27), owners and halt-guard (T29), flaky (T30) run a base script" \
     eq "$(yq -r '.jobs | to_entries[] | select([.value.steps[] | select(has("run")) | .run] | join(" ") | test("\\./\\.base/factory/bin/")) | .key' "$wf" | sort | tr '\n' ' ')" \
-       "attest-verify build-test commit-check context depends-on desk halt-guard owners rails-proof scope tamper tier-order "
+       "attest-verify build-test commit-check context depends-on desk flaky halt-guard owners rails-proof scope tamper tier-order "
   # Each such job: the head (full history) checked out first, then the base into .base.
   local j
-  for j in context rails-proof scope tamper commit-check attest-verify build-test desk depends-on tier-order owners halt-guard; do
+  for j in context rails-proof scope tamper commit-check attest-verify build-test desk depends-on tier-order owners halt-guard flaky; do
     check "$j: checkout head (fetch-depth 0), then base into .base" \
       eq "$(yq -o=json -I=0 ".jobs[\"$j\"].steps | map(select((.uses // \"\") | test(\"^actions/checkout@\")) | .with)" "$wf")" \
          '[{"ref":"${{ env.GATE_HEAD }}","fetch-depth":0},{"ref":"${{ env.GATE_BASE }}","path":".base"}]'
@@ -504,7 +513,7 @@ case_gates_yml_base_scripts() {
 }
 
 for c in fixtures-are-githubs pull-request-ticket merge-group queue-ref-parse classes refusals identity node id-validator \
-         gate-stubs queue queue-refusals queue-identity-classes gates-yml-base-scripts; do
+         attest-context queue queue-refusals queue-identity-classes gates-yml-base-scripts; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

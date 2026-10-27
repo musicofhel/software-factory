@@ -15,7 +15,17 @@
 # Every job reports on every path (I18): the required set of factory/policy/branch-protection.json is
 # exactly these job ids, and `apply-branch-protection.sh --check` fails when the two differ or a job
 # gains a job-level `if:` (specs/factory-step3-v1 TB10, ticket T29). Actions are pinned by commit sha.
-# No w:heavy job is required until a self-hosted factory-node runner exists.
+#
+# No w:heavy job is required until a self-hosted factory-node runner exists (ci:G14): every job here
+# runs on a hosted runner, and a push-triggered heavy check would never report on the queue path, so
+# as a required check it would only time the queue out. Heavy evidence reaches the queue later as a
+# record attest-verify can check (step 4).
+#
+# The remaining CI gates (specs/factory-step3-v1 TB11, ticket T30): `attest-verify` (the node's attest
+# note) and `flaky` (the quarantine list's expiry). There is no bug-scan job: ubs's license rider
+# excludes Anthropic and anyone acting for it, and the spec wants ubs and aislop together
+# (records/TB0.md (c); the spec's HANDOFF carries the question). skills-scan is not here and not
+# required: skills-janitor.yml says why (merge:G18).
 #
 # `depends-on` and `tier-order` (specs/factory-step3-v1 TB8, ticket T27) read the store at the base, or
 # at origin/main when it descends from the base: labeler.yml re-runs a held job once its parent merged
@@ -193,14 +203,34 @@ jobs:
       - name: a PR removing factory/HALT has two owner approvals on its head
         env: { GH_TOKEN: "${{ github.token }}" }
         run: ./.base/factory/bin/halt-guard.sh
+  # The node's gate manifest (specs/factory-step3-v1 TB11, ticket T30; ADR-0007 decision 9): the attest note on
+  # the PR head under refs/notes/factory-attest, recomputed here (rails, scope, tamper verdicts, the
+  # gate command list, the trailers). No `needs:`: a required job skipped by a failed need reports
+  # success (records/TB0.md (b)), so it runs on its own and reports its own verdict.
   attest-verify:
     runs-on: ubuntu-latest
-    needs: [build-test, rails-proof, scope, tamper, commit-check]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
-      - name: gate manifest (attest verify is a required check; build order 3)
+      # The tamper verdict is recomputed with the tamper job's pin and Python minor.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with: { python-version: "3.14" }
+      - name: tamperguard 0.2.0 on the node's Python minor
+        run: pipx install --python python3.14 tamperguard==0.2.0
+      - name: the attest note on the PR head agrees with what CI recomputes (a missing note fails)
         env: { GH_TOKEN: "${{ github.token }}" }
         run: ./.base/factory/bin/attest-verify.sh
+  # No quarantined test outlives its expiry (ci:G15): the quarantine list that lands (the base's, or
+  # the head's when the PR changes it) has no expired or malformed entry. The JUnit-history classifier
+  # is step 4 (flaky-test-detective has no pinned release, records/TB0.md (c)).
+  flaky:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { ref: "${{ env.GATE_BASE }}", path: .base }
+      - name: factory/policy/quarantine.json has no expired entry
+        run: ./.base/factory/bin/flaky-check.sh --base "$GATE_BASE" --head "$GATE_HEAD"

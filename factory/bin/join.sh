@@ -451,7 +451,7 @@ REGISTER="$(jq -cn --arg repo "$REPO" --arg h "$handle" --arg fh "$FH" --argjson
   --argjson unknown_min "$(budget .governor.unknownStateSleepMinutes)" '
   {token: {url: "https://github.com/settings/personal-access-tokens/new", repository: $repo,
            permissions: {contents: "read and write", issues: "read and write", pull_requests: "read and write", metadata: "read"}, expiry_days: 90,
-           ref_patterns: ["ticket/**", "nodes/**", "refs/locks/**"], store: "\($fh)/token", given: $given},
+           ref_patterns: ["ticket/**", "nodes/**", "refs/locks/**", "refs/notes/factory-attest"], store: "\($fh)/token", given: $given},
    runner: {url: "https://github.com/\($repo)/settings/actions/runners/new", labels: ["factory-node"],
             command: "./config.sh --url https://github.com/\($repo) --token <registration token from that page> --labels factory-node --name \($h)"},
    quota: {command: "cux add --no-alias", after: ". \($fh)/env", run_by: "owner",

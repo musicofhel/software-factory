@@ -96,6 +96,10 @@
               {
                 "context": "halt-guard",
                 "integration_id": 15368
+              },
+              {
+                "context": "flaky",
+                "integration_id": 15368
               }
             ]
           }

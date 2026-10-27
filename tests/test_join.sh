@@ -9,7 +9,8 @@
 # printed cux line and no credential in any argv join hands a tool (case cux-line, AC3). T24: a
 # fleet.gate running `make lint` needs a shellcheck under a system root (case lint-shellcheck). T29:
 # and an actionlint there too (case lint-actionlint); the token asks for Contents, Issues and Pull
-# requests write, and ~/.factory/env exports GH_TOKEN from the stored token (cases cux-line,
+# requests write and names refs/notes/factory-attest among its refs (T30: the node pushes its attest
+# note there), and ~/.factory/env exports GH_TOKEN from the stored token (cases cux-line,
 # home-diff, review-field); tamperguard is installed on the CPython diff-gates.sh pins (case plan).
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
@@ -745,11 +746,15 @@ case_cux_line() {
   check "  it sits in step 3, before the manifest" eval 'sed -n "/^== 3\/5/,/^== 4\/5/p" <<<"$OUT" | grep -qF "cux add --no-alias"'
   check "the token line asks for Contents, Issues and Pull requests write" \
     grep -qF "     Repository access: only test/repo. Repository permissions: Contents, Issues and Pull requests read and write (Metadata read is added)." <<<"$OUT"
+  check "  it names the attest notes ref among the refs the token may write (T30)" \
+    grep -qF "It may write only ticket/**, nodes/**, refs/locks/**, refs/notes/factory-attest:" <<<"$OUT"
   jn --handle node-a --no-suite --json
   check "--json: register.quota carries the exact command" \
     eq "$(jq -c '.register.quota | [.command, .after, .run_by]' <<<"$OUT")" "[\"cux add --no-alias\",\". $fh/env\",\"owner\"]"
   check "--json: register.token.permissions, exactly" eq "$(jq -c .register.token.permissions <<<"$OUT")" \
     '{"contents":"read and write","issues":"read and write","pull_requests":"read and write","metadata":"read"}'
+  check "--json: the token's refs include the attest notes ref the node pushes (T30)" \
+    eq "$(jq -c .register.token.ref_patterns <<<"$OUT")" '["ticket/**","nodes/**","refs/locks/**","refs/notes/factory-attest"]'
   check "  the sleep it names is budget.json's" eval \
     'jq -r .register.quota.why <<<"$OUT" | grep -qF "sleeps $(jq .governor.unknownStateSleepMinutes "$REPO_ROOT/factory/policy/budget.json") minutes"'
 

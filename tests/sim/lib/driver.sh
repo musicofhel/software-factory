@@ -38,7 +38,7 @@
 #       records/TB0.md (d)). When a job moves main, every open PR on main whose head is now reachable
 #       from it is marked merged, `.merged += {pr, sha: <new main>}` and `.merged_marks` (GitHub's
 #       indirect merge; its merge_commit_sha is undocumented, a kit line, TB12).
-#       SIM_STANDIN_GREEN (job ids, space-separated; the caller's labeled stand-in): a job of that id
+#       SIM_STANDIN_GREEN (job ids, space-separated; the caller's labeled stand-in; unused since TB11, T30): a job of that id
 #       that failed is success in GitHub's view (.runs, .checks, needs, the caller's result), while
 #       jobs.jsonl keeps the real conclusion plus `standin: true`; sim.log says `stand-in:`.
 #       Each run is also recorded as GitHub's Actions API answers it: `.runs` of the fake gh state

@@ -36,10 +36,32 @@ scn_commit() {  # scn_commit <ticket|-> [subject]: commit the index; `-` = no tr
   [ "$1" = - ] || msg="$(printf '%s\n\n%s' "$msg" "$(trailers "$1" "${br##*/}")")"
   git -C "$SCN" commit -qm "$msg"
 }
-scn_pr() {  # scn_pr <branch> <ticket|-> [author]: push the branch, open its PR; prints the PR number
+scn_attest() {  # scn_attest <branch>: the attest note a node pushes with HEAD of the scratch clone (lib/attest.sh,
+                # ADR-0007 decision 9; ticket T30) onto origin's refs/notes/factory-attest: a ticket ref's own
+                # ticket and handle, the trailers' adapter, base = the merge-base with origin/main, the
+                # verdicts a passing node writes. A scenario whose defect is a gate's sees attest-verify
+                # recompute that gate and disagree, as CI would with a node that lied.
+  local br="$1" t h base facts nref=refs/notes/factory-run/scn
+  t="${br#ticket/}"; t="${t%%/*}"
+  h="$(git -C "$SCN" rev-parse HEAD)"; base="$(git -C "$SCN" merge-base origin/main HEAD)"
+  facts="$(jq -cn --arg t "$t" --arg n "${br##*/}" --arg b "$base" --arg h "$h" \
+    '{ticket: $t, node: $n, adapter: "claude-code", outcome: "built", base: $b, head: $h,
+      fleet: {run: "sim-scenario", strikes: 0, doc_sha256: null},
+      verdicts: {tamperguard: {verdict: "ok", score: 0, findings: 0}, "rails-proof": "pass", scope: "pass"},
+      hashes: {tamperguard_json: null}}')"
+  ( cd "$SCN" && PROG=scn-attest && . factory/bin/lib/common.sh && . factory/bin/lib/diff-gates.sh &&
+    . factory/bin/lib/attest.sh && attest_manifest "$facts" ) >"$SIM/scn-note.json" || die "scn_attest: no note for $br"
+  git -C "$SCN" update-ref -d "$nref" 2>/dev/null || true
+  git -C "$SCN" fetch -q origin "+refs/notes/factory-attest:$nref" 2>/dev/null || true
+  git -C "$SCN" notes --ref="$nref" add -f -F "$SIM/scn-note.json" "$h"
+  git -C "$SCN" push -q origin "$nref:refs/notes/factory-attest"
+}
+scn_pr() {  # scn_pr <branch> <ticket|-> [author]: push the branch, open its PR; prints the PR number. A ticket
+            # ref is pushed with its attest note (scn_attest) as a node pushes it, unless SCN_NO_NOTE=1
   local body="Ticket: $2\nNode: dev-box"
   [ "$2" != - ] || body="A human PR."
   git -C "$SCN" push -q -f origin "HEAD:refs/heads/$1"
+  case "$1" in ticket/*) [ "${SCN_NO_NOTE:-0}" = 1 ] || scn_attest "$1" ;; esac
   FAKE_GH_USER="${3:-dev-box-owner}" "$SIM_FAKES/gh" pr create --repo "$REPO" --base main --head "$1" \
     --title "sim scenario: $1" --body "$(printf '%b' "$body")" >>"$LOG"
   pr_of "$1"
@@ -112,6 +134,16 @@ scn_start ticket/T-sim-s/scn-tamper
 scn_put sim/s/test_hello.sh "it.skip('hello prints hello')"
 scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn-tamper T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.tamper-skip "$(scn_detail tamper "$h")" check_fails_naming tamper "$h" '"verdict": *"tamper"'
+# Its attest note says tamperguard ok, as a lying node's would: attest-verify recomputes the verdict
+# and names the mismatch (ticket T30).
+judge S.attest-mismatch "$(scn_detail attest-verify "$h")" check_fails_naming attest-verify "$h" 'mismatch: verdicts\.tamperguard'
+
+# A ticket PR pushed without its attest note: attest-verify fails and says so (ci:G6, ci:G16).
+scn_start ticket/T-sim-s/scn-nonote
+scn_put sim/s/hello.sh 'echo hello'
+scn_commit T-sim-s; pr="$(SCN_NO_NOTE=1 scn_pr ticket/T-sim-s/scn-nonote T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.attest-missing "$(scn_detail attest-verify "$h"); scope $(check_of scope "$h")" \
+  eval 'check_fails_naming attest-verify "$h" "no attest note" && [ "$(check_of scope "$h")" = success ]'
 
 # A rail path edited: rails-proof fails and names it.
 scn_start ticket/T-sim-s/scn-rail
@@ -174,6 +206,16 @@ git -C "$SCN" commit -qm "$(printf 'docs: a note\n\nSigned-off-by: dev-box-owner
 pr="$(scn_pr human/scn-docs - dev-box-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.class-human "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" \
   '.class == "human" and .author_association == "COLLABORATOR" and .ticket == null'
+
+# A collaborator's PR that puts an expired entry on the quarantine list: the list that would land has
+# it, and the flaky job fails naming the test (ci:G15, ticket T30).
+scn_start human/scn-quarantine
+jq '.quarantined += [{test: "sim/flaky-test", issue: 1, expires: "2020-01-01"}]' "$SCN/factory/policy/quarantine.json" >"$SIM/q.json"
+command cp "$SIM/q.json" "$SCN/factory/policy/quarantine.json"; git -C "$SCN" add factory/policy/quarantine.json
+git -C "$SCN" commit -qm "$(printf 'policy: quarantine a test\n\nSigned-off-by: dev-box-owner <dev-box-owner@sim.invalid>')"
+pr="$(scn_pr human/scn-quarantine - dev-box-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.quarantine-expired "$(scn_detail flaky "$h")" \
+  check_fails_naming flaky "$h" 'expired 2020-01-01: sim/flaky-test'
 
 # A stranger's PR (from a fork, not a ticket branch): no class, refused.
 scn_start stranger/scn-docs
@@ -244,7 +286,14 @@ scn_commit T-sim-c2; pr="$(scn_pr ticket/T-sim-c2/scn-early T-sim-c2)"; approve 
 judge S.child-before-parent "$(scn_detail depends-on "$h")" check_fails_naming depends-on "$h" 'T-sim-p2'
 C2_PR="$pr" C2_HEAD="$h"   # S.child-released: the parent merges and this held job is re-run
 
-# A tier-1 PR while an approved tier-0 PR is open: tier-order holds the tier-1 one.
+# A tier-1 PR while an approved tier-0 PR is open: tier-order holds the tier-1 one. Labeled stand-in
+# (ticket T30): attest-verify is real, so the approved PR_A is green, and with the App configured
+# enqueue.yml's pick, which pr_event fires on workflow_run, would land it inside its own pr_event,
+# before the tier-1 PR exists (post-merge completes T-sim-s, and every later T-sim-s scenario would be
+# refused a completed ticket). For these two PRs the App is unset, a real configuration (enqueue runs
+# --dry-run and lands nothing, enqueue.yml); the queue section restores it.
+SIM_VARS_APP="$SIM_VARS"; SIM_VARS="$(jq -c 'del(.FACTORY_APP_ID)' <<<"$SIM_VARS")"; export SIM_VARS
+standin "the App is unset for S.tier-jump's two PRs: the queue lands nothing while tier-order is judged"
 scn_start ticket/T-sim-s/scn-a
 scn_put sim/s/conflict.txt 'a'
 scn_commit T-sim-s; PR_A="$(scn_pr ticket/T-sim-s/scn-a T-sim-s)"; approve "$PR_A"; pr_event "$PR_A"
@@ -252,14 +301,14 @@ scn_start ticket/T-sim-t1/scn-t1
 scn_put sim/t1/hello.sh 'echo hello'
 scn_commit T-sim-t1; pr="$(scn_pr ticket/T-sim-t1/scn-t1 T-sim-t1)"; approve "$pr"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.tier-jump "$(scn_detail tier-order "$h")" check_fails_naming tier-order "$h" "#$PR_A"
+export SIM_VARS="$SIM_VARS_APP"
 
 # ------------------------------------------------------------------ the queue (enqueue.yml, eject.sh)
-# GitHub's view of the attest-verify stub is the walk's labeled stand-in again, so a PR can be green.
-# PRs from the PR-only scenarios stay red: their runs were recorded without it.
-export SIM_STANDIN_GREEN="attest-verify"
 # claim.sh skips a ticket with any open ticket/<id>/* PR, and S.rebase-strike claims T-sim-s: its
-# earlier scenario PRs (PR_A among them) are closed first.
-for n in $(ghq '.pulls[] | select(.state == "OPEN" and (.headRefName | startswith("ticket/T-sim-s/"))) | .number'); do
+# earlier scenario PRs (PR_A among them) are closed first. So is S.tier-jump's approved tier-1 PR:
+# green once PR_A is gone and its held tier-order re-runs, the queue would land T-sim-t1 before
+# S.foreign-trailer's PR.
+for n in $(ghq '.pulls[] | select(.state == "OPEN" and (.headRefName | test("^ticket/T-sim-s/|^ticket/T-sim-t1/scn-t1$"))) | .number'); do
   gh_state '(.pulls[] | select(.number == $n)).state = "CLOSED"' --argjson n "$n"
 done
 ej_line() {  # ej_line <pr>: the ejection record of PR <n> on main (factory/ledger/ejections.jsonl), or {}
@@ -353,7 +402,6 @@ judge S.native-dequeue "enqueued $(ghq -c --argjson n "$PR_N2" '[(.enqueued // [
   eval 'ghq -e --argjson n "$PR_N2" "any((.enqueued // [])[]; .pr == \$n)" >/dev/null && ejected "$PR_N2" red-queue-run &&
         [ "$(ej_line "$PR_N2" | jq -r .dequeued_reason)" = CI_FAILURE ]'
 gh_state '.merge_queue = null'
-unset SIM_STANDIN_GREEN
 
 # A T-sim-t1 PR whose second commit names T-sim-victim. Merged: post-merge completes T-sim-t1 (its
 # head branch's ticket) and reports T-sim-victim `foreign`, never completing it (merge:G11).
@@ -419,12 +467,12 @@ judge S.built-plus-claim "#$B2 lock $( [ -n "$(lock_of "$B2")" ] && echo kept ||
 # ------------------------------------------------------------------ HALT (last: it halts the factory)
 # A collaborator halts the line with zero approvals: the `factory:halt` label on a PR fires halt.yml
 # (pull_request_target labeled), which commits factory/HALT onto main on the App token (ADR-0004 C + D;
-# merge:G17). The PR that carries the label passes its own required checks with no approval either,
-# with attest-verify, still the ci:G6 stub until TB11, under the walk's stand-in (SIM_STANDIN_GREEN).
+# merge:G17). The PR that carries the label passes its own required checks with no approval either
+# (attest-verify passes the halt class: no node built it).
 scn_start human/halt-add
 scn_put factory/HALT 'sim: stop the line'
 git -C "$SCN" commit -qm "$(printf 'halt: stop the line\n\nSigned-off-by: sim-owner <sim-owner@sim.invalid>')"
-pr="$(scn_pr human/halt-add - sim-owner)"; SIM_STANDIN_GREEN="attest-verify" pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+pr="$(scn_pr human/halt-add - sim-owner)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.class-halt-add "context: $(ctx_of pull_request "$h")" ctx_is pull_request "$h" '.class == "halt" and .author_association == "OWNER"'
 miss="$(required_report "$(main_sha)" "$h")"
 approvals="$(git -C "$ORIGIN" show "$(main_sha):factory/policy/branch-protection.json" |

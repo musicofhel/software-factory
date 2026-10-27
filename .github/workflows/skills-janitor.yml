@@ -1,4 +1,9 @@
-# Skills are untrusted input: every change under factory/skills/ is scanned before merge.
+# Skills are untrusted input: every change under factory/skills/ is to be scanned before merge.
+# NOT a required check (specs/factory-step3-v1 TB11, ticket T30; merge:G18): skills-scan.sh is a stub
+# that exits 2 (step 4: the /janitor-security review is an agent's verdict, not a deterministic gate a
+# hosted runner recomputes), so this job is red on such PRs and blocks nothing. It has no merge_group
+# and is not on the first-party queue's path; it joins the required set only with a real body and
+# both paths (I18). Until then owners-check.sh wants two code owners on factory/** and .claude/**.
 name: skills-janitor
 on:
   pull_request:

@@ -82,21 +82,37 @@ run_push() {
   git -C "$CLONE" push -q origin "--force-with-lease=$ref:$seen" "$1:$ref" 2>>"$LOGBASE.git.err"
 }
 
-# run_gate_hashes <tip>: [{gate, sha256}] for the ticket's records in .adlc/manifest.jsonl at <tip>:
-# the gate-manifest hashes a PR body may carry (I8), never the records themselves.
-run_gate_hashes() {
-  local tmp line out='[]'
-  tmp="$(mktemp)"
-  if git -C "$CLONE" cat-file -e "$1:.adlc/manifest.jsonl" 2>/dev/null; then
-    while IFS= read -r line; do
-      jq -e --arg t "$TICKET" 'type == "object" and .ticket == $t' <<<"$line" >/dev/null 2>&1 || continue
-      printf '%s\n' "$line" >"$tmp"
-      out="$(jq -c --arg g "$(jq -r '(.gate // .type // "unknown") | tostring' <<<"$line")" --arg h "$(run_sha256 "$tmp")" \
-               '. + [{gate: ($g | if test("^[A-Za-z0-9._-]{1,64}$") then . else "unknown" end), sha256: $h}]' <<<"$out")"
-    done < <(git -C "$CLONE" show "$1:.adlc/manifest.jsonl")
-  fi
-  rm -f "$tmp"
-  printf '%s\n' "$out"
+# run_push_attested <sha> <note-file> <scratch-ref>: push <sha> to ticket/<id>/<handle> together with
+# the attest note on it (lib/attest.sh; ticket T30), in ONE atomic push: the branch with run_push's
+# lease, and refs/notes/factory-attest grown by one note from origin's tip (leased on that tip, so a
+# note another node pushed in between is never lost). <scratch-ref> is this slot's own notes ref
+# (refs/notes/factory-run/slot-<n>): slots never share a notes ref, and the node's tracking refs and
+# FETCH_HEAD are not touched. A lost race on the notes ref is retried from a fresh fetch, 3 tries; a
+# branch that moved under its lease is not retried. The scratch ref is deleted on every return.
+run_push_attested() {
+  local sha="$1" note="$2" nref="$3" ref="refs/heads/ticket/$TICKET/$HANDLE" seen ntip try rc
+  seen="$(git -C "$CLONE" rev-parse -q --verify "refs/remotes/origin/ticket/$TICKET/$HANDLE" || true)"
+  for try in 1 2 3; do
+    git -C "$CLONE" update-ref -d "$nref" 2>/dev/null || true
+    rc=0; git -C "$CLONE" ls-remote --exit-code origin "$ATTEST_REF" >/dev/null 2>>"$LOGBASE.git.err" || rc=$?
+    case "$rc" in
+      0) git -C "$CLONE" fetch -q --no-write-fetch-head origin "+$ATTEST_REF:$nref" 2>>"$LOGBASE.git.err" || break
+         ntip="$(git -C "$CLONE" rev-parse "$nref")" ;;
+      2) ntip="" ;;                                   # the first note ever
+      *) break ;;
+    esac
+    git -C "$CLONE" notes --ref="$nref" add -f -F "$note" "$sha" 2>>"$LOGBASE.git.err" || break
+    if git -C "$CLONE" push -q --atomic origin "--force-with-lease=$ref:$seen" "--force-with-lease=$ATTEST_REF:$ntip" \
+         "$sha:$ref" "$nref:$ATTEST_REF" 2>>"$LOGBASE.git.err"; then
+      git -C "$CLONE" update-ref -d "$nref" 2>/dev/null || true
+      return 0
+    fi
+    printf 'run_push_attested: try %s of 3 refused\n' "$try" >>"$LOGBASE.git.err"
+    # Only a moved notes ref is worth a retry: a branch that moved under the lease stays moved.
+    [ "$(git -C "$CLONE" ls-remote origin "$ref" 2>/dev/null | cut -f1)" = "$seen" ] || break
+  done
+  git -C "$CLONE" update-ref -d "$nref" 2>/dev/null || true
+  return 1
 }
 
 # run_dead_end <lapsed-ref> <file>: the material a lapsed ticket branch carries, for fleet's
@@ -144,9 +160,9 @@ run_pr_body() {
     + "| tokens | \(.tokens // "not reported by fleet 1.12.0") |\n"
     + "| base | `\(.base[0:12])` (\(.base_kind)) |\n| head | `\(.head[0:12])` |\n"
     + "| tamperguard | \(.tamperguard.verdict) (score \(.tamperguard.score), \(.tamperguard.findings) finding(s)) |\n"
-    + "| scope-check | pass |\n\n"
-    + "Gate-manifest hashes:\n"
-    + (if (.gates | length) == 0 then "- none recorded for this ticket\n"
-       else (.gates | map("- \(.gate) `\(.sha256)`") | join("\n")) + "\n" end)
+    + "| scope-check | pass |\n"
+    + "| rails-proof | pass |\n\n"
+    + (if .attest then "Gate manifest: the attest note (`refs/notes/factory-attest`, format `\(.attest.format)`, unsigned) on `\(.head[0:12])`, sha256 `\(.attest.sha256)`; attest-verify recomputes it in CI.\n"
+       else "Gate manifest: not recorded.\n" end)
     + "\nTranscripts never leave the node: this body carries ids, reason codes, counts and hashes only."' <<<"$1"
 }

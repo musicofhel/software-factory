@@ -36,6 +36,26 @@
 # claim unchanged (rebase-none); the rebase strike survives a PR retry and a pause (rebase-survives); a
 # gate's desk takes rebase-strike too (rebase-gated); a malformed ledger line is skipped
 # (rebase-malformed-line).
+# T30 (specs/factory-step3-v1 TB11): the gate manifest. run_setup puts main's .adlc/config.json
+# (securityMode unsigned-fallback, fleet.gate build + test) on main. After scope-check the node writes
+# $LOGBASE.attest.json (action attest-note, before the lock check) and pushes it as a note on the
+# pushed sha, in ONE atomic push with the branch (push ticket/<id>/<handle>, then push
+# refs/notes/factory-attest): origin's note holds format factory-attest/1, unsigned-fallback, the
+# ticket, node, adapter, outcome built, base the merge-base, head the pushed sha, its tree, fleet {run,
+# strikes, doc_sha256}, gate_commands (build-test.sh --list of main's fleet.gate) = tests_run, the
+# verdicts (tamperguard ok, rails-proof pass, scope pass) and the tamperguard JSON's hash; the note is
+# the log file byte for byte and the PR body's "Gate manifest" sha256 is its sha256; the PR body has
+# the rails-proof row and no gate-manifest-hashes list; the scratch ref
+# refs/notes/factory-run/slot-<n> is gone from the clone (success, rebase-clean: outcome rebased,
+# tests_run [], fleet run none, no fleet document). A PR that fails once: the slot state's
+# pr_pending.attest is {format, sha256} only, the retry pushes no second note and its body carries the
+# same sha256 (pr-open-once-fails). A second ticket grows the notes ref by one commit, the first note
+# unchanged (attest-second-ticket). rails-fail, scope-fail, tamper and a lost lock push no note
+# (rails-fail, scope-fail, tamper, lock-lost-before-push). The note's body (its gate_commands /
+# tests_run / signing / tree keys, `/bin/sh`, the format string) never reaches the ledger, stdout or the
+# slot state beyond pr_pending.attest.format (success, rebase-clean, pr-open-once-fails). main's
+# config `{}` (no fleet.gate) → attest-note-failed, released attest-error, exit 1, nothing pushed, the
+# lock released (attest-error).
 # tamperguard is laid out as a uv tool (fake_uv): its own install dir, and a python reached through a
 # version link, as on a real node.
 set -euo pipefail
@@ -53,8 +73,10 @@ run_setup() {
   export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 TZ=UTC
   export GIT_AUTHOR_NAME=node GIT_AUTHOR_EMAIL=node@fake GIT_COMMITTER_NAME=node GIT_COMMITTER_EMAIL=node@fake
   rm -rf "$FAKE_GH_GIT"
-  # T-run in main's ticket store (adlc's file name): the diff gates read its scope and rails from the base
+  # T-run in main's ticket store (adlc's file name): the diff gates read its scope and rails from the base;
+  # main's .adlc/config.json is the store's (securityMode, fleet.gate): the attest note's gate commands (T30)
   printf '%s\n' 'main-file factory/policy/adapters.json {"claude-code": "2.1.280", "codex": null}' \
+    'main-file .adlc/config.json {"securityMode": "unsigned-fallback", "fleet": {"gate": {"build": "true", "test": "true"}}}' \
     "main-file .adlc/tickets/t-run--$(printf %s T-run | sha256sum | cut -d' ' -f1).json"' {"id": "T-run", "title": "add hello.sh", "scope": ["hello.sh", "half.txt"], "rails": ["tests/rail/**"]}' \
     "node dev-box $((T0 - 7200)) active 2 dev-box" | tests/fixtures/make-repo.sh "$FAKE_GH_GIT"
   git clone -q "$FAKE_GH_GIT" "$WORLD/clone"
@@ -162,6 +184,52 @@ over_main() { git -C "$FAKE_GH_GIT" rev-list "$(git -C "$FAKE_GH_GIT" rev-parse 
 no_mark() { ! grep -rqF "$MARK" "$@"; }
 marker() { desk_marker_read "$(last_comment)"; }   # the needs-desk marker of the result comment
 want_marker() { jq -cn --arg r "$1" --arg h "${2:-hash-T-run}" '{ticket: "T-run", hash: $h, reason: $r, node: "dev-box"}'; }
+# T30: the attest note, as origin (the fake's git store) holds it
+NREF=refs/notes/factory-attest
+GATES='[{"key":"build","command":"true","argv":["/bin/sh","-c","true"]},{"key":"test","command":"true","argv":["/bin/sh","-c","true"]}]'
+note_raw() { local b; b="$(git -C "$FAKE_GH_GIT" notes --ref="$NREF" list "$1" 2>/dev/null)" && git -C "$FAKE_GH_GIT" cat-file blob "$b"; }
+note_sha() { note_raw "$1" | sha256sum | cut -d' ' -f1; }
+no_notes() { ! git -C "$FAKE_GH_GIT" rev-parse -q --verify "$NREF" >/dev/null; }
+no_attest() { [ "$(field '[.actions[] | select(startswith("attest-note") or startswith("push refs/notes/"))] | length')" = 0 ] && no_notes; }
+logsha() { sha256sum "$FACTORY_HOME/run/logs/$(field .run_id).$1" | cut -d' ' -f1; }
+pr_manifest_sha() { sed -nE 's/^Gate manifest: .*, sha256 `([0-9a-f]{64})`; attest-verify recomputes it in CI\.$/\1/p' "$1"; }
+# note_body_absent <file>...: the note's body never lands there: its gate_commands / tests_run (the
+# base's commands, `/bin/sh`), its signing and tree keys, the format string beyond pr_pending.attest
+note_body_absent() { ! grep -qE '"(gate_commands|tests_run|signing|tree)"|/bin/sh|factory-attest/1' "$@"; }
+# note_checks <outcome> <pr> <fleet {run, strikes, doc_sha256}>: the attest note on the pushed sha (T30)
+note_checks() {
+  local sha n tree body="$WORLD/prs/$2.md"; sha="$(pushed)"; n="$(note_raw "$sha" | jq -c . 2>/dev/null || true)"
+  tree="$(git -C "$FAKE_GH_GIT" rev-parse "$sha^{tree}")"
+  check "  T30: origin's $NREF holds one JSON note on the pushed sha" eq "$(jq -r type <<<"$n")" object
+  check "  the note's keys are factory-attest/1's" eq "$(jq -c 'keys' <<<"$n")" \
+    '["adapter","base","fleet","format","gate_commands","hashes","head","node","outcome","signing","tests_run","ticket","tree","verdicts"]'
+  check "  format factory-attest/1, unsigned-fallback; ticket, node, adapter" \
+    eq "$(jq -r '"\(.format) \(.signing) \(.ticket) \(.node) \(.adapter)"' <<<"$n")" "factory-attest/1 unsigned-fallback T-run dev-box claude-code@2.1.280"
+  check "  outcome $1; base the merge-base (main), head the pushed sha, tree its tree" \
+    eq "$(jq -r '"\(.outcome) \(.base) \(.head) \(.tree)"' <<<"$n")" "$1 $(git -C "$FAKE_GH_GIT" merge-base main "$sha") $sha $tree"
+  check "  fleet $3" eq "$(jq -cS .fleet <<<"$n")" "$(jq -cS . <<<"$3")"
+  check "  gate_commands: build-test.sh --list of main's fleet.gate" eq "$(jq -c .gate_commands <<<"$n")" "$GATES"
+  check "  tests_run: $([ "$1" = built ] && echo 'the gate commands (fleet ran them)' || echo '[] (no fleet run)')" \
+    eq "$(jq -c .tests_run <<<"$n")" "$([ "$1" = built ] && echo "$GATES" || echo '[]')"
+  check "  verdicts: tamperguard ok (score, findings as the ledger's), rails-proof pass, scope pass" \
+    eq "$(jq -cS .verdicts <<<"$n")" "$(jq -cS '{tamperguard, "rails-proof": "pass", scope: "pass"}' <<<"$LAST")"
+  check "  hashes: the sha256 of the claim's tamperguard JSON" eq "$(jq -c .hashes <<<"$n")" "{\"tamperguard_json\":\"$(logsha tamperguard.json)\"}"
+  check "  the note as pushed is the node's \$LOGBASE.attest.json, byte for byte" eq "$(note_sha "$sha")" "$(logsha attest.json)"
+  check "  the PR body's gate-manifest sha256 is the note's" eq "$(pr_manifest_sha "$body")" "$(note_sha "$sha")"
+  check "  the PR body names the note: ref, format, unsigned, the head" \
+    grep -qF "Gate manifest: the attest note (\`$NREF\`, format \`factory-attest/1\`, unsigned) on \`${sha:0:12}\`, sha256" "$body"
+  check "  the PR body has the rails-proof row, no gate-manifest-hashes list" \
+    eval 'grep -qxF "| rails-proof | pass |" "$body" && ! grep -qF "Gate-manifest hashes" "$body"'
+  check "  actions: attest-note after scope-check, before the lock check; branch then note pushed" \
+    eq "$(field '[.actions[] | select(test("^(scope-check|attest-note|lock-owned|push )"))] | join(",")')" \
+       "scope-check,attest-note,lock-owned,push ticket/T-run/dev-box,push $NREF"
+  check "  the scratch notes ref is gone from the clone (no refs/notes/* at all there)" \
+    eq "$(git -C "$WORLD/clone" for-each-ref --format='%(refname)' refs/notes)" ""
+  printf '%s\n' "$OUT" >"$WORLD/stdout.txt"
+  check "  the note's body is not in the ledger or stdout" note_body_absent "$FACTORY_HOME/run/ledger.jsonl" "$WORLD/stdout.txt"
+  check "  (the node-local note file does match that grep, so it is not vacuous)" \
+    eval '! note_body_absent "$FACTORY_HOME/run/logs/$(field .run_id).attest.json"'
+}
 
 case_success() {
   run_setup
@@ -213,13 +281,14 @@ case_success() {
   check "  the pushed sha is the gated one (.gate_head)" eq "$(pushed)" "$(field .gate_head)"
   check "  tamperguard ok, rails-proof pass, scope-check pass" \
     eq "$(field '"\(.tamperguard.verdict) \(.rails_proof) \(.scope_check)"')" "ok pass pass"
-  check "  in that order, before the push" \
-    eq "$(field '[.actions[] | select(test("^(tamperguard|rails-proof|scope-check|push )"))] | join(",")')" \
-       "tamperguard,rails-proof,scope-check,push ticket/T-run/dev-box"
+  check "  in that order, then the attest note, before the push of the branch and the note (T30)" \
+    eq "$(field '[.actions[] | select(test("^(tamperguard|rails-proof|scope-check|attest-note|push )"))] | join(",")')" \
+       "tamperguard,rails-proof,scope-check,attest-note,push ticket/T-run/dev-box,push refs/notes/factory-attest"
   check "  the real scripts passed (their stderr in the claim's log base)" \
     eval 'grep -qF "rails-proof: pass" "$FACTORY_HOME/run/logs/$(field .run_id).rails.err" &&
           grep -qF "scope-check: pass" "$FACTORY_HOME/run/logs/$(field .run_id).scope.err"'
   check "  no nap under --once" test ! -e "$WORLD/naps"
+  note_checks built 2 "$(jq -cn --arg r "$(field .fleet.run)" --arg d "$(logsha fleet.json)" '{run: $r, strikes: 1, doc_sha256: $d}')"
 }
 
 gate_desk() {  # gate_desk <reason>: a diff gate failed on the gated commit: desk, nothing pushed
@@ -233,6 +302,8 @@ gate_desk() {  # gate_desk <reason>: a diff gate failed on the gated commit: des
   check "  the comment says nothing was pushed" grep -qF 'Nothing pushed.' <<<"$(last_comment)"
   check "  the lock is released, the worktree gone, no slot state" \
     eq "$(lock)$([ -e "$WT" ] && echo kept)$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)" ""
+  check "  no attest note written or pushed (T30): no attest-note action, origin has no $NREF" \
+    no_attest
 }
 
 case_scope_fail() {
@@ -273,6 +344,7 @@ case_tamper() {
   check "  verdict, score and finding count only" eq "$(jq -c .tamperguard <<<"$LAST")" '{"verdict":"tamper","score":10,"findings":1}'
   check "  rails-proof and scope-check never ran" eq "$(field '[.rails_proof, .scope_check, (.actions | index("rails-proof"), index("scope-check"))] | unique | tojson')" "[null]"
   check "  nothing pushed" test -z "$(pushed)"
+  check "  no attest note written or pushed (T30): no attest-note action, origin has no $NREF" no_attest
   check "  labeled needs-desk, ready removed" eq "$(labels)" in-progress,needs-desk,w:light
   check "  the comment ends in the needs-desk marker, reason tamper" eq "$(marker)" "$(want_marker tamper)"
   check "  the lock is released" test -z "$(lock)"
@@ -497,8 +569,9 @@ case_lock_lost_before_push() {
     chmod +x "$WORLD/bin/ralon"
     loop --once
     check "the lock is $how after fleet, all gates pass: exit 0, outcome lock-lost" eq "$RC $(field '"\(.outcome) \(.reason)"')" "0 lock-lost lock-lost"
-    check "  the lock check said so after the gates" \
-      eq "$(field '.actions | (index("lock-lost") > index("scope-check")) and (index("lock-owned") == null)')" true
+    check "  the lock check said so after the gates and the attest note (T30)" \
+      eq "$(field '[.actions[] | select(test("^(scope-check|attest-note|lock-owned|lock-lost|push )"))] | join(",")')" scope-check,attest-note,lock-lost
+    check "  the note stays on the node: origin has no $NREF" no_notes
     check "  nothing pushed to ticket/T-run/*, no PR" \
       eq "$(git -C "$FAKE_GH_GIT" for-each-ref --format=x refs/heads/ticket | wc -l | tr -d ' ') $(jq '.pulls // [] | length' "$FAKE_GH_ISSUES") $(field .pushed)" "0 0 null"
     check "  no comment beyond the claim's, no label edit (the claim's labels)" eq "$(comments) $(labels)" "1 in-progress,ready,w:light"
@@ -521,12 +594,65 @@ case_pr_open_once_fails() {
     eq "$(jq -c '[.pr_pending.tries, .pr_pending.sha == "'"$sha"'"]' "$FACTORY_HOME/run/slot-1.json")" '[1,true]'
   check "  the lock is kept, the Issue's labels untouched, no result comment" eq "$(test -n "$(lock)" && echo kept) $(labels) $(comments)" "kept in-progress,ready,w:light 1"
   check "  the worktree is gone (the pushed sha is all the PR needs)" test ! -e "$WT"
+  check "  T30: the note went out with the branch: origin's $NREF has it on the pushed sha" eq "$(note_raw "$sha" | jq -r .head)" "$sha"
+  check "  the slot state's pr_pending.attest is the note's format and sha256 only" \
+    eq "$(jq -c .pr_pending.attest "$FACTORY_HOME/run/slot-1.json")" "$(jq -cn --arg h "$(note_sha "$sha")" '{format: "factory-attest/1", sha256: $h}')"
+  jq 'del(.pr_pending.attest)' "$FACTORY_HOME/run/slot-1.json" >"$WORLD/slot-rest.json"
+  check "  the note's body is not in the slot state (beyond that) or the ledger" note_body_absent "$WORLD/slot-rest.json" "$FACTORY_HOME/run/ledger.jsonl"
   loop --once
   check "the next iteration retries the PR: exit 0, pr-retry on the pushed sha" \
     eq "$RC $(field '"\(.actions[0]) \(.pr_retry.sha)"')" "0 pr-retry $sha"
   check "  the lock checked first, then the PR opened; fleet did not run again" \
     eq "$(field '.actions | index("lock-owned") < index("pr-open")') $(fleet_calls)" "true 1"
+  check "  no second note, no second push of it; the retried PR body carries the note's sha256 (from the slot state)" \
+    eq "$(field '[.actions[] | select(startswith("attest-note") or startswith("push "))] | length') $(git -C "$FAKE_GH_GIT" rev-list --count "$NREF") $(pr_manifest_sha "$WORLD/prs/2.md")" \
+       "0 1 $(note_sha "$sha")"
   handoff_checks
+}
+
+case_attest_error() {
+  # T30: main's .adlc/config.json has no fleet.gate (build-test.sh --list refuses it): no note can be written
+  run_setup
+  main_moves "store: no fleet.gate" .adlc/config.json '{}'
+  loop --once
+  check "no fleet.gate on main: exit 1 (the slot stops), outcome released, reason attest-error" \
+    eq "$RC $(field '"\(.outcome) \(.reason)"')" "1 released attest-error"
+  check "  every gate passed first, then attest-note-failed; no lock check, no push" \
+    eq "$(field '[.actions[] | select(test("^(tamperguard|rails-proof|scope-check|attest-note|lock-|push)"))] | join(",")')" \
+       tamperguard,rails-proof,scope-check,attest-note-failed
+  check "  nothing pushed: no ticket branch, no $NREF, no PR on the origin" \
+    eq "$(git -C "$FAKE_GH_GIT" for-each-ref --format=x refs/heads/ticket | wc -l | tr -d ' ') $(no_notes && echo none) $(jq '.pulls // [] | length' "$FAKE_GH_ISSUES") $(field .pushed)" \
+       "0 none 0 null"
+  check "  the claim released: the lock gone, the comment names attest-error, no needs-desk" \
+    eq "$(lock)|$(grep -c 'reason `attest-error`' <<<"$(last_comment)")|$(labels)" "|1|in-progress,ready,w:light"
+  check "  the worktree is gone, no slot state, no scratch notes ref in the clone" \
+    eq "$([ -e "$WT" ] && echo kept)$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)$(git -C "$WORLD/clone" for-each-ref refs/notes)" ""
+}
+
+case_attest_second_ticket() {
+  # T30: a second ticket's note grows origin's notes ref from its tip; the first ticket's note stays
+  run_setup
+  loop --once
+  local first second n1 tick
+  first="$(pushed)"; n1="$(note_raw "$first")"
+  tick=".adlc/tickets/t-two--$(printf %s T-two | sha256sum | cut -d' ' -f1).json"
+  main_moves "store: T-two" "$tick" '{"id": "T-two", "title": "add hello.sh too", "scope": ["hello.sh"], "rails": ["tests/rail/**"]}'
+  FAKE_ADLC_TICKETS="$(jq -c '. + [{id: "T-two", title: "add hello.sh too", body: "Build hello.sh too.", rails: ["tests/rail/**"]}]' <<<"$FAKE_ADLC_TICKETS")"
+  fakegh_issue 3 $((T0 - 3600)) ready,w:light "T-two: add hello.sh too" \
+    "$(printf '<!-- mirrored by factory/bin/mirror.sh -->\nTicket: T-two\nTicket-Hash: hash-T-two\n\nBuild hello.sh too.\n')"
+  loop --once
+  second="$(fakegh_ref refs/heads/ticket/T-two/dev-box)"
+  check "a second ticket (T-two, Issue #3) on the same node: built, pushed ticket/T-two/dev-box" \
+    eq "$RC $(field '"\(.outcome) \(.ticket) \(.pushed.sha)"')" "0 built T-two $second"
+  check "  origin's $NREF holds two notes: on the first ticket's sha and the second's" \
+    eq "$(git -C "$FAKE_GH_GIT" notes --ref="$NREF" list | cut -d' ' -f2 | sort)" "$(printf '%s\n' "$first" "$second" | sort)"
+  check "  the first ticket's note is unchanged" eq "$(note_raw "$first")" "$n1"
+  check "  the second note is T-two's, on its sha, its base the moved main" \
+    eq "$(note_raw "$second" | jq -r '"\(.ticket) \(.head) \(.base)"')" "T-two $second $(omain)"
+  check "  the notes ref grew by one commit on the first (two commits, a line)" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-list --count "$NREF") $(git -C "$FAKE_GH_GIT" rev-list --parents -n1 "$NREF" | wc -w | tr -d ' ')" "2 2"
+  check "  the PR body's sha256 is the second note's" eq "$(pr_manifest_sha "$WORLD/prs/$(field .pr).md")" "$(note_sha "$second")"
+  check "  no scratch notes ref left in the clone" eq "$(git -C "$WORLD/clone" for-each-ref refs/notes)" ""
 }
 
 case_pr_open_twice_fails() {
@@ -1086,9 +1212,9 @@ case_rebase_clean() {
     eq "$(field .gate_base) $(field .gate_head)" "$main $(pushed)"
   check "  tamperguard's range is that one" eq "$(jq -c . "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$main...$(pushed)" '["--range", $r, "--json"]')"
   check "  tamperguard ok, rails-proof pass, scope-check pass" eq "$(field '"\(.tamperguard.verdict) \(.rails_proof) \(.scope_check)"')" "ok pass pass"
-  check "  in order: tamperguard, rails-proof, scope-check, the lock check, the push" \
-    eq "$(field '[.actions[] | select(test("^(tamperguard|rails-proof|scope-check|lock-owned|push )"))] | join(",")')" \
-       "tamperguard,rails-proof,scope-check,lock-owned,push ticket/T-run/dev-box"
+  check "  in order: tamperguard, rails-proof, scope-check, the attest note, the lock check, the push (T30)" \
+    eq "$(field '[.actions[] | select(test("^(tamperguard|rails-proof|scope-check|attest-note|lock-owned|push )"))] | join(",")')" \
+       "tamperguard,rails-proof,scope-check,attest-note,lock-owned,push ticket/T-run/dev-box,push refs/notes/factory-attest"
   check "  a new PR #8 from ticket/T-run/dev-box (the ejected #7 stays closed)" \
     eq "$(field .pr) $(jq -c '[.pulls[] | [.number, .state]]' "$FAKE_GH_ISSUES")" '8 [[7,"CLOSED"],[8,"OPEN"]]'
   check "  the PR body's outcome row: rebased, the ejected E, PR #7, rebase strike 2" \
@@ -1103,6 +1229,10 @@ case_rebase_clean() {
     eq "$(labels)|$(lock)|$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)$([ -e "$WT" ] && echo kept)" "in-review,w:light||"
   check "  the result comment names PR #8" grep -qF 'PR #8' <<<"$(last_comment)"
   check "  the ledger has the same line" eq "$(tail -n1 "$FACTORY_HOME/run/ledger.jsonl")" "$LAST"
+  # T30: a rebase strike's note: outcome rebased, no tests run, fleet run none (rebase_apply), no fleet document
+  note_checks rebased 8 '{"run": "none", "strikes": 0, "doc_sha256": null}'
+  check "  the note is on the rebased commit only (not on the ejected E)" \
+    eq "$(git -C "$FAKE_GH_GIT" notes --ref="$NREF" list | cut -d' ' -f2)" "$(pushed)"
 }
 
 case_rebase_conflict() {
@@ -1259,7 +1389,7 @@ for c in ${CASES:-success scope-fail rails-fail no-adversarial-review tamper pol
                   pr-open-once-fails pr-open-twice-fails budget-override strikes-exhausted flail desk-marker \
                   review-unavailable anything-else argv resume lapsed-range no-transcript once governor dry-run guards \
                   fakes bwrap-shim rebase-clean rebase-conflict rebase-ineligible rebase-none rebase-gated \
-                  rebase-survives rebase-malformed-line}; do
+                  rebase-survives rebase-malformed-line attest-error attest-second-ticket}; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

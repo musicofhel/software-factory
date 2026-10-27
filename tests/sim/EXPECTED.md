@@ -4,10 +4,13 @@ Every stage judges the **desired** behavior of the pipeline (specs/factory-step3
 means the pipeline did the right thing, `red: <gap id>` that it does not yet, with the gap of
 `specs/factory-step3-v1/records/sim/*.md` that explains it and the row that fixes it. After a red
 stage the sim plays a labeled stand-in (`stand-in:` in sim.log) so the later stages stay observable.
-The queue's stand-ins: GitHub's view of the `attest-verify` stub as green (SIM_STANDIN_GREEN, the
-walk and the queue scenarios only, so a PR can reach the queue; jobs.jsonl keeps its real failure),
-a repo admin's merge for the scenario merges that are no queue's, and GitHub's own native merge
-queue (the group, its merge_group run, its merge and its dequeue) in the native scenarios.
+The queue's stand-ins: a repo admin's merge for the scenario merges that are no queue's, GitHub's
+own native merge queue (the group, its merge_group run, its merge and its dequeue) in the native
+scenarios, and the App unset for S.tier-jump's two PRs (a real configuration: enqueue runs
+`--dry-run`), so the approved, green tier-0 PR is not landed by the queue inside its own event before
+the tier-1 PR is judged. Since TB11 (ticket T30) attest-verify is real and no gate has a green
+stand-in: every ticket PR the sim opens carries its attest note (the walk's from run.sh, the
+scenarios' from lib/scenarios.sh `scn_attest`), and lib/driver.sh's SIM_STANDIN_GREEN is unused.
 `tests/sim/lib/compare.sh` compares this table with the results in both directions: a stage that
 goes green before its line here says `pass` fails the sim as much as a regression does. The row that
 fixes a gap flips its lines in the same commit. A stage only GitHub
@@ -20,7 +23,8 @@ queue's commit (enqueue.yml calls gates.yml), one line per job the driver ran fr
 from the caller's inputs; `.enqueue` = enqueue.yml's `pick` built the queue commit, `.merge` = `land`
 pushed it to main; `.node-tamper`, `.node-rails`,
 `.node-scope` = the node's three diff gates on the commit it pushes, from run.sh's ledger line;
-`.i17-argv` = the node's `diff-gates:` trace lines and tamperguard argv equal those of the PR's
+`.attest-note` = origin holds the node's attest note on the PR head, with its ticket, node, base,
+head, tests run and passing verdicts (ADR-0007 decision 9); `.i17-argv` = the node's `diff-gates:` trace lines and tamperguard argv equal those of the PR's
 `rails-proof`, `scope` and `tamper` jobs on the same base...head); `S.*` are the failure scenarios
 (lib/scenarios.sh), each judged on the gate that should stop it naming its own reason, and `S.class-*`
 on the class the `context` job gave the PR; `gh.forms` = no script called a `gh` form the fake gh does
@@ -41,6 +45,7 @@ not model.
 | P.node-rails | pass |
 | P.node-scope | pass |
 | P.commit-shape | pass |
+| P.attest-note | pass |
 | P.pr-open | pass |
 | P.claim-released | pass |
 | P.tier-label | pass |
@@ -58,7 +63,8 @@ not model.
 | P.pr.desk | pass |
 | P.pr.owners | pass |
 | P.pr.halt-guard | pass |
-| P.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
+| P.pr.attest-verify | pass |
+| P.pr.flaky | pass |
 | P.pr.required-checks | pass |
 | P.hold | pass |
 | P.tier-order | pass |
@@ -75,7 +81,8 @@ not model.
 | P.q.desk | pass |
 | P.q.owners | pass |
 | P.q.halt-guard | pass |
-| P.q.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built`; GitHub's view of it is the sim's labeled stand-in (TB11) |
+| P.q.attest-verify | pass |
+| P.q.flaky | pass |
 | P.q.identity | pass |
 | P.merge | pass |
 | P.merged-mark | red: kit: GitHub marks the PR merged once its head is reachable from main, but its merge_commit_sha then is undocumented; post-merge needs it equal to the queue commit (TB12) |
@@ -89,6 +96,7 @@ not model.
 | C.node-rails | pass |
 | C.node-scope | pass |
 | C.commit-shape | pass |
+| C.attest-note | pass |
 | C.pr-open | pass |
 | C.claim-released | pass |
 | C.tier-label | pass |
@@ -106,7 +114,8 @@ not model.
 | C.pr.desk | pass |
 | C.pr.owners | pass |
 | C.pr.halt-guard | pass |
-| C.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
+| C.pr.attest-verify | pass |
+| C.pr.flaky | pass |
 | C.pr.required-checks | pass |
 | C.hold | pass |
 | C.tier-order | pass |
@@ -123,7 +132,8 @@ not model.
 | C.q.desk | pass |
 | C.q.owners | pass |
 | C.q.halt-guard | pass |
-| C.q.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built`; GitHub's view of it is the sim's labeled stand-in (TB11) |
+| C.q.attest-verify | pass |
+| C.q.flaky | pass |
 | C.q.identity | pass |
 | C.merge | pass |
 | C.merged-mark | red: kit: GitHub marks the PR merged once its head is reachable from main, but its merge_commit_sha then is undocumented; post-merge needs it equal to the queue commit (TB12) |
@@ -132,6 +142,8 @@ not model.
 | C.lock-released | pass |
 | S.out-of-scope | pass |
 | S.tamper-skip | pass |
+| S.attest-mismatch | pass |
+| S.attest-missing | pass |
 | S.rail-edit | pass |
 | S.no-trailer | pass |
 | S.head-edits-gate | pass |
@@ -141,6 +153,7 @@ not model.
 | S.ticket-ref-malformed | pass |
 | S.fork-ticket-ref | pass |
 | S.class-human | pass |
+| S.quarantine-expired | pass |
 | S.stranger-refused | pass |
 | S.ticket-adlc | pass |
 | S.head-edits-gate-config | pass |
@@ -150,7 +163,7 @@ not model.
 | S.desk-stale-base | pass |
 | S.desk-no-records | pass |
 | S.child-before-parent | pass |
-| S.tier-jump | red: ci:G6 — attest-verify.sh is a stub, so no PR is ever green and tier-order has nothing to wait for (TB11; the scenario's PR_A then also needs its attest note) |
+| S.tier-jump | pass |
 | S.queue-conflict | pass |
 | S.rebase-strike | pass |
 | S.queue-red | pass |

@@ -1,6 +1,6 @@
 # ADR-0007: The merge queue — GitHub's when the repo has one, else a first-party serial queue
 
-- Status: accepted 2026-10-27 (specs/factory-step3-v1 row TB9; ticket T28)
+- Status: accepted 2026-10-27 (specs/factory-step3-v1 row TB9; ticket T28); amended 2026-10-27 by row TB11 (ticket T30): decision 9, the attest note
 - Date: 2026-10-27
 - Deciders: @musicofhel. The loop `specs/factory-step3-v1` drafted it under ticket T28.
 
@@ -79,6 +79,35 @@ organization is Aaron's decision and out of the spec's scope.
 8. **The merge method is `merge`** (carry 3 of the spec's HANDOFF). The serial queue always makes a
    two-parent merge commit. The native queue's merge method is set by the branch-protection policy
    (TB10); `squash` would break commit-check's queue rule and post-merge's range.
+9. **The attest note: what the queue checks about the node** (specs/factory-step3-v1 TB11, ticket
+   T30; ci:G6, ci:G16, node:G6). The node writes its gate manifest as one JSON git note on the ticket
+   commit it pushes, under `refs/notes/factory-attest`, and pushes it in the same atomic push as the
+   branch (`lib/run.sh` `run_push_attested`: the notes ref grows from origin's tip under a lease, so
+   two nodes never drop each other's notes; each slot builds it on its own scratch ref). Format
+   `factory-attest/1` (`factory/bin/lib/attest.sh`):
+   `{format, signing, ticket, node, adapter, outcome: built | rebased, base, head, tree, fleet: {run,
+   strikes, doc_sha256}, gate_commands, tests_run, verdicts: {tamperguard: {verdict, score, findings},
+   rails-proof, scope}, hashes: {tamperguard_json}}`. It holds ids, shas, codes, counts, the base's
+   gate commands and hashes, never a finding's text (I8). It is unsigned, which the store's
+   `securityMode: unsigned-fallback` allows (ruling Q1 of factory-run-calls-v1); a key can sign it
+   later.
+   The required check `attest-verify` reads the note on the PR head. On `merge_group` and the
+   first-party queue, that is the queue commit's second parent, which must be the PR's own head
+   (`gh api pulls/N`). The check recomputes everything it
+   can from the base, through the same helpers the node calls (I17): the ticket, node and adapter
+   against the gate context and the commit's own trailers; the merge-base, head and tree; the gate
+   command list (`build-test.sh --list` of `fleet.gate` at the merge-base) and the tests fleet ran;
+   and the rails-proof, scope and tamperguard verdicts. A missing note, a note lacking a key, a ticket not open in
+   the store at the merge-base, or any mismatch fails it. So does a store that no longer accepts
+   unsigned notes. What CI cannot recompute (fleet's run id,
+   strikes and the two hashes) stays as a record. A desk, halt or human PR has no node and no note,
+   and passes; approvals gate those (TB10).
+   CorvidLabs/attest 1.0.0 (MIT, a linux binary; `records/TB0.md` (c)) also keeps records in git
+   notes, under `refs/notes/attest`. Its record is `{reviewer, confidence, verdict, tests-passed,
+   human-approved}`, and `attest verify` checks it against a confidence policy. That record has no
+   field for a recomputable gate verdict, so the factory uses its own format beside it. An attest
+   record can be added on the same commit later without touching this one. The node's token asks
+   for write access to `refs/notes/factory-attest` along with its branches (join.sh).
 
 ## Consequences
 
@@ -93,3 +122,5 @@ organization is Aaron's decision and out of the spec's scope.
   `land`'s push and what `merge_commit_sha` it reports, and the native dequeue reason values. That
   `mergeQueue` reads null on this user-owned repo is measured (`records/TB0.md` (a):
   `{"data":{"repository":{"mergeQueue":null}}}`).
+- A PR built before the attest note existed (or pushed by hand on a ticket ref) fails
+  `attest-verify` until a node rebuilds it. Notes accumulate on one ref; nothing prunes them.
