@@ -13,6 +13,7 @@
 #   GC_EVENT    pull_request | merge_group | node
 #   GC_BASE     pull_request.base.sha | merge_group.base_sha | --base, else the merge-base of
 #               refs/remotes/origin/main and the head (the node; never a lapsed tip)
+#   GC_BASE_BRANCH  the base branch (pull_request.base.ref, merge_group.base_ref; main on the node)
 #   GC_HEAD     pull_request.head.sha | merge_group.head_sha | --head, else HEAD
 #   GC_PR       the PR number: the event's, or on merge_group N of gh-readonly-queue/<base>/pr-<N>-<sha>;
 #               empty on the node
@@ -105,7 +106,7 @@ gate_context() {
     shift
   done
   GC_EVENT="" GC_BASE="" GC_HEAD="" GC_PR="" GC_HEAD_REF="" GC_TICKET="" GC_HANDLE="" GC_CLASS=""
-  GC_AUTHOR="" GC_ASSOC="" GC_BODY="" GC_HEAD_REPO="" GC_REPO=""
+  GC_AUTHOR="" GC_ASSOC="" GC_BODY="" GC_HEAD_REPO="" GC_REPO="" GC_BASE_BRANCH=main
   # Explicit flags are the node's call (run.sh: --ticket --base --head); a runner's event otherwise.
   if [ -n "$ticket$base$head" ] || [ -z "${GITHUB_EVENT_NAME:-}" ]; then
     GC_EVENT=node
@@ -127,12 +128,14 @@ gate_context() {
       pull="$(jq -c '.pull_request // empty' <<<"$ev")"
       [ -n "$pull" ] || die "a $GITHUB_EVENT_NAME event without .pull_request"
       GC_BASE="$(jq -r '.base.sha // empty' <<<"$pull")"; GC_HEAD="$(jq -r '.head.sha // empty' <<<"$pull")"
-      GC_PR="$(jq -r '.number // empty' <<<"$pull")"
+      GC_PR="$(jq -r '.number // empty' <<<"$pull")"; GC_BASE_BRANCH="$(jq -r '.base.ref // "main"' <<<"$pull")"
       gc_pull "$pull" ;;
     merge_group)
       GC_EVENT=merge_group
       GC_BASE="$(jq -r '.merge_group.base_sha // empty' <<<"$ev")"; GC_HEAD="$(jq -r '.merge_group.head_sha // empty' <<<"$ev")"
       local qref; qref="$(jq -r '.merge_group.head_ref // empty' <<<"$ev")"
+      # shellcheck disable=SC2034  # read by depends-check.sh and tier-order.sh (gc_store_sha)
+      GC_BASE_BRANCH="$(jq -r '.merge_group.base_ref // "refs/heads/main" | sub("^refs/heads/"; "")' <<<"$ev")"
       GC_PR="$(gc_queue_pr "$qref")" || refuse "merge_group head_ref '$qref' is not gh-readonly-queue/<base>/pr-<N>-<sha>"
       pull="$(gh api "repos/$GC_REPO/pulls/$GC_PR")" || die "cannot read PR #$GC_PR of $GC_REPO (GH_TOKEN with pull-requests: read)"
       [ "$(jq -r '.number // empty' <<<"$pull")" = "$GC_PR" ] || die "repos/$GC_REPO/pulls/$GC_PR answered another PR"
@@ -180,6 +183,48 @@ gate_context_json() {
       ticket: $ticket, handle: $handle, class: $class, author: $author, author_association: $assoc}
      | with_entries(select(.value != ""))'
 }
+
+# The base store (specs/factory-step3-v1 TB8, ticket T27): what depends-check.sh, tier-order.sh and
+# labeler.sh read, never the head's.
+#
+#   gc_store_sha <base> [branch]  the newest trusted commit of the base branch this checkout holds:
+#                                 refs/remotes/origin/<branch> (default main) when it descends from
+#                                 <base>, else <base>. GitHub re-runs a job with its original event
+#                                 ("the same GITHUB_SHA (commit SHA) and GITHUB_REF (git ref) of the
+#                                 original event", docs: re-run workflows and jobs), so a job labeler.sh
+#                                 re-runs reads main as it is now. The branch only moves forward
+#                                 (ruleset main: non_fast_forward) and a head plants no remote ref in a
+#                                 fresh checkout, so the tip is as trusted as <base>.
+#   gc_store <sha>                every ticket of the store at <sha> (.adlc/tickets/<slug>--<sha256>.json)
+#                                 as one JSON array; an unreadable file dies (fail closed), never an
+#                                 empty store
+#   GC_STORE_JQ                   jq defs over that array: gc_tier (the body header `tier: <n>`, or
+#                                 null), gc_parents($id) (the ids with an edge to $id, mirror.sh's rule)
+gc_store_sha() {
+  local base="$1" tip
+  tip="$(git rev-parse -q --verify "refs/remotes/origin/${2:-main}^{commit}" 2>/dev/null || true)"
+  if [ -n "$tip" ] && [ "$tip" != "$base" ] && git merge-base --is-ancestor "$base" "$tip" 2>/dev/null; then
+    printf '%s\n' "$tip"
+  else
+    printf '%s\n' "$base"
+  fi
+}
+gc_store() {
+  local sha="$1" files f
+  files="$(git ls-tree -z --full-tree --name-only "$sha" -- .adlc/tickets/ | tr '\0' '\n')" || die "cannot list .adlc/tickets/ at ${sha:0:12}"
+  while IFS= read -r f; do
+    [[ "$f" =~ ^\.adlc/tickets/[a-z0-9-]+--[0-9a-f]{64}\.json$ ]] || continue
+    git show "$sha:$f" | jq -ce 'select(type == "object" and (.id | type) == "string")' ||
+      die "$f at ${sha:0:12} is not a ticket (fail closed)"
+  done <<<"$files" | jq -sc . || die "cannot read the store at ${sha:0:12}"
+}
+# shellcheck disable=SC2034  # read by depends-check.sh, tier-order.sh, labeler.sh
+GC_STORE_JQ='
+def gc_tier: (.body // "" | gsub("\r"; "") | split("\n")) as $l | ($l | index("")) as $i
+  | [$l[0:($i // ($l | length))][] | capture("^tier:[ \t]*(?<v>[0-9]+)[ \t]*$")? | .v] | first
+  | if . == null then null else tonumber end;
+def gc_parents($id): [.[] | select(any(.edges[]?; .to == $id)) | .id];
+'
 
 # gate_begin [flags]: what every gate script calls first: resolve, check identity, say on stderr which
 # copy of the gate runs against what (the job log shows the base's script ran, I16).

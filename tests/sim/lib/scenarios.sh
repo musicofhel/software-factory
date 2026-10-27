@@ -248,6 +248,7 @@ scn_start ticket/T-sim-c2/scn-early
 scn_put sim/c2/hello.sh 'echo hello'
 scn_commit T-sim-c2; pr="$(scn_pr ticket/T-sim-c2/scn-early T-sim-c2)"; approve "$pr"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.child-before-parent "$(scn_detail depends-on "$h")" check_fails_naming depends-on "$h" 'T-sim-p2'
+C2_PR="$pr" C2_HEAD="$h"   # S.child-released: the parent merges and this held job is re-run
 
 # A tier-1 PR while an approved tier-0 PR is open: tier-order holds the tier-1 one.
 scn_start ticket/T-sim-s/scn-a
@@ -302,6 +303,17 @@ mk_lock "$P2" dev-box "$old"
 janitor_sweep
 judge S.held-24h "#$P2 labels $(ghq --argjson n "$P2" '.issues[] | select(.number == $n) | [.labels[].name] | join(",")'); lock ${P2:+$( [ -n "$(lock_of "$P2")" ] && echo kept || echo released)}" \
   eval '! has_label "$P2" ready && ! has_label "$P2" needs-desk'
+
+# The parent merges. post-merge completes T-sim-p2; on post-merge's completion (workflow_run) the
+# labeler finds T-sim-c2's held depends-on answering otherwise against main now and re-runs it; the
+# re-run replays the PR's event and reads the store at main's tip (lib/gate-context.sh gc_store_sha).
+queue_and_merge "$(pr_of ticket/T-sim-p2/dev-box)"
+rerun_of() {  # rerun_of <job> <head>: the conclusion of the driver's latest re-run of that job, or empty
+  jq -r --arg j "$1" --arg h "$2" 'select(.rerun == true and .job == $j and .head_sha == $h) | .conclusion' "$SIM/jobs.jsonl" | tail -n1
+}
+judge S.child-released "T-sim-p2 completed: $(done_of T-sim-p2); #$C2_PR $(scn_detail depends-on "$C2_HEAD"); re-run: $(rerun_of depends-on "$C2_HEAD")" \
+  eval 'test "$(done_of T-sim-p2)" = true && test "$(rerun_of depends-on "$C2_HEAD")" = success &&
+        test "$(check_of depends-on "$C2_HEAD")" = success'
 
 # node-b (1 slot) has T-sim-b1 built an hour ago with its PR open, and claimed T-sim-b2 10 min ago.
 # The sweep must leave the new claim alone (the built ticket's PR is the claim, not a slot).

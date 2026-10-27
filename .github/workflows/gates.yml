@@ -8,6 +8,11 @@
 # scripts from ./.base: a PR that edits a gate script or this file is still gated by the base's
 # copy. factory/bin/lib/gate-context.sh resolves base, head, PR, ticket and PR class the same way
 # for every gate; `context` prints them.
+#
+# `depends-on` and `tier-order` (specs/factory-step3-v1 TB8, ticket T27) read the store at the base, or
+# at origin/main when it descends from the base: labeler.yml re-runs a held job once its parent merged
+# or a lower tier turned green, and a re-run replays the original event. tier-order reads other PRs'
+# runs and jobs (`actions: read`).
 name: gates
 on:
   pull_request:
@@ -19,6 +24,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
+  actions: read
   security-events: write
 env:
   GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
@@ -102,6 +108,30 @@ jobs:
       - name: Signed-off-by + Assisted-by trailers on every commit of a ticket branch
         env: { GH_TOKEN: "${{ github.token }}" }
         run: ./.base/factory/bin/commit-check.sh
+  # A ticket PR waits until every parent (a ticket of the base store with an edge to it) is completed
+  # there; the PR body is never read (merge:G3, ci:G9).
+  depends-on:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { ref: "${{ env.GATE_BASE }}", path: .base }
+      - name: every parent of the base's ticket is completed in the base store (exit 2 holds, naming them)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: ./.base/factory/bin/depends-check.sh
+  # A tier-n ticket PR waits while an approved, green, open ticket PR of a lower tier exists (merge:G5,
+  # ci:G10); within a tier the queue keeps first-green order (TB9).
+  tier-order:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { ref: "${{ env.GATE_BASE }}", path: .base }
+      - name: no approved, green, open ticket PR of a lower tier (exit 2 waits, naming them)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: ./.base/factory/bin/tier-order.sh
   # A PR touching .adlc/** (the desk's, or any other): the store it would put on main lints, its
   # manifest chain only grows from main, and every ticket it adds or changes carries its current
   # `ready` records (specs/factory-step3-v1 TB7, ticket T26). Any other PR passes at once.

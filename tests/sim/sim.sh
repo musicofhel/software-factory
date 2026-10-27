@@ -235,6 +235,10 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   lock="$(lock_of "$n")"
   judge "$X.claim-released" "lock ${lock:+kept }${lock:-released}; Issue labels $(ghq --argjson n "$n" '.issues[] | select(.number == $n) | [.labels[].name] | join(",")')" \
     claim_handed_to_pr "$n"
+  # The labeler's schedule (labeler.yml from main; GitHub's clock, not a stand-in): the tier label and
+  # the display block from main's store.
+  printf '{"schedule":"*/15 * * * *"}\n' >"$SIM/ev-sched-labeler.json"
+  drive schedule "$SIM/ev-sched-labeler.json" "$(main_sha)" .github/workflows/labeler.yml
   judge "$X.tier-label" "PR labels: $(pr_field "$pr" '[.labels[].name] | join(",")')" \
     ghq -e --argjson n "$pr" 'any(.pulls[] | select(.number == $n) | .labels[]; .name | startswith("tier:"))'
 

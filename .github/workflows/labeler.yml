@@ -1,0 +1,72 @@
+# The trusted labeler (specs/factory-step3-v1 TB8, ticket T27; intake:I3, node:G8, merge:G5). From a
+# checkout of main, never a PR head (no pull_request_target): factory/bin/labeler.sh labels every open
+# ticket PR `tier:<n>` from main's store, writes the PR body's display block (Depends-on, tier,
+# prosecuting adapter, Assisted-by), and re-runs a PR's `depends-on` or `tier-order` job when main's
+# answer changed (a parent merged, a lower tier merged or turned green).
+#
+# GITHUB_TOKEN events start no workflow, dispatch excepted (records/TB0.md (d)): post-merge's push on
+# GITHUB_TOKEN starts nothing, so the labeler also runs when post-merge completes (workflow_run), on
+# every push to main (a merge, or post-merge's push on the App token), and on a schedule for the
+# rest (a lower-tier PR turning green). The App token is used when one is configured.
+name: labeler
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [post-merge]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "print what would change, change nothing"
+        type: boolean
+        default: false
+concurrency:
+  group: labeler
+  cancel-in-progress: false
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: write
+defaults:
+  run:
+    shell: bash
+jobs:
+  labeler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The secrets context cannot appear in a step's `if:`; its presence is read here.
+    env:
+      FACTORY_APP_ID: ${{ vars.FACTORY_APP_ID }}
+      HAS_APP_KEY: ${{ secrets.FACTORY_APP_KEY != '' }}
+    steps:
+      # A configured App whose token cannot be minted fails the job: no silent fallback then.
+      - name: mint the factory App token
+        id: app
+        if: env.FACTORY_APP_ID != '' && env.HAS_APP_KEY == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_KEY }}
+          permission-pull-requests: write
+          permission-issues: write
+          permission-actions: write
+      - uses: actions/checkout@v4
+        with: { ref: main, fetch-depth: 0 }
+      - name: tier labels, the display block, and the re-run of held jobs (factory/bin/labeler.sh)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          APPLY: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run == false }}
+        run: |
+          if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
+          echo "labeler $mode" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./factory/bin/labeler.sh "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

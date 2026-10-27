@@ -37,7 +37,7 @@ not model.
 | P.commit-shape | pass |
 | P.pr-open | pass |
 | P.claim-released | pass |
-| P.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
+| P.tier-label | pass |
 | P.pr.context | pass |
 | P.pr.identity | pass |
 | P.i17-argv | pass |
@@ -47,11 +47,13 @@ not model.
 | P.pr.tamper | pass |
 | P.pr.dependencies | pass |
 | P.pr.commit-check | pass |
+| P.pr.depends-on | pass |
+| P.pr.tier-order | pass |
 | P.pr.desk | pass |
 | P.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | P.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
-| P.hold | red: merge:G3 — no `depends-on` job (TB8) |
-| P.tier-order | red: merge:G5 — no `tier-order` job (TB8) |
+| P.hold | pass |
+| P.tier-order | pass |
 | P.enqueue | red: merge:G4 — nothing enqueues a green PR (TB9) |
 | P.mg.context | pass |
 | P.mg.identity | pass |
@@ -61,6 +63,8 @@ not model.
 | P.mg.tamper | pass |
 | P.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
 | P.mg.commit-check | pass |
+| P.mg.depends-on | pass |
+| P.mg.tier-order | pass |
 | P.mg.desk | pass |
 | P.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | P.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
@@ -77,7 +81,7 @@ not model.
 | C.commit-shape | pass |
 | C.pr-open | pass |
 | C.claim-released | pass |
-| C.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
+| C.tier-label | pass |
 | C.pr.context | pass |
 | C.pr.identity | pass |
 | C.i17-argv | pass |
@@ -87,11 +91,13 @@ not model.
 | C.pr.tamper | pass |
 | C.pr.dependencies | pass |
 | C.pr.commit-check | pass |
+| C.pr.depends-on | pass |
+| C.pr.tier-order | pass |
 | C.pr.desk | pass |
 | C.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | C.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
-| C.hold | red: merge:G3 — no `depends-on` job (TB8) |
-| C.tier-order | red: merge:G5 — no `tier-order` job (TB8) |
+| C.hold | pass |
+| C.tier-order | pass |
 | C.enqueue | red: merge:G4 — nothing enqueues a green PR (TB9) |
 | C.mg.context | pass |
 | C.mg.identity | pass |
@@ -101,6 +107,8 @@ not model.
 | C.mg.tamper | pass |
 | C.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
 | C.mg.commit-check | pass |
+| C.mg.depends-on | pass |
+| C.mg.tier-order | pass |
 | C.mg.desk | pass |
 | C.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | C.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
@@ -127,12 +135,13 @@ not model.
 | S.desk-chain-race | pass |
 | S.desk-stale-base | pass |
 | S.desk-no-records | pass |
-| S.child-before-parent | red: merge:G3 — no `depends-on` job (TB8) |
-| S.tier-jump | red: merge:G5 — no `tier-order` job (TB8) |
+| S.child-before-parent | pass |
+| S.tier-jump | red: ci:G6 — attest-verify.sh is a stub, so no PR is ever green and tier-order has nothing to wait for (TB11; the scenario's PR_A then also needs its attest note) |
 | S.queue-conflict | red: merge:G7 — no ejection: no `autorebase` label, no ejections.jsonl (TB9) |
 | S.foreign-trailer | pass |
 | S.foreign-trailer-refused | pass |
 | S.held-24h | pass |
+| S.child-released | pass |
 | S.built-plus-claim | pass |
 | S.class-halt-add | pass |
 | S.halt-add | red: merge:G17 — adding HALT waits on `gates / <job>` contexts and one approval (TB10) |

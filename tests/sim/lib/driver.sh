@@ -18,6 +18,20 @@
 #         push          {ref, before, after}
 #         schedule      {schedule: <cron>}       (only-workflow-file names the workflow)
 #         issues        {action, label: {name}, issue: {number}}
+#         workflow_run  {action: completed, workflow_run: {id, name, path, event, head_sha, head_branch,
+#                       conclusion}}: the driver fires it itself, never a caller (below)
+#       Each run is also recorded as GitHub's Actions API answers it: `.runs` of the fake gh state
+#       ({id, name, path, event, head_sha, head_branch, created_at, run_attempt, jobs: [{id, name,
+#       status, conclusion, started_at, completed_at}]}, ids and times from the `.seq` counter on the
+#       pinned clock FAKE_GH_NOW), with the sim's own `_`-keys to replay a job.
+#       After the workflows of an event ran, every one of them `completed` fires `workflow_run` for the
+#       workflows of main's tip that name it (GitHub reads workflow_run workflows from the default
+#       branch). One level: a workflow_run run fires none (GitHub allows three; nothing here chains).
+#       Last, the outermost drive plays every job re-run requested meanwhile (POST
+#       actions/jobs/<id>/rerun appends to `.reruns`): the job runs again with its run's original
+#       event, sha and workflow file ("Re-runs use ... the same GITHUB_SHA (commit SHA) and
+#       GITHUB_REF (git ref) of the original event", GitHub docs, re-run workflows and jobs), a new
+#       job id replaces the old one in its run, run_attempt + 1, and a new check run is recorded.
 #       Each job's `run:` steps see PATH = <job>.pipx-bin:RUNNER_PATH and PIPX_BIN_DIR = that dir,
 #       fresh per job (GitHub: PIPX_BIN_DIR=/opt/pipx_bin on PATH, one VM per job).
 #       Appends one JSON line per job to $SIM/jobs.jsonl: {workflow, job, event, conclusion, log}.
@@ -64,6 +78,9 @@ def filt($cfg; $key; $vals):
      else true end)
     and (if .event == "pull_request" then filt($cfg; "branches"; [.payload.pull_request.base.ref])
          elif .event == "push" then filt($cfg; "branches"; [.payload.ref | sub("^refs/heads/"; "")])
+         elif .event == "workflow_run" then
+           (.payload.workflow_run.name | IN(($cfg.workflows // [])[]))
+           and filt($cfg; "branches"; [.payload.workflow_run.head_branch])
          else true end)
     and (if .event == "pull_request" or .event == "push" then
            (if $cfg == null or $cfg.paths == null then true else any(.files[]; any_glob($cfg.paths; .)) end)
@@ -81,9 +98,10 @@ JOB_ORDER_JQ='
     | if ($w | length) == 0 then error("needs cycle") else .done += $w | .out += $w end)
 | .out[]'
 
+DRV_DEPTH=0
 drive() {
   local event="$1" evfile="$2" wsha="$3" only="${4:-}"
-  local all n i file wf payload files="[]" sha ref base_ref="" head_ref="" head_sha
+  local all n i file wf payload files="[]" sha ref base_ref="" head_ref="" head_sha done_runs=() r
   payload="$(jq -c . "$evfile")"
   case "$event" in
     pull_request)
@@ -97,11 +115,13 @@ drive() {
     push)
       sha="$(jq -r .after <<<"$payload")"; ref="$(jq -r .ref <<<"$payload")"; head_sha="$sha"
       files="$(git -C "$ORIGIN" diff --name-only "$(jq -r .before <<<"$payload")" "$sha" | jq -Rsc 'split("\n")[:-1]')" ;;
-    schedule|issues|workflow_dispatch)
+    schedule|issues|workflow_dispatch|workflow_run)
       sha="$(git -C "$ORIGIN" rev-parse refs/heads/main)"; ref=refs/heads/main; head_sha="$sha" ;;
     *) drv_die "event $event is not simulated" ;;
   esac
-  all="$(wf_all "$wsha")"
+  # A commit's workflows never change: the last sha's list is reused (every workflow_run reads main's).
+  if [ "$wsha" != "${DRV_ALL_SHA:-}" ]; then DRV_ALL="$(wf_all "$wsha")"; DRV_ALL_SHA="$wsha"; fi
+  all="$DRV_ALL"
   n="$(jq length <<<"$all")"
   for ((i = 0; i < n; i++)); do
     file="$(jq -r ".[$i].file" <<<"$all")"
@@ -113,14 +133,75 @@ drive() {
       jq -e --arg e "$event" --argjson p "$payload" --argjson f "$files" '{on, event: $e, payload: $p, files: $f} | '"$MATCH_JQ" \
         <<<"$wf" >/dev/null || continue
     fi
-    run_workflow "$file" "$wf" "$event" "$payload" "$sha" "$ref" "$base_ref" "$head_ref" "$head_sha"
+    DRV_DEPTH=$((DRV_DEPTH + 1))
+    run_workflow "$file" "$wf" "$event" "$payload" "$sha" "$ref" "$base_ref" "$head_ref" "$head_sha" "$wsha"
+    DRV_DEPTH=$((DRV_DEPTH - 1))
+    done_runs+=("$DRV_RUN_ID")
+  done
+  if [ "$event" != workflow_run ]; then
+    for r in "${done_runs[@]+"${done_runs[@]}"}"; do
+      jq -c --argjson id "$r" '.runs[] | select(.id == $id)
+        | {action: "completed", workflow_run: ({id, name, path, event, head_sha, head_branch}
+           + {conclusion: (if any(.jobs[]; .conclusion == "failure") then "failure" else "success" end)})}' \
+        "$FAKE_GH_ISSUES" >"$SIM/ev-wfrun.json"
+      DRV_DEPTH=$((DRV_DEPTH + 1))
+      drive workflow_run "$SIM/ev-wfrun.json" "$(git -C "$ORIGIN" rev-parse refs/heads/main)"
+      DRV_DEPTH=$((DRV_DEPTH - 1))
+    done
+  fi
+  [ "$DRV_DEPTH" != 0 ] || play_reruns
+}
+
+gh_seq() {  # gh_seq: the next id of the fake gh state's `.seq` counter (run ids, job ids, clock ticks)
+  gh_state '.seq = ((.seq // 0) + 1)'
+  jq -r .seq "$FAKE_GH_ISSUES"
+}
+gh_time() { jq -nr --argjson s "$1" --argjson t "${FAKE_GH_NOW:-0}" '$t + $s | todate'; }
+
+# Every job re-run requested since (`.reruns`), in request order, until none is left.
+play_reruns() {
+  local jid run job wdir nwdir res started nid
+  while [ "$(jq '(.reruns // []) | length' "$FAKE_GH_ISSUES")" != 0 ]; do
+    jid="$(jq -r '.reruns[0]' "$FAKE_GH_ISSUES")"
+    gh_state '.reruns = .reruns[1:]'
+    run="$(jq -c --argjson j "$jid" '.runs[] | select(any(.jobs[]; .id == $j))' "$FAKE_GH_ISSUES")"
+    [ -n "$run" ] || drv_die "re-run of job $jid: no run holds it"
+    job="$(jq -r --argjson j "$jid" '.jobs[] | select(.id == $j) | .name' <<<"$run")"
+    local file wf; file="$(jq -r ._file <<<"$run")"
+    wf="$(git -C "$ORIGIN" show "$(jq -r ._wsha <<<"$run"):$file" | yq -o=json '.' | jq -c .)"
+    jq -e --arg j "$job" '.jobs[$j].needs == null' <<<"$wf" >/dev/null ||
+      drv_die "re-run of $file/$job: a job with needs is not simulated"
+    wdir="$(jq -r ._wdir <<<"$run")"; nwdir="$(mktemp -d "$SIM/run.XXXXXX")"
+    cp "$wdir/event.json" "$wdir/ctx0.json" "$nwdir/"
+    started="$(gh_seq)"
+    res="$(run_job "$file" "$wf" "$job" "$(jq -r .event <<<"$run")" "$nwdir" '{}' "$(jq -r ._sha <<<"$run")" \
+           "$(jq -r ._ref <<<"$run")" "$(jq -r ._base_ref <<<"$run")" "$(jq -r ._head_ref <<<"$run")")"
+    nid="$(gh_seq)"
+    gh_state '(.runs[] | select(.id == $r)) |= (.run_attempt += 1 | .jobs |= map(if .id == $j then
+                {id: $n, name, status: "completed", conclusion: $c, started_at: $s, completed_at: $e} else . end))' \
+      --argjson r "$(jq .id <<<"$run")" --argjson j "$jid" --argjson n "$nid" --arg c "$res" \
+      --arg s "$(gh_time "$started")" --arg e "$(gh_time "$nid")"
+    jq -cn --arg w "$file" --arg j "$job" --arg e "$(jq -r .event <<<"$run")" --arg c "$res" --arg h "$(jq -r .head_sha <<<"$run")" \
+      --arg l "$nwdir/$job.log" '{workflow: $w, job: $j, event: $e, conclusion: $c, head_sha: $h, log: $l, rerun: true}' >>"$SIM/jobs.jsonl"
+    gh_state '.checks = ((.checks // []) + [{name: $j, workflow: $w, event: $e, head_sha: $h, conclusion: $c}])' \
+      --arg j "$job" --arg w "$file" --arg e "$(jq -r .event <<<"$run")" --arg h "$(jq -r .head_sha <<<"$run")" --arg c "$res"
+    printf 'sim driver: re-ran %s/%s (job %s → %s): %s\n' "$file" "$job" "$jid" "$nid" "$res" >>"$SIM/sim.log"
   done
 }
 
 run_workflow() {
-  local file="$1" wf="$2" event="$3" payload="$4" sha="$5" ref="$6" base_ref="$7" head_ref="$8" head_sha="$9"
-  local wdir job needs="{}" res
+  local file="$1" wf="$2" event="$3" payload="$4" sha="$5" ref="$6" base_ref="$7" head_ref="$8" head_sha="$9" wsha="${10}"
+  local wdir job needs="{}" res rid started jid head_branch
   wdir="$(mktemp -d "$SIM/run.XXXXXX")"
+  # The run as the Actions API lists it: a pull_request run's head_branch is the PR's head ref.
+  rid="$(gh_seq)"; DRV_RUN_ID="$rid"
+  head_branch="$head_ref"; [ -n "$head_branch" ] || head_branch="${ref#refs/heads/}"
+  gh_state '.runs = ((.runs // []) + [{id: $id, name: $n, path: $f, event: $e, head_sha: $h, head_branch: $hb,
+              created_at: $at, run_attempt: 1, jobs: [], _file: $f, _wsha: $ws, _wdir: $wd, _sha: $sha, _ref: $ref,
+              _base_ref: $br, _head_ref: $hr}])' \
+    --argjson id "$rid" --arg n "$(jq -r '.name // ""' <<<"$wf")" --arg f "$file" --arg e "$event" --arg h "$head_sha" \
+    --arg hb "$head_branch" --arg at "$(gh_time "$rid")" --arg ws "$wsha" --arg wd "$wdir" --arg sha "$sha" --arg ref "$ref" \
+    --arg br "$base_ref" --arg hr "$head_ref"
   printf '%s\n' "$payload" >"$wdir/event.json"
   jq -n --arg e "$event" --argjson p "$payload" --arg sha "$sha" --arg ref "$ref" --arg r "$REPO" \
      --arg br "$base_ref" --arg hr "$head_ref" --argjson vars "$SIM_VARS" --argjson sec "$SIM_SECRETS" --argjson wf "$wf" '
@@ -129,7 +210,12 @@ run_workflow() {
      env: {}, vars: $vars, secrets: ($sec + {GITHUB_TOKEN: "ghs_sim_github_token"}), inputs: {}, steps: {}, needs: {},
      job: {}, runner: {os: "Linux", temp: ""}, matrix: {}}' >"$wdir/ctx0.json"
   while IFS= read -r job; do
+    started="$(gh_seq)"
     res="$(run_job "$file" "$wf" "$job" "$event" "$wdir" "$needs" "$sha" "$ref" "$base_ref" "$head_ref")"
+    jid="$(gh_seq)"
+    gh_state '(.runs[] | select(.id == $r)).jobs += [{id: $j, name: $n, status: "completed", conclusion: $c,
+                started_at: $s, completed_at: $e}]' \
+      --argjson r "$rid" --argjson j "$jid" --arg n "$job" --arg c "$res" --arg s "$(gh_time "$started")" --arg e "$(gh_time "$jid")"
     needs="$(jq -c --arg j "$job" --arg r "$res" '.[$j] = {result: $r, outputs: {}}' <<<"$needs")"
     jq -cn --arg w "$file" --arg j "$job" --arg e "$event" --arg c "$res" --arg h "$head_sha" --arg l "$wdir/$job.log" \
       '{workflow: $w, job: $j, event: $e, conclusion: $c, head_sha: $h, log: $l}' >>"$SIM/jobs.jsonl"

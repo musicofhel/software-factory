@@ -53,6 +53,11 @@
 #        branch must exist on FAKE_GH_GIT; the number is max(issue, PR numbers) + 1, refs/pull/<n>/head
 #        is written as GitHub does; prints the PR URL; the author is @me),
 #        view <n> --json fields (the same fields).
+# pr:    edit <n> (--add-label/--label, --remove-label repeatable; --body | --body-file; unknown repo
+#        labels fail, as gh does; label names match case-insensitively).
+# api:   GET actions/runs (?head_sha=, ?event=, ?branch= filter; newest first), GET
+#        actions/runs/<id>/jobs, POST actions/jobs/<id>/rerun (404 unknown job, 403 not completed;
+#        the id is appended to .reruns) on the "runs" array of FAKE_GH_ISSUES (see actions()).
 # api:   DELETE collaborators/<login> (204; the login is appended to .removed_collaborators of
 #        FAKE_GH_ISSUES, so a sim can see the revoke).
 #        GET pulls/<n>: the REST pull-request object of a "pulls" entry (number, state, merged, title,
@@ -141,6 +146,7 @@ api() {
     explicit_body=1
   fi
   [ "$explicit" = 1 ] || { if [ "$fields" != '{}' ] || [ -n "$explicit_body" ]; then method=POST; else method=GET; fi; }
+  local query=""; case "$path" in *\?*) query="${path#*\?}" ;; esac
   path="${path%%\?*}"
   case "$path" in "repos/$REPO/"*) path="${path#"repos/$REPO/"}" ;; *) http_err 404 "Not Found" ;; esac
   case "$path" in
@@ -150,6 +156,9 @@ api() {
       : "${FAKE_GH_ISSUES:?fake gh api collaborators needs FAKE_GH_ISSUES}"
       mutate '.removed_collaborators = ((.removed_collaborators // []) + [$u])' --arg u "${path#collaborators/}"
       return 0 ;;
+    actions/runs|actions/runs/*/jobs|actions/jobs/*/rerun)
+      : "${FAKE_GH_ISSUES:?fake gh api actions needs FAKE_GH_ISSUES}"
+      actions "$method" "$path" "$query" "$jqx"; return ;;
     pulls/*)
       [ "$method" = GET ] || unsupported "fake gh api: only GET pulls/<n> is modeled"
       local n="${path#pulls/}" base_sha
@@ -233,6 +242,43 @@ api() {
       return 0 ;;
     *) [ -z "${FAKE_GH_UNKNOWN:-}" ] || printf 'api %s %s\t%s\n' "$method" "$path" "$(printf '%q ' "${ARGV[@]}")" >>"$FAKE_GH_UNKNOWN"
        http_err 404 "Not Found" ;;
+  esac
+  if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+}
+
+# ---------------------------------------------------------------- actions (runs, jobs, re-run)
+# .runs of FAKE_GH_ISSUES: [{id, name, path, event, head_sha, created_at, run_attempt,
+# jobs: [{id, name, status, conclusion, started_at, completed_at}]}] (keys starting `_` are the sim
+# driver's own and never answered). A re-run request is appended to .reruns; the sim driver plays it.
+actions() {  # actions <method> <path> <query> <jq>
+  local method="$1" path="$2" query="$3" jqx="$4" out q id
+  qv() { tr '&' '\n' <<<"$query" | sed -n "s/^$1=//p" | head -n1; }
+  case "$method $path" in
+    "GET actions/runs")
+      q="$(jq -cn --arg h "$(qv head_sha)" --arg e "$(qv event)" --arg b "$(qv branch)" '{h: $h, e: $e, b: $b}')"
+      out="$(jq -c --argjson q "$q" '
+        [(.runs // [])[] | select(($q.h == "" or .head_sha == $q.h) and ($q.e == "" or .event == $q.e)
+                                  and ($q.b == "" or .head_branch == $q.b))]
+        | sort_by(.id) | reverse
+        | map({id, name, path, event, head_sha, head_branch, run_attempt: (.run_attempt // 1), created_at,
+               status: "completed",
+               conclusion: (if any((.jobs // [])[]; .conclusion == "failure") then "failure" else "success" end)})
+        | {total_count: length, workflow_runs: .}' "$FAKE_GH_ISSUES")" ;;
+    "GET actions/runs/"*/jobs)
+      id="${path#actions/runs/}"; id="${id%/jobs}"
+      [[ "$id" =~ ^[0-9]+$ ]] && jq -e --argjson id "$id" 'any((.runs // [])[]; .id == $id)' "$FAKE_GH_ISSUES" >/dev/null ||
+        http_err 404 "Not Found"
+      out="$(jq -c --argjson id "$id" '.runs[] | select(.id == $id) | .id as $r
+        | [(.jobs // [])[] | {id, run_id: $r, name, status, conclusion, started_at, completed_at}] | {total_count: length, jobs: .}' "$FAKE_GH_ISSUES")" ;;
+    "POST actions/jobs/"*/rerun)
+      id="${path#actions/jobs/}"; id="${id%/rerun}"
+      [[ "$id" =~ ^[0-9]+$ ]] && jq -e --argjson id "$id" 'any((.runs // [])[] | (.jobs // [])[]; .id == $id)' "$FAKE_GH_ISSUES" >/dev/null ||
+        http_err 404 "Not Found"
+      jq -e --argjson id "$id" 'any(.runs[] | (.jobs // [])[]; .id == $id and .status == "completed")' "$FAKE_GH_ISSUES" >/dev/null ||
+        http_err 403 "This job is not completed yet"
+      mutate '.reruns = ((.reruns // []) + [$id])' --argjson id "$id"
+      return 0 ;;
+    *) unsupported "fake gh api: $method $path is not modeled" ;;
   esac
   if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
 }
@@ -469,7 +515,7 @@ label() {
 pr() {
   : "${FAKE_GH_ISSUES:?fake gh pr needs FAKE_GH_ISSUES}"
   local sub="${1:-}"; shift || true
-  local repo="" state=open limit=30 fields="" head="" base="" title="" body="" have_body=0 labels='[]' n=""
+  local repo="" state=open limit=30 fields="" head="" base="" title="" body="" have_body=0 labels='[]' rmlabels='[]' n=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -R|--repo) repo="$2"; shift ;;
@@ -480,7 +526,8 @@ pr() {
       -t|--title) title="$2"; shift ;;
       -b|--body) body="$2"; have_body=1; shift ;;
       -F|--body-file) if [ "$2" = - ]; then body="$(command cat)"; else body="$(command cat "$2")"; fi; have_body=1; shift ;;
-      -l|--label) labels="$(jq -c --arg v "$2" '. + ($v | split(","))' <<<"$labels")"; shift ;;
+      -l|--label|--add-label) labels="$(jq -c --arg v "$2" '. + ($v | split(","))' <<<"$labels")"; shift ;;
+      --remove-label) rmlabels="$(jq -c --arg v "$2" '. + ($v | split(","))' <<<"$rmlabels")"; shift ;;
       --json) fields="$2"; shift ;;
       -*) unsupported "fake gh pr $sub: unsupported argument $1" ;;
       *) [ -z "$n" ] || unsupported "fake gh pr $sub: unsupported argument $1"; n="$1" ;;
@@ -534,6 +581,22 @@ pr() {
       n="$(jq '[.pulls[].number] | max' "$FAKE_GH_ISSUES")"
       git -C "$FAKE_GH_GIT" update-ref "refs/pull/$n/head" "$sha"
       printf 'https://github.com/%s/pull/%s\n' "$REPO" "$n" ;;
+    edit)
+      [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any((.pulls // [])[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
+        fail "GraphQL: Could not resolve to a PullRequest with the number of $n."
+      [ "$labels$have_body$rmlabels" != '[]0[]' ] || fail "fake gh pr edit: nothing to edit (it would prompt)"
+      # Label names match case-insensitively, as on GitHub; a PR carries the repo label's own casing.
+      local missing
+      missing="$(jq -r --argjson l "$labels" '[.labels[] | ascii_downcase] as $known | $l[] | select(ascii_downcase | IN($known[]) | not)' "$FAKE_GH_ISSUES" | head -n1)"
+      [ -z "$missing" ] || fail "'$missing' not found"
+      labels="$(jq -c --argjson l "$labels" '.labels as $k | [$l[] | ascii_downcase as $d | first($k[] | select(ascii_downcase == $d))]' "$FAKE_GH_ISSUES")"
+      mutate '(.pulls[] | select(.number == $n)) |= (
+                .labels = ([(.labels // [])[] | if type == "string" then {name: .} else . end
+                            | select(.name | ascii_downcase | IN($rm[] | ascii_downcase) | not)]
+                           + ($l | map({name: .})) | unique_by(.name | ascii_downcase))
+                | if $hb == 1 then .body = $body else . end)' \
+        --argjson n "$n" --argjson l "$labels" --argjson rm "$rmlabels" --argjson hb "$have_body" --arg body "$body"
+      printf 'https://github.com/%s/pull/%s\n' "$REPO" "$n" ;;
     *) unsupported "fake gh pr: unsupported subcommand '$sub'" ;;
   esac
 }
@@ -541,12 +604,12 @@ pr() {
 # Every form modeled above, for tests/test_sim.sh.
 forms() {
   printf '%s\n' "issue list" "issue create" "issue edit" "issue comment" "issue close" "issue reopen" \
-    "label list" "label create" "pr list" "pr create" "pr view" \
+    "label list" "label create" "pr list" "pr create" "pr view" "pr edit" \
     "api GET git/matching-refs/*" "api GET git/ref/*" "api GET git/commits/*" "api POST git/commits" \
     "api POST git/refs" "api PATCH git/refs/*" "api DELETE git/refs/*" \
     "api GET branches/*/protection" "api PUT branches/*/protection" "api DELETE branches/*/protection" \
     "api GET rulesets" "api GET rulesets/*" "api POST rulesets" "api PUT rulesets/*" "api DELETE collaborators/*" \
-    "api GET pulls/*"
+    "api GET pulls/*" "api GET actions/runs" "api GET actions/runs/*/jobs" "api POST actions/jobs/*/rerun"
 }
 
 case "${1:-}" in

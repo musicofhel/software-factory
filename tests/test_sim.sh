@@ -90,9 +90,9 @@ case_gh_unknown_refused() {
   check "and logged to FAKE_GH_UNKNOWN" grep -q 'repo view' "$W/unknown.log"
   rc=0
   git init -q --bare "$W/u.git"
-  FAKE_GH_GIT="$W/u.git" FAKE_GH_UNKNOWN="$W/unknown.log" FAKE_GH_ISSUES="$W/gh-u.json" FAKE_GH_REPO=a/b "$FAKES_DIR/gh" api repos/a/b/actions/runs >/dev/null 2>&1 || rc=$?
+  FAKE_GH_GIT="$W/u.git" FAKE_GH_UNKNOWN="$W/unknown.log" FAKE_GH_ISSUES="$W/gh-u.json" FAKE_GH_REPO=a/b "$FAKES_DIR/gh" api repos/a/b/deployments >/dev/null 2>&1 || rc=$?
   check "an unknown api path is refused" test "$rc" != 0
-  check "and logged" eq "$(grep -c 'actions/runs' "$W/unknown.log")" 1
+  check "and logged" eq "$(grep -c 'deployments' "$W/unknown.log")" 1
 }
 
 jobs_awk() {  # jobs_awk <workflow.yml>: the `jobs:` keys, parsed without yq
