@@ -219,12 +219,14 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   else stage "$X.fleet-preflight" pass ""; fi
   if [ "$(jq -r '.reason // .outcome // empty' <<<"$RUN_LAST")" = tamper ]; then stage "$X.node-tamper" red "$RUN_LAST"
   else stage "$X.node-tamper" pass "tamperguard ok"; fi
-  if grep -q scope-check-not-built <<<"$RUN_LAST"; then
-    stage "$X.node-scope" red "scope-check-not-built"
-    standin "a passing scope-check (the real one is TB3)"
-    printf '#!/usr/bin/env bash\nexit 0\n' >"$SIM/bin/scope-pass"; chmod +x "$SIM/bin/scope-pass"
-    node_run dev-box FAKE_FLEET_CHECK_CONFIG=0 FAKE_FLEET_FILE="$dir/hello.sh" FACTORY_SCOPE_CHECK="$SIM/bin/scope-pass"
-  else stage "$X.node-scope" pass ""; fi
+  # The node's diff gates on GATE_BASE...GATE_HEAD (run.sh on_success), from its ledger line.
+  local nrun ngb ngh
+  nrun="$(jq -r '.run_id // empty' <<<"$RUN_LAST")"; ngb="$(jq -r '.gate_base // empty' <<<"$RUN_LAST")"; ngh="$(jq -r '.gate_head // empty' <<<"$RUN_LAST")"
+  judge "$X.node-rails" "rails_proof: $(jq -r '.rails_proof // "absent"' <<<"$RUN_LAST") on ${ngb:0:12}...${ngh:0:12}$(node_gate_err "$nrun" rails)" \
+    jq -e '.rails_proof == "pass"' <<<"$RUN_LAST"
+  judge "$X.node-scope" "scope_check: $(jq -r '.scope_check // "absent"' <<<"$RUN_LAST") on ${ngb:0:12}...${ngh:0:12}$(node_gate_err "$nrun" scope)" \
+    jq -e '.scope_check == "pass"' <<<"$RUN_LAST"
+  local ntg; ntg="$(tail -n1 "$SIM/nodes/dev-box/tg.log")"
   pr="$(pr_of "ticket/$id/dev-box")"
   [ -n "$pr" ] || die "no PR for $id after the node ran: $RUN_LAST"
   head="$(pr_field "$pr" .headRefOid)"; base="$(git -C "$ORIGIN" merge-base "$(main_sha)" "$head")"
@@ -238,9 +240,16 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
     ghq -e --argjson n "$pr" 'any(.pulls[] | select(.number == $n) | .labels[]; .name | startswith("tier:"))'
 
   # Every workflow job on pull_request; the gate context names this PR, its ticket and class.
-  local pbase; pbase="$(main_sha)"
+  local pbase tgn; pbase="$(main_sha)"
+  tgn="$(wc -l <"$FAKE_TAMPERGUARD_LOG" | tr -d ' ')"
   pr_event "$pr"
   job_stages "$X.pr" pull_request "$head"
+  # I17: the node ran the same helper with the same argv as CI's three diff gates on this PR. The node
+  # pushes exactly GATE_HEAD, so CI's head is that sha and CI's base (the PR's base, main now) is its
+  # merge-base when main has not moved since; each gate's `diff-gates:` trace lines and tamperguard's
+  # own argv must then be equal, line for line.
+  judge "$X.i17-argv" "$(i17_detail "$nrun" "$ngb" "$ngh" "$pbase" "$head" "$ntg" "$tgn")" \
+    i17_same "$nrun" "$ngb" "$ngh" "$pbase" "$head" "$ntg" "$tgn"
   judge "$X.pr.identity" "context: $(ctx_of pull_request "$head")" ctx_is pull_request "$head" \
     ".event == \"pull_request\" and .pr == $pr and .ticket == \"$id\" and .handle == \"dev-box\" and .class == \"ticket\"
      and .base == \"$pbase\" and .head == \"$head\""
@@ -267,6 +276,45 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   judge "$X.complete" "post-merge" test "$(adlc_desk ticket show "$id" --json | jq -r .ticket.completed)" = true
   judge "$X.issue-closed" "#$n $(issue_state "$n")" test "$(issue_state "$n")" = closed
   judge "$X.lock-released" "refs/locks/issue-$n ${lock:+still there}" test -z "$(lock_of "$n")"
+}
+node_gate_err() {  # node_gate_err <run-id> <rails|scope>: `; <last line>` of the gate's stderr on the node, or nothing
+  local f="$SIM/nodes/dev-box/fh/run/logs/$1.$2.err"
+  [ -n "$1" ] && [ -s "$f" ] || return 0
+  printf '; %s' "$(grep -v '^diff-gates: ' "$f" | tail -n1 | cut -c1-120)"
+}
+node_trace() {  # node_trace <run-id> <gate>: the node's `diff-gates:` lines for rails-proof, scope or tamper
+  local f
+  case "$2" in rails-proof) f=rails ;; scope) f=scope ;; tamper) f=diff-gates ;; esac
+  grep -h '^diff-gates: ' "$SIM/nodes/dev-box/fh/run/logs/$1.$f.err" 2>/dev/null || true
+}
+ci_trace() {  # ci_trace <head> <job>: the `diff-gates:` lines that job printed on pull_request
+  local log; log="$(job_log pull_request "$1" "$2")"
+  [ -n "$log" ] || return 0
+  grep -h '^diff-gates: ' "$log" || true
+}
+ci_tg_argv() {  # ci_tg_argv <lines-before>: tamperguard's argv as CI called it since then (one JSON array per call)
+  tail -n +"$(($1 + 1))" "$FAKE_TAMPERGUARD_LOG"
+}
+i17_same() {  # i17_same <run-id> <gate-base> <gate-head> <pr-base> <pr-head> <node tg argv> <ci tg lines before>
+  local g n
+  [ -n "$1" ] && [ "$2" = "$4" ] && [ "$3" = "$5" ] || return 1
+  for g in rails-proof scope tamper; do
+    n="$(node_trace "$1" "$g")"
+    [ -n "$n" ] && [ "$n" = "$(ci_trace "$5" "$g")" ] || return 1
+  done
+  [ -n "$6" ] && [ "$6" = "$(ci_tg_argv "$7")" ] &&
+    [ "$6" = "$(jq -cn --arg r "$4...$5" '["--range", $r, "--json"]')" ]
+}
+i17_detail() {
+  local g d="" n c
+  if [ "$2" != "$4" ] || [ "$3" != "$5" ]; then
+    printf 'node gated %s...%s, CI %s...%s' "${2:0:12}" "${3:0:12}" "${4:0:12}" "${5:0:12}"; return
+  fi
+  for g in rails-proof scope tamper; do
+    n="$(node_trace "$1" "$g" | wc -l | tr -d ' ')"; c="$(ci_trace "$5" "$g" | wc -l | tr -d ' ')"
+    if [ "$(node_trace "$1" "$g")" = "$(ci_trace "$5" "$g")" ]; then d+="$g $n=$c; "; else d+="$g node $n != CI $c; "; fi
+  done
+  printf '%son %s...%s; tamperguard node %s, CI %s' "$d" "${4:0:12}" "${5:0:12}" "${6:-none}" "$(ci_tg_argv "$7" | tr '\n' ' ')"
 }
 one_trailered_commit() {  # <base> <head> <id>: exactly one commit, carrying the four trailers
   local c; c="$(git -C "$ORIGIN" rev-list "$1..$2")"

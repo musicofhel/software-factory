@@ -278,6 +278,46 @@ Ruling Q1 of `specs/factory-step2-followups-v1/RULINGS.md` answers this with a p
    proof (`tests/live/test_render_live.sh`, ruling Q2 of `specs/factory-run-calls-v1/RULINGS.md`)
    runs vetto under a scratch HOME, with the render's roots pointing at the real uv dirs.
 
+## Amendment 2026-10-26: T22, the diff gates
+
+T9's item 10 (scope-check is a stub, so the success path holds at `scope-check-not-built`) and its
+known gap 4 are closed. `specs/factory-step3-v1` row TB3 builds the three diff gates once, in
+`factory/bin/lib/diff-gates.sh`, which run.sh and the three CI scripts (`rails-proof.sh`,
+`scope-check.sh`, `tamper-check.sh`) all source, so the node and CI call one matcher with one argv,
+one tool pin and one range rule (I17). The measurements are in `specs/factory-step3-v1/records/TB3.md`.
+
+1. **The node gates exactly the commit it pushes.** On success, run.sh first builds the record commit
+   (its trailers, item 9), and that commit is `GATE_HEAD`. `GATE_BASE` is
+   `git merge-base refs/remotes/origin/main GATE_HEAD`. It is never the run's own base, which on a
+   resume is a lapsed branch's tip: that tip's commits are gated with the rest (node:G5). Every gate
+   reads `GATE_BASE...GATE_HEAD`, three-dot. On a pass, the loop pushes that same sha. The ledger line
+   records `gate_base`, `gate_head`, `rails_proof` and `scope_check`.
+2. **The order of the gates is tamperguard, then rails-proof, then scope-check.** tamperguard still
+   runs under vetto and the claim's rendered policy (amendment T17). Its argv is now
+   `dg_tamper_argv`'s, `--range GATE_BASE...GATE_HEAD --json`, the argv CI passes.
+   `policy_tamperguard` takes that argv instead of a range. `dg_tamper_judge` reads the result:
+   rc 0 with `ok` or `review` passes, rc 2 with a parsed `tamper` verdict goes to the desk
+   (`tamper`), and anything else is `tamperguard-error`. A rail edit is `rails-fail` and a path out
+   of scope is `scope-fail`; both go to the desk (needs-desk) with nothing pushed. Any other non-zero
+   exit is `rails-proof-error` or `scope-check-error`: the lock is released and the slot stops
+   (exit 1). The `FACTORY_SCOPE_CHECK` seam is gone.
+3. **Scope and rails come from the base's store.** They are read from
+   `GATE_BASE:.adlc/tickets/<slug>--<sha256 id>.json`, adlc's own filename. A branch cannot widen its
+   scope or drop its rails. A ticket that is absent, completed or has no rails is refused (exit 2). A
+   ticket diff that touches `.adlc/**` fails scope even when a scope glob covers it.
+4. **Globs.** scope uses fleet's own matcher, ported exactly (fleet `lib/gates.mjs:54-60` →
+   `@adlc/core` `lib/tickets.mjs:136-138` → `lib/glob.mjs:37-81`, @adlc/cli 1.12.0). Git's `:(glob)`
+   differs from it in 3 of the 442 cases measured. `src/**.js` crosses `/` for fleet and not for git,
+   while `a?c` and `[ab]x` are wildcards for git only. A rail therefore freezes the union of the two
+   readings. A plain pathspec, whose `*` crosses `/`, is never used.
+5. **One Python minor.** The node's uv resolves tamperguard 0.2.0 on CPython 3.14. CI's tamper job
+   installs it with `pipx install --python python3.14 tamperguard==0.2.0`, and the pins live in
+   `DG_TAMPERGUARD_PIN` and `DG_TAMPERGUARD_PYTHON`. join.sh does not pin the minor on the node yet
+   (`uv tool install tamperguard==0.2.0`, with no `--python`); that is carried to T29.
+6. **`adversarial-review` is required.** run.sh refuses to start without it on PATH (exit 1,
+   SPEC-v0.2 L644, node:G16), because fleet's review step needs it. The consequence above that names it
+   as T11's still holds for providing a trusted one.
+
 ## Consequences
 
 - SPEC-v0.2's sketch is wrong in five spellings (ralon `--lock`, vetto `--profile`, `cux status --json`,

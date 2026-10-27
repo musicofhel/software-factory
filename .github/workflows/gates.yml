@@ -52,7 +52,7 @@ jobs:
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
       - uses: actions/checkout@v4
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
-      - name: rails diff empty (build order 3 fills the rail paths from the ticket)
+      - name: no path of BASE...HEAD touches a rail of the base's ticket
         env: { GH_TOKEN: "${{ github.token }}" }
         run: ./.base/factory/bin/rails-proof.sh
   scope:
@@ -62,18 +62,24 @@ jobs:
         with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
       - uses: actions/checkout@v4
         with: { ref: "${{ env.GATE_BASE }}", path: .base }
-      - name: diff ⊆ ticket scope
+      - name: BASE...HEAD ⊆ the base's ticket scope (fleet's globs; never .adlc/**)
         env: { GH_TOKEN: "${{ github.token }}" }
         run: ./.base/factory/bin/scope-check.sh
   tamper:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { ref: "${{ env.GATE_BASE }}", path: .base }
+      # The node's minor (lib/diff-gates.sh DG_TAMPERGUARD_PYTHON) and pin (DG_TAMPERGUARD_PIN).
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - name: tamperguard (exit 2 fails the gate)
-        run: pipx run tamperguard==0.2.0 --base origin/main
+        with: { python-version: "3.14" }
+      - name: tamperguard 0.2.0 on the node's Python minor
+        run: pipx install --python python3.14 tamperguard==0.2.0
+      - name: tamperguard --range BASE...HEAD --json (a parsed tamper verdict fails; any other error too)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: ./.base/factory/bin/tamper-check.sh
   dependencies:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'

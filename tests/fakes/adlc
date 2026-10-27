@@ -38,8 +38,10 @@
 #                             when a gate fails and still prints the forecast)
 #   FAKE_ADLC_FAIL            ERE; a call whose joined argv matches exits 1 with nothing on stdout
 #   FAKE_ADLC_GITSTORE=1      the store is the real layout in the cwd's repository (make sim): one
-#                             file per ticket in <toplevel>/.adlc/tickets/<lower id>--<hash>.json
-#                             (.store.json is skipped), ticketHash = sha256 of the sorted compact
+#                             file per ticket in <toplevel>/.adlc/tickets/<slug>--<sha256 of the id>.json
+#                             as adlc names it (tickets/lib/filename.mjs: the slug is the lowercased id,
+#                             runs of other characters `-`; lib/diff-gates.sh reads a ticket from a base
+#                             commit by that name) (.store.json is skipped), ticketHash = sha256 of the sorted compact
 #                             ticket JSON. Adds the writes adlc 1.12.0 has (measured 2026-10-26 in a
 #                             scratch store, specs/factory-step3-v1/records/TB1.md): `ticket create
 #                             --input F --write [--allow-unsigned] [--json]` (an edge target must exist,
@@ -73,8 +75,9 @@ if [ "${FAKE_ADLC_GITSTORE:-0}" = 1 ]; then
   gs_hash() { jq -cS . | sha256sum | cut -d' ' -f1; }
   gs_file() { local f; for f in "$SDIR"/*.json; do [ -e "$f" ] && [ "$(jq -r .id "$f")" = "$1" ] && { echo "$f"; return 0; }; done; return 1; }
   gs_put() {  # gs_put <ticket-json>: replace the ticket's file
-    local old h lid; old="$(gs_file "$(jq -r .id <<<"$1")" || true)"
-    h="$(gs_hash <<<"$1")"; lid="$(jq -r '.id | ascii_downcase' <<<"$1")"
+    local old id h lid; id="$(jq -r .id <<<"$1")"; old="$(gs_file "$id" || true)"
+    h="$(printf '%s' "$id" | sha256sum | cut -d' ' -f1)"
+    lid="$(jq -r '.id | ascii_downcase | gsub("[^a-z0-9]+"; "-") | ltrimstr("-") | rtrimstr("-") | .[:48] | rtrimstr("-") | if . == "" then "ticket" else . end' <<<"$1")"
     [ -z "$old" ] || rm -f "$old"
     jq -S . <<<"$1" >"$SDIR/$lid--$h.json"
   }

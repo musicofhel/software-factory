@@ -53,14 +53,21 @@ world_build() {
     "node node-b $((T0 - 600)) active 1 node-b-owner" | "$SIM_ROOT/tests/fixtures/make-repo.sh" "$ORIGIN"
   git -C "$ORIGIN" config uploadpack.allowAnySHA1InWant true
 
-  # The runner's shims: gh is the fake; tamperguard through pipx; make test/lint stubbed (the suite
-  # runs this sim, so a job running it would recurse; build-test's real command list is TB5's).
+  # The runner's shims: gh is the fake; pipx installs the fake tamperguard; make test/lint stubbed
+  # (the suite runs this sim, so a job running it would recurse; build-test's real command list is
+  # TB5's). `pipx install` links its app into $PIPX_BIN_DIR, which the driver makes per job and puts
+  # on the job's PATH (GitHub's runner: PIPX_BIN_DIR=/opt/pipx_bin, on PATH, a fresh VM per job), so
+  # only a job that installed tamperguard can call it.
   mkdir -p "$SIM/runner-bin" "$SIM/runner-home" "$SIM/bin"
   ln -sf "$SIM_FAKES/gh" "$SIM/runner-bin/gh"
   ln -sf "$SIM_FAKES/curl" "$SIM/runner-bin/curl"
   printf '%s\n' '#!/usr/bin/env bash' \
-    'if [ "${1:-}" = run ] && [ "${2:-}" = tamperguard==0.2.0 ]; then shift 2; exec "'"$SIM_FAKES"'/tamperguard" "$@"; fi' \
-    'echo "sim pipx: only \`pipx run tamperguard==0.2.0\` is simulated: $*" >&2; exit 127' >"$SIM/runner-bin/pipx"
+    'if [ "$*" = "install --python python3.14 tamperguard==0.2.0" ]; then' \
+    '  [ -n "${PIPX_BIN_DIR:-}" ] || { echo "sim pipx: no PIPX_BIN_DIR" >&2; exit 1; }' \
+    '  mkdir -p "$PIPX_BIN_DIR" && ln -sf "'"$SIM_FAKES"'/tamperguard" "$PIPX_BIN_DIR/tamperguard"' \
+    '  echo "  installed package tamperguard 0.2.0, installed using Python 3.14 (sim)"; exit 0' \
+    'fi' \
+    'echo "sim pipx: only \`pipx install --python python3.14 tamperguard==0.2.0\` is simulated: $*" >&2; exit 127' >"$SIM/runner-bin/pipx"
   printf '%s\n' '#!/usr/bin/env bash' \
     'case "$*" in test|lint) echo "sim make: \`make $*\` stubbed (the suite runs the sim itself)"; exit 0 ;; esac' \
     'exec /usr/bin/make "$@"' >"$SIM/runner-bin/make"
@@ -96,6 +103,8 @@ node_build() {
   mkdir -p "$d/bin" "$d/fh"
   clone_of "$d/clone"
   printf '#!/usr/bin/env bash\n[ "${1:-}" = --version ] && echo "2.1.280 (Claude Code)"\n' >"$d/bin/claude"
+  # fleet's review step (run.sh needs it on PATH to start; the fake fleet never calls it).
+  printf '#!/usr/bin/env bash\necho "sim adversarial-review: not simulated: $*" >&2\nexit 1\n' >"$d/bin/adversarial-review"
   printf '#!/usr/bin/env bash\necho "$1" >>"%s/naps"\n' "$d" >"$d/bin/nap"
   # tamperguard as uv installs it (test_run.sh fake_uv): its own dir, python through a version link.
   u="$d/uv"
@@ -104,7 +113,7 @@ node_build() {
   ln -sfn cpython-9.9.9-fake "$u/python/cpython-9.9-fake"
   ln -sf "$u/python/cpython-9.9-fake/bin/python9.9" "$u/tools/tamperguard/bin/python"
   printf '#!%s\nexec "%s/tamperguard" "$@"\n' "$u/tools/tamperguard/bin/python" "$SIM_FAKES" >"$u/tools/tamperguard/bin/tamperguard"
-  chmod +x "$d/bin/claude" "$d/bin/nap" "$u/tools/tamperguard/bin/tamperguard"
+  chmod +x "$d/bin/claude" "$d/bin/nap" "$d/bin/adversarial-review" "$u/tools/tamperguard/bin/tamperguard"
   ln -sf "$u/tools/tamperguard/bin/tamperguard" "$d/bin/tamperguard"
   jq -n --arg h "$h" --arg seen "$(jq -nr --argjson e $((T0 - 600)) '$e | todate')" '
     {handle: $h, owner: "\($h)-owner", os: "linux", cpu: 8, ram_gb: 16, slots: 1, heavy_gates: false,
@@ -125,6 +134,6 @@ node_env() {  # call inside a subshell
   export FAKE_ADLC_LOG="$d/adlc.log" FAKE_GH_USER="$h-owner" FAKE_GH_BOT=0
   export GIT_AUTHOR_NAME="$h-owner" GIT_AUTHOR_EMAIL="$h-owner@sim.invalid" GIT_COMMITTER_NAME="$h-owner" GIT_COMMITTER_EMAIL="$h-owner@sim.invalid"
   export PATH="$d/bin:$SIM/bin:$SIM_FAKES:$PATH"
-  unset FAKE_FLEET_REASON FAKE_FLEET_REASONS FAKE_FLEET_STRIKES FACTORY_SCOPE_CHECK FACTORY_HANDLE
+  unset FAKE_FLEET_REASON FAKE_FLEET_REASONS FAKE_FLEET_STRIKES FACTORY_HANDLE
   cd "$d/clone" || return 1
 }

@@ -29,13 +29,19 @@
 #                (a link to lib/bwrap-shim, which adds fleet's missing system roots read-only) and
 #                `fleet-pin`. Only fleet's PATH changes, never the loop's or ralon's (ADR-0006, #1266)
 #   case on fleet's reason (success = exitCode 0, reason null, a fleet/run-* branch, merged >= 1):
-#     success                       tamperguard (under vetto + the claim's render of build.toml,
-#                                   $FACTORY_HOME/run/policy/<run id>.build.toml, lib/policy-render.sh)
-#                                   then scope-check. Both pass → push ticket/<id>/<handle>, open the
-#                                   PR, comment; the lock stays (released at merge). tamper or a real
-#                                   scope failure → comment, label needs-desk, release, no push. scope-check
-#                                   "not built" (step 3's stub) → record scope-check-not-built, keep
-#                                   a LOCAL ticket branch, release, no push, stop the slot (exit 2)
+#     success                       the node gates exactly the commit it pushes: the record commit
+#                                   (trailers) is built first, then the three diff gates run on
+#                                   GATE_BASE...GATE_HEAD, GATE_HEAD = that commit and GATE_BASE = its
+#                                   merge-base with origin/main (never a lapsed tip, node:G5), through
+#                                   lib/diff-gates.sh, the helper CI's gates call (I17, T22):
+#                                   tamperguard (dg_tamper_argv, under vetto + the claim's render of
+#                                   build.toml, $FACTORY_HOME/run/policy/<run id>.build.toml,
+#                                   lib/policy-render.sh; dg_tamper_judge), rails-proof.sh, then
+#                                   scope-check.sh. All pass → push that same sha to
+#                                   ticket/<id>/<handle>, open the PR, comment; the lock stays
+#                                   (released at merge). tamper, a rail edit or a scope failure →
+#                                   comment, label needs-desk, release, no push. A gate error →
+#                                   release, no push, stop the slot (exit 1)
 #     quota-paused | wall-clock     push the partial branch, heartbeat the lock, keep the worktree;
 #                                   the next iteration (after the governor) re-runs the identical
 #                                   fleet argv there, which resumes it. A fourth pause of one claim
@@ -63,8 +69,9 @@
 # Environment: FACTORY_HOME (default ~/.factory; its env file is sourced when FACTORY_MANIFEST is
 # unset), FACTORY_MANIFEST, FACTORY_REPO, FACTORY_NOW, FACTORY_ADLC, FACTORY_FLEET (default
 # `npx -y @adlc/cli@1.12.0 fleet`), FACTORY_FLEET_PIN (default: the <v> of `@adlc/cli@<v>` in
-# FACTORY_FLEET, else none; the bwrap shim is on only at exactly 1.12.0), FACTORY_SCOPE_CHECK
-# (default factory/bin/scope-check.sh), FACTORY_SLEEP (default sleep).
+# FACTORY_FLEET, else none; the bwrap shim is on only at exactly 1.12.0), FACTORY_SLEEP (default
+# sleep). adversarial-review (fleet's review step, SPEC-v0.2 L644) must be on PATH, or the loop does
+# not start (exit 1, node:G16).
 # Exit 0 done (--once, --max-iterations); 1 operational error or a run-level fleet failure; 2 the
 # governor refused or the slot stopped at a gate.
 set -euo pipefail
@@ -77,6 +84,8 @@ PROG=run
 . "$(dirname "$0")/lib/desk-marker.sh"
 # shellcheck source=factory/bin/lib/policy-render.sh
 . "$(dirname "$0")/lib/policy-render.sh"
+# shellcheck source=factory/bin/lib/diff-gates.sh
+. "$(dirname "$0")/lib/diff-gates.sh"
 
 usage() { sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
@@ -104,6 +113,7 @@ if [ -z "${FACTORY_MANIFEST:-}" ] && [ -f "$FH/env" ]; then
   FH="${FACTORY_HOME:-$FH}"
 fi
 need git jq gh
+need adversarial-review
 M="${FACTORY_MANIFEST:-}"
 [ -n "$M" ] && [ -f "$M" ] || die "no manifest: set FACTORY_MANIFEST or run join.sh --apply (it writes $FH/env)"
 CLONE="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from the node's clone of the factory repo"
@@ -134,7 +144,6 @@ if [ -z "$FLEET_PIN" ]; then
   for w in "${FLEET[@]}"; do [[ "$w" =~ ^@adlc/cli@(.+)$ ]] && FLEET_PIN="${BASH_REMATCH[1]}"; done
 fi
 read -r -a SLEEP <<<"${FACTORY_SLEEP:-sleep}"
-SCOPE_CHECK="${FACTORY_SCOPE_CHECK:-$FACTORY_ROOT/factory/bin/scope-check.sh}"
 B="$FACTORY_ROOT/factory/bin"
 COMMON=(--repo "$REPO" --manifest "$M" --handle "$HANDLE")
 
@@ -246,11 +255,18 @@ label_desk() {
   if gh issue edit "$ISSUE" --repo "$REPO" --add-label needs-desk --remove-label ready >/dev/null 2>>"$LOGBASE.err"; then act label-needs-desk
   else act label-needs-desk-failed; fi
 }
+record_commit() {  # record_commit <parent> <outcome> [trailers...]: prints the record commit's sha
+  run_record_commit "$1" "factory: $TICKET $2 on $HANDLE" "Factory-Outcome: $2" "${@:3}" || { act record-commit-failed; return 1; }
+}
 push_record() {  # push_record <parent> <outcome> [trailers...]: record commit + push; sets PUSHED_SHA
   local sha
   PUSHED_SHA=""
-  sha="$(run_record_commit "$1" "factory: $TICKET $2 on $HANDLE" "Factory-Outcome: $2" "${@:3}")" ||
-    { act record-commit-failed; return 1; }
+  sha="$(record_commit "$@")" || return 1
+  push_sha "$sha"
+}
+push_sha() {  # push_sha <sha>: push it to ticket/<id>/<handle>; sets PUSHED_SHA
+  local sha="$1"
+  PUSHED_SHA=""
   if run_push "$sha"; then
     PUSHED_SHA="$sha"; act "push ticket/$TICKET/$HANDLE"
     rec --arg b "ticket/$TICKET/$HANDLE" --arg s "$sha" '.pushed = {branch: $b, sha: $s}'
@@ -350,14 +366,22 @@ finish_release() {  # finish_release <comment?> <sleep> [stop-rc]
   NEXT_SLEEP="$2"; STOP_RC="${3:-}"
 }
 on_success() {
-  local tip tg_out tg verdict score findings src=0 serr
+  local tip tg_out tg verdict score findings rc a
   tip="$(git -C "$CLONE" rev-parse -q --verify "$(jq -r .integrationBranch <<<"$DOC")^{commit}" || true)"
   [ -n "$tip" ] || { REASON=integration-branch-missing; outcome released; finish_release 1 0 1; return; }
+  # The node gates exactly the commit it pushes (I17): the record commit first, then every gate on
+  # GATE_BASE...GATE_HEAD from the merge-base with origin/main, never a lapsed tip (node:G5): a lapsed
+  # branch's own commits are gated with the rest.
+  GATE_HEAD="$(record_commit "$tip" built "Fleet-Run: $FLEET_RUN" "Fleet-Strikes: $STRIKES")" ||
+    { REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
+  GATE_BASE="$(git -C "$WT" merge-base refs/remotes/origin/main "$GATE_HEAD")" ||
+    { REASON=gate-base-missing; outcome released; finish_release 1 0 1; return; }
+  rec --arg b "$GATE_BASE" --arg h "$GATE_HEAD" '.gate_base = $b | .gate_head = $h'
   # tamperguard over the whole ticket diff, under vetto and this claim's render of build.toml
   # (ADR-0005 decision 8 as amended by T17; lib/policy-render.sh). A root that cannot be derived
   # fails closed: the step never runs under a policy that lacks it.
   local policy="$RUN_DIR/policy/$RUN_ID.build.toml" roots r
-  local -a root=()
+  local -a root=() tg_argv=()
   if roots="$(policy_roots "$WT" "$FH" 2>"$LOGBASE.tamperguard.err")"; then
     while IFS= read -r r; do root+=("$r"); done <<<"$roots"
   fi
@@ -367,8 +391,9 @@ on_success() {
     REASON=tamperguard-error; outcome released; finish_release 1 0 1; return
   fi
   act policy-render
+  while IFS= read -r a; do tg_argv+=("$a"); done < <(dg_tamper_argv "$GATE_BASE" "$GATE_HEAD" 2>>"$LOGBASE.diff-gates.err")
   # vetto exits 125 whatever happened, so the result is the rc file the command itself writes.
-  policy_tamperguard "$WT" "$policy" "$BASE..$tip" >>"$LOGBASE.vetto.log" 2>&1
+  policy_tamperguard "$WT" "$policy" "${tg_argv[@]}" >>"$LOGBASE.vetto.log" 2>&1
   act tamperguard
   # the findings quote the diff and the stderr may too: they stay on the node, in the run's log
   # (the worktree goes)
@@ -380,7 +405,7 @@ on_success() {
   verdict="$(jq -r '.verdict // empty | strings' <<<"$tg_out")"
   score="$(jq -r 'if (.score | type) == "number" then .score else 0 end' <<<"$tg_out")"
   findings="$(jq -r 'if (.findings | type) == "array" then (.findings | length) else 0 end' <<<"$tg_out")"
-  case "$tg:$verdict" in
+  case "$(dg_tamper_judge "$tg" "$tg_out")" in
     0:ok|0:review) ;;
     2:tamper)
       rec --arg s "$score" --arg f "$findings" '.tamperguard = {verdict: "tamper", score: ($s | tonumber), findings: ($f | tonumber)}'
@@ -388,25 +413,28 @@ on_success() {
     *) REASON=tamperguard-error; outcome released; finish_release 1 0 1; return ;;
   esac
   rec --arg v "$verdict" --arg s "$score" --arg f "$findings" '.tamperguard = {verdict: $v, score: ($s | tonumber), findings: ($f | tonumber)}'
-  serr="$LOGBASE.scope.err"
-  (cd "$WT" && "$SCOPE_CHECK" --ticket "$TICKET" --base "$BASE" --head "$tip") >/dev/null 2>"$serr" || src=$?
+  # rails-proof, then scope-check: the scripts CI runs, with the node's flags (exit 2 = the gate fails).
+  rc=0
+  (cd "$WT" && "$FACTORY_ROOT/factory/bin/rails-proof.sh" --ticket "$TICKET" --base "$GATE_BASE" --head "$GATE_HEAD") >/dev/null 2>"$LOGBASE.rails.err" || rc=$?
+  act rails-proof
+  case "$rc" in
+    0) rec '.rails_proof = "pass"' ;;
+    2) rec '.rails_proof = "fail"'
+       REASON=rails-fail; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
+    *) rec '.rails_proof = "error"'
+       REASON=rails-proof-error; outcome released; finish_release 1 0 1; return ;;
+  esac
+  rc=0
+  (cd "$WT" && "$FACTORY_ROOT/factory/bin/scope-check.sh" --ticket "$TICKET" --base "$GATE_BASE" --head "$GATE_HEAD") >/dev/null 2>"$LOGBASE.scope.err" || rc=$?
   act scope-check
-  if [ "$src" = 2 ] && grep -q 'not built' "$serr"; then
-    # step 3's stub: no false green. The work stays on a local branch for the owner; nothing is pushed.
-    git -C "$CLONE" update-ref "refs/heads/ticket/$TICKET/$HANDLE" "$tip"
-    act "local-branch ticket/$TICKET/$HANDLE"
-    rec '.scope_check = "scope-check not built"'
-    REASON=scope-check-not-built; outcome held; finish_release 1 0 2; return
-  elif [ "$src" = 2 ]; then
-    rec '.scope_check = "fail"'
-    REASON=scope-fail; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return
-  elif [ "$src" != 0 ]; then
-    rec '.scope_check = "error"'
-    REASON=scope-check-error; outcome released; finish_release 1 0 1; return
-  fi
-  rec '.scope_check = "pass"'
-  push_record "$tip" built "Fleet-Run: $FLEET_RUN" "Fleet-Strikes: $STRIKES" ||
-    { REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
+  case "$rc" in
+    0) rec '.scope_check = "pass"' ;;
+    2) rec '.scope_check = "fail"'
+       REASON=scope-fail; outcome desk; comment desk; label_desk; release_lock; wt_remove; rm -f "$STATE"; return ;;
+    *) rec '.scope_check = "error"'
+       REASON=scope-check-error; outcome released; finish_release 1 0 1; return ;;
+  esac
+  push_sha "$GATE_HEAD" || { REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
   local open pr="" url facts_pr
   open="$(gh pr list --repo "$REPO" --head "ticket/$TICKET/$HANDLE" --state open --json number 2>>"$LOGBASE.err" | jq -r '.[0].number // empty')" || open=""
   if [ -n "$open" ]; then pr="$open"; act pr-exists

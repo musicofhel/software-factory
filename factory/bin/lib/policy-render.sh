@@ -17,8 +17,10 @@
 #                       writes <template> with its one-line [filesystem] allow_read extended by the
 #                       roots (each absolute, an existing directory, never $HOME or above it).
 #                       Every other line is copied as is. Returns 1, writing nothing, otherwise.
-#   policy_tamperguard <worktree> <policy> <range>
-#                       the step itself: vetto strict under <policy>, from the worktree root, writes
+#   policy_tamperguard <worktree> <policy> <tamperguard argv...>
+#                       the step itself: vetto strict under <policy>, from the worktree root, runs
+#                       tamperguard with the argv lib/diff-gates.sh's dg_tamper_argv gives (the same
+#                       argv CI's tamper-check.sh passes, I17; T22), writes
 #                       .factory-run/tamperguard.{json,err,rc}. vetto exits 125 whatever happened
 #                       (ADR-0005 amendment T6 item 1), so the caller reads the rc file, never vetto.
 #                       vetto's own output goes to stdout/stderr.
@@ -101,9 +103,9 @@ policy_render() {
 }
 
 policy_tamperguard() {
-  local wt="$1" policy="$2" range="$3"
+  local wt="$1" policy="$2"; shift 2
   rm -f "$wt/.factory-run/tamperguard.json" "$wt/.factory-run/tamperguard.err" "$wt/.factory-run/tamperguard.rc"
   (cd "$wt" && vetto --profile strict --policy "$policy" --tui none -- \
-     bash -c 'tamperguard --range "$1" --json >"$2" 2>"$3"; echo "$?" >"$4"' tamperguard "$range" \
-     .factory-run/tamperguard.json .factory-run/tamperguard.err .factory-run/tamperguard.rc) || true
+     bash -c 'o="$1" e="$2" r="$3"; shift 3; tamperguard "$@" >"$o" 2>"$e"; echo "$?" >"$r"' tamperguard \
+     .factory-run/tamperguard.json .factory-run/tamperguard.err .factory-run/tamperguard.rc "$@") || true
 }

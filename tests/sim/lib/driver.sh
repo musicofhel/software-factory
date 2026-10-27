@@ -18,6 +18,8 @@
 #         push          {ref, before, after}
 #         schedule      {schedule: <cron>}       (only-workflow-file names the workflow)
 #         issues        {action, label: {name}, issue: {number}}
+#       Each job's `run:` steps see PATH = <job>.pipx-bin:RUNNER_PATH and PIPX_BIN_DIR = that dir,
+#       fresh per job (GitHub: PIPX_BIN_DIR=/opt/pipx_bin on PATH, one VM per job).
 #       Appends one JSON line per job to $SIM/jobs.jsonl: {workflow, job, event, conclusion, log}.
 #       Returns 0; a driver error (an action it cannot emulate, a bad expression) exits 1 loudly.
 #   pr_merge_ref <n> <base-sha> <head-sha>   builds refs/pull/<n>/merge as GitHub does (merge-tree);
@@ -211,7 +213,7 @@ run_job() {
       esac
       local -a envargs=()
       while IFS= read -r kv; do envargs+=("$kv"); done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$senv")
-      ( cd "$ws" && env PATH="$RUNNER_PATH" HOME="$SIM/runner-home" CI=true GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+      ( cd "$ws" && env PATH="$wdir/$job.pipx-bin:$RUNNER_PATH" PIPX_BIN_DIR="$wdir/$job.pipx-bin" HOME="$SIM/runner-home" CI=true GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
           RUNNER_TEMP="$wdir/$job.tmp" GITHUB_WORKSPACE="$ws" GITHUB_EVENT_PATH="$wdir/event.json" GITHUB_EVENT_NAME="$event" \
           GITHUB_SHA="$sha" GITHUB_REF="$ref" GITHUB_BASE_REF="$base_ref" GITHUB_HEAD_REF="$head_ref" GITHUB_REPOSITORY="$REPO" \
           GITHUB_OUTPUT="$wdir/$job.out" GITHUB_STEP_SUMMARY="$wdir/$job.summary" \

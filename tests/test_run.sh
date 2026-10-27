@@ -4,16 +4,22 @@
 # node's clone, the fake gh (+ a `pr create` shim), the fake adlc (ralon-lock.sh's ticket store),
 # cux, ralon, vetto, tamperguard and fleet (tests/fakes/), a fake `claude` for version-check, and a
 # recording `sleep`. The clock is FACTORY_NOW.
-# Acceptance 1 (one case per fleet reason: success, scope-stub, tamper, quota-paused, wall-clock,
+# Acceptance 1 (one case per fleet reason: success, tamper, quota-paused, wall-clock,
 # strikes-exhausted, flail, review-unavailable, anything-else), 2 argv, 3 resume, 4 no-transcript,
-# 5 once, 6 scope-stub; plus the paused claim's resume in place, the resume cap, a lost lock, the
-# governor's verdicts, the dry run, slot guards and the fakes themselves. T12 acceptance 4: the bwrap
+# 5 once; plus the paused claim's resume in place, the resume cap, a lost lock, the governor's
+# verdicts, the dry run, slot guards and the fakes themselves. T12 acceptance 4: the bwrap
 # shim on fleet's PATH only, and only at fleet pin 1.12.0 (case bwrap-shim). T14 acceptance 4: every
 # needs-desk path comments the reason with the needs-desk marker before the label (desk_case,
 # tamper, resume-cap, desk-marker). T17: tamperguard's policy is the claim's render of build.toml,
 # which differs from the template only by existing absolute allow_read roots (I14; cases
 # policy-render, policy-render-lib), a missing interpreter fails closed before the step (case
 # policy-missing-root), and tamperguard's stderr is kept in the claim's log base (case tamper).
+# T22: the real diff gates on the record commit the node pushes, GATE_BASE...GATE_HEAD from the
+# merge-base with origin/main, the ticket's scope and rails read from main's store (run_setup puts
+# T-run there): tamperguard, rails-proof, scope-check all pass and the gated sha is pushed (success,
+# argv); a rail edit or a path outside the scope → desk, nothing pushed (rails-fail, scope-fail,
+# desk-marker); a lapsed-branch resume gates from main, not the lapsed tip (lapsed-range, acceptance
+# 2); no adversarial-review on PATH → the loop does not start (no-adversarial-review).
 # tamperguard is laid out as a uv tool (fake_uv): its own install dir, and a python reached through a
 # version link, as on a real node.
 set -euo pipefail
@@ -31,7 +37,9 @@ run_setup() {
   export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 TZ=UTC
   export GIT_AUTHOR_NAME=node GIT_AUTHOR_EMAIL=node@fake GIT_COMMITTER_NAME=node GIT_COMMITTER_EMAIL=node@fake
   rm -rf "$FAKE_GH_GIT"
+  # T-run in main's ticket store (adlc's file name): the diff gates read its scope and rails from the base
   printf '%s\n' 'main-file factory/policy/adapters.json {"claude-code": "2.1.280", "codex": null}' \
+    "main-file .adlc/tickets/t-run--$(printf %s T-run | sha256sum | cut -d' ' -f1).json"' {"id": "T-run", "title": "add hello.sh", "scope": ["hello.sh"], "rails": ["tests/rail/**"]}' \
     "node dev-box $((T0 - 7200)) active 2 dev-box" | tests/fixtures/make-repo.sh "$FAKE_GH_GIT"
   git clone -q "$FAKE_GH_GIT" "$WORLD/clone"
   export FACTORY_NOW="$T0" FAKE_GH_NOW="$T0" FACTORY_HOME="$WORLD/fh" FACTORY_MANIFEST="$WORLD/manifest.json"
@@ -41,11 +49,12 @@ run_setup() {
   export FACTORY_FLEET_PIN=1.12.0   # the fake copies fleet 1.12.0
   export FAKE_FLEET_TRANSCRIPT="worker said: $MARK" FAKE_TAMPERGUARD_DETAIL="assert True  # $MARK"
   export FAKE_ADLC_TICKETS='[{"id": "T-run", "title": "add hello.sh", "body": "Build hello.sh. '"$MARK"'", "rails": ["tests/rail/**"]}]'
-  unset FACTORY_SCOPE_CHECK FAKE_FLEET_REASON FAKE_FLEET_REASONS FAKE_TAMPERGUARD_VERDICT FAKE_FLEET_STRIKES FAKE_CLAUDE_VERSION
+  unset FAKE_FLEET_REASON FAKE_FLEET_REASONS FAKE_FLEET_FILE FAKE_TAMPERGUARD_VERDICT FAKE_FLEET_STRIKES FAKE_CLAUDE_VERSION
   : >"$FAKE_CUX_LOG"; : >"$FAKE_FLEET_LOG"; : >"$FAKE_RALON_LOG"; : >"$FAKE_VETTO_LOG"; : >"$FAKE_TAMPERGUARD_LOG"
   mkdir -p "$WORLD/bin" "$WORLD/prs"
   printf '#!/usr/bin/env bash\n[ "${1:-}" = --version ] && echo "${FAKE_CLAUDE_VERSION:-2.1.280} (Claude Code)"\n' >"$WORLD/bin/claude"
   printf '#!/usr/bin/env bash\necho "$1" >>"%s/naps"\n' "$WORLD" >"$WORLD/bin/nap"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$WORLD/bin/adversarial-review"   # fleet's review step: only its presence is checked
   # gh pr create is not in the fake gh: a shim records it (the body in prs/<n>.md) and opens the PR
   # in the fake's store; everything else goes to tests/fakes/gh.
   command cat >"$WORLD/bin/gh" <<EOF
@@ -77,7 +86,7 @@ if [ "\${1:-} \${2:-}" = "pr create" ]; then
 fi
 exec "$FAKES_DIR/gh" "\$@"
 EOF
-  chmod +x "$WORLD/bin/claude" "$WORLD/bin/nap" "$WORLD/bin/gh"
+  chmod +x "$WORLD/bin/claude" "$WORLD/bin/nap" "$WORLD/bin/adversarial-review" "$WORLD/bin/gh"
   export PATH="$WORLD/bin:$PATH"
   jq -n --arg seen "$(iso $((T0 - 600)))" '
     {handle: "dev-box", owner: "dev-box", os: "linux", cpu: 8, ram_gb: 16, slots: 2, heavy_gates: false,
@@ -104,11 +113,6 @@ under_cap() {
   printf '{"a@example.invalid": {"polled_at": "%s", "five_hour": {"utilization": 10, "resets_at": "%s"}, "seven_day": {"utilization": 20, "resets_at": "%s"}}}\n' \
     "$(iso $((FACTORY_NOW - 60)))" "$(iso $((FACTORY_NOW + 3600)))" "$(iso $((FACTORY_NOW + 86400)))" >"$FAKE_CUX_USAGE"
 }
-passing_scope() {  # a built scope-check that passes (step 3's real one will replace the stub)
-  printf '#!/usr/bin/env bash\necho "$*" >>"%s/scope.log"\nexit 0\n' "$WORLD" >"$WORLD/bin/scope-pass"
-  chmod +x "$WORLD/bin/scope-pass"
-  export FACTORY_SCOPE_CHECK="$WORLD/bin/scope-pass"
-}
 loop() {  # loop <args>: run.sh --slot 1 --apply --json in the clone; sets RC, OUT (stdout), LAST (last line); stderr in $WORLD/err
   RC=0
   OUT="$(cd "$WORLD/clone" && "$RUN" --slot 1 --apply --json "$@" 2>"$WORLD/err")" || RC=$?
@@ -128,7 +132,6 @@ want_marker() { jq -cn --arg r "$1" --arg h "${2:-hash-T-run}" '{ticket: "T-run"
 
 case_success() {
   run_setup
-  passing_scope
   loop --once
   check "fleet success, both gates pass: exit 0" eq "$RC" 0
   check "  outcome built" eq "$(field .outcome)" built
@@ -152,36 +155,70 @@ case_success() {
   check "  fleet's local branches are gone" eq "$(git -C "$WORLD/clone" for-each-ref --format=x refs/heads/fleet | wc -l | tr -d ' ')" 0
   check "  no slot state left" test ! -e "$FACTORY_HOME/run/slot-1.json"
   check "  the ledger has the same line" eq "$(tail -n1 "$FACTORY_HOME/run/ledger.jsonl")" "$LAST"
-  check "  scope-check got the ticket and the range" grep -qE '^--ticket T-run --base [0-9a-f]{40} --head [0-9a-f]{40}$' "$WORLD/scope.log"
+  check "  the gates ran on the record commit, from main: .gate_base is origin main" \
+    eq "$(field .gate_base)" "$(git -C "$FAKE_GH_GIT" rev-parse main)"
+  check "  the pushed sha is the gated one (.gate_head)" eq "$(pushed)" "$(field .gate_head)"
+  check "  tamperguard ok, rails-proof pass, scope-check pass" \
+    eq "$(field '"\(.tamperguard.verdict) \(.rails_proof) \(.scope_check)"')" "ok pass pass"
+  check "  in that order, before the push" \
+    eq "$(field '[.actions[] | select(test("^(tamperguard|rails-proof|scope-check|push )"))] | join(",")')" \
+       "tamperguard,rails-proof,scope-check,push ticket/T-run/dev-box"
+  check "  the real scripts passed (their stderr in the claim's log base)" \
+    eval 'grep -qF "rails-proof: pass" "$FACTORY_HOME/run/logs/$(field .run_id).rails.err" &&
+          grep -qF "scope-check: pass" "$FACTORY_HOME/run/logs/$(field .run_id).scope.err"'
   check "  no nap under --once" test ! -e "$WORLD/naps"
 }
 
-case_scope_stub() {
+gate_desk() {  # gate_desk <reason>: a diff gate failed on the gated commit: desk, nothing pushed
+  check "  outcome desk, reason $1, the loop goes on" eq "$RC $(field '"\(.outcome) \(.reason)"')" "0 desk $1"
+  check "  nothing pushed to the origin, no PR" \
+    eq "$(git -C "$FAKE_GH_GIT" for-each-ref --format=x refs/heads/ticket | wc -l | tr -d ' ') $(jq '.pulls // [] | length' "$FAKE_GH_ISSUES")" "0 0"
+  check "  tamperguard ran first (ok), on the same range" \
+    eq "$(field .tamperguard.verdict) $(jq -r '.[1]' "$FAKE_TAMPERGUARD_LOG")" "ok $(field .gate_base)...$(field .gate_head)"
+  check "  labeled needs-desk, ready removed" eq "$(labels)" in-progress,needs-desk,w:light
+  check "  the comment ends in the needs-desk marker, reason $1" eq "$(marker)" "$(want_marker "$1")"
+  check "  the comment says nothing was pushed" grep -qF 'Nothing pushed.' <<<"$(last_comment)"
+  check "  the lock is released, the worktree gone, no slot state" \
+    eq "$(lock)$([ -e "$WT" ] && echo kept)$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)" ""
+}
+
+case_scope_fail() {
   run_setup
+  export FAKE_FLEET_FILE=outside.sh
   loop --once
-  check "scope-check is step 3's stub (exit 2, 'not built'): exit 2, the slot stops" eq "$RC" 2
-  check "  the record says scope-check not built" eq "$(field .scope_check)" "scope-check not built"
-  check "  reason scope-check-not-built, outcome held" eq "$(field '"\(.reason) \(.outcome)"')" "scope-check-not-built held"
-  check "  nothing pushed to the origin" eq "$(git -C "$FAKE_GH_GIT" for-each-ref --format=x refs/heads/ticket | wc -l | tr -d ' ')" 0
-  check "  no PR" eq "$(jq '.pulls // [] | length' "$FAKE_GH_ISSUES")" 0
-  check "  the work is kept on a LOCAL ticket branch at fleet's integration merge" \
-    eq "$(git -C "$WORLD/clone" log -1 --format=%s ticket/T-run/dev-box)" "Merge branch 'fleet/t-run' into fleet/run-fake-1"
-  check "  tamperguard ran first (ok)" eq "$(field .tamperguard.verdict)" ok
-  check "  the lock is released" test -z "$(lock)"
-  check "  the comment gives the reason code" grep -qF '`scope-check-not-built`' <<<"$(last_comment)"
-  check "  no needs-desk label" eq "$(labels)" in-progress,ready,w:light
-  check "  the worktree is gone" test ! -e "$WT"
+  check "fleet built outside.sh, the ticket's scope is [hello.sh]: scope-check fails" eq "$(field .scope_check)" fail
+  check "  rails-proof passed first" eq "$(field .rails_proof)" pass
+  check "  scope-check named the path" grep -qxF '  outside.sh' "$FACTORY_HOME/run/logs/$(field .run_id).scope.err"
+  gate_desk scope-fail
+}
+
+case_rails_fail() {
+  run_setup
+  export FAKE_FLEET_FILE=tests/rail/x
+  loop --once
+  check "fleet wrote tests/rail/x, a rail of the ticket (tests/rail/**): rails-proof fails" eq "$(field .rails_proof)" fail
+  check "  scope-check never ran" eq "$(field '.scope_check, (.actions | index("scope-check"))' | tr '\n' ' ')" "null null "
+  gate_desk rails-fail
+}
+
+case_no_adversarial_review() {
+  run_setup
+  rm -f "$WORLD/bin/adversarial-review"
+  loop --once
+  check "adversarial-review not on PATH: exit 1, the loop does not start" eq "$RC $OUT" "1 "
+  check "  it says why" grep -qF 'adversarial-review not found on PATH' "$WORLD/err"
+  check "  no claim, no fleet, no governor read, no \$FACTORY_HOME/run" \
+    eq "$(lock)|$(fakegh_calls '.[0] == "api"')|$(fleet_calls)|$(wc -l <"$FAKE_CUX_LOG" | tr -d ' ')|$([ -e "$FACTORY_HOME/run" ] && echo run)" "|0|0|0|"
 }
 
 case_tamper() {
   run_setup
-  passing_scope
   export FAKE_TAMPERGUARD_VERDICT=tamper
   loop --once
   check "tamperguard says tamper: exit 0, the loop goes on" eq "$RC" 0
   check "  outcome desk, reason tamper" eq "$(field '"\(.outcome) \(.reason)"')" "desk tamper"
   check "  verdict, score and finding count only" eq "$(jq -c .tamperguard <<<"$LAST")" '{"verdict":"tamper","score":10,"findings":1}'
-  check "  scope-check never ran" test ! -e "$WORLD/scope.log"
+  check "  rails-proof and scope-check never ran" eq "$(field '[.rails_proof, .scope_check, (.actions | index("rails-proof"), index("scope-check"))] | unique | tojson')" "[null]"
   check "  nothing pushed" test -z "$(pushed)"
   check "  labeled needs-desk, ready removed" eq "$(labels)" in-progress,needs-desk,w:light
   check "  the comment ends in the needs-desk marker, reason tamper" eq "$(marker)" "$(want_marker tamper)"
@@ -191,7 +228,7 @@ case_tamper() {
   check "  no finding text left the node (comments, ledger, stdout)" \
     no_mark "$WORLD/comments.txt" "$FACTORY_HOME/run/ledger.jsonl" "$WORLD/stdout.txt"
   export FAKE_TAMPERGUARD_VERDICT=error
-  run_setup; passing_scope; export FAKE_TAMPERGUARD_VERDICT=error
+  run_setup; export FAKE_TAMPERGUARD_VERDICT=error
   loop --once
   check "tamperguard itself fails: exit 1 (no false green), nothing pushed" eq "$RC:$(field .reason):$(pushed)" 1:tamperguard-error:
   check "  its stderr is kept in the claim's log base, next to its JSON" \
@@ -224,7 +261,6 @@ i14() {  # i14 <render> <extra root>...: the render differs from build.toml only
 
 case_policy_render() {
   run_setup
-  passing_scope
   loop --once
   local render g u
   render="$FACTORY_HOME/run/policy/$(field .run_id).build.toml"
@@ -236,7 +272,6 @@ case_policy_render() {
   # a joined node: tamperguard under $FACTORY_HOME/uv (join.sh's UV_TOOL_DIR, UV_PYTHON_INSTALL_DIR),
   # its link in $FACTORY_HOME/bin. The tool and python roots fall inside $FACTORY_HOME/uv and are dropped.
   run_setup
-  passing_scope
   mkdir -p "$FACTORY_HOME/bin"
   fake_uv "$FACTORY_HOME/uv"
   rm -rf "$WORLD/uv"
@@ -248,7 +283,6 @@ case_policy_render() {
 
 case_policy_missing_root() {
   run_setup
-  passing_scope
   rm -rf "$WORLD/uv/python/cpython-9.9.9-fake"   # the version link now dangles
   loop --once
   check "tamperguard's interpreter dir is gone: exit 1, tamperguard-error (no false green)" \
@@ -260,8 +294,8 @@ case_policy_missing_root() {
   check "  the reason is in the claim's tamperguard.err" \
     grep -qF "policy-render: interpreter $WORLD/uv/tools/tamperguard/bin/python does not resolve to an executable" \
       "$FACTORY_HOME/run/logs/$(field .run_id).tamperguard.err"
-  check "  scope-check never ran, nothing pushed, the lock released" \
-    eq "$(test -e "$WORLD/scope.log" && echo ran)|$(pushed)|$(lock)" "||"
+  check "  rails-proof and scope-check never ran, nothing pushed, the lock released" \
+    eq "$(field '.actions | index("rails-proof"), index("scope-check")' | tr '\n' ' ')|$(pushed)|$(lock)" "null null ||"
 }
 
 case_policy_render_lib() {
@@ -319,7 +353,6 @@ case_wall_clock() { pause_case wall-clock 0; }
 
 case_resume_in_place() {
   run_setup
-  passing_scope
   export FAKE_FLEET_REASONS="quota-paused success"
   loop --once
   local first lock0
@@ -384,13 +417,11 @@ case_strikes_exhausted() { desk_case strikes-exhausted; }
 case_flail() { desk_case flail; }
 
 case_desk_marker() {
-  # A real scope failure (exit 2, not the stub's "not built"): the fourth needs-desk path.
+  # A scope failure (the real scope-check: fleet built a path outside the ticket's scope): a needs-desk path.
   run_setup
-  printf '#!/usr/bin/env bash\necho "out of scope: x" >&2\nexit 2\n' >"$WORLD/bin/scope-fail"
-  chmod +x "$WORLD/bin/scope-fail"
-  export FACTORY_SCOPE_CHECK="$WORLD/bin/scope-fail"
+  export FAKE_FLEET_FILE=outside.sh
   loop --once
-  check "a real scope failure: exit 0, outcome desk, reason scope-fail" eq "$RC $(field '"\(.outcome) \(.reason)"')" "0 desk scope-fail"
+  check "a scope failure: exit 0, outcome desk, reason scope-fail" eq "$RC $(field '"\(.outcome) \(.reason)"')" "0 desk scope-fail"
   check "  nothing pushed, labeled needs-desk, ready removed" eq "$(pushed) $(labels)" " in-progress,needs-desk,w:light"
   check "  the comment ends in the marker, reason scope-fail" eq "$(marker)" "$(want_marker scope-fail)"
   check "  the marker is the comment's last line" eq "$(last_comment | tail -n1)" \
@@ -418,9 +449,6 @@ case_desk_marker() {
   loop --once
   check "no Ticket-Hash line on the Issue: the marker's hash is unknown" eq "$(marker)" "$(want_marker flail unknown)"
   # Outcomes that do not label needs-desk carry no marker.
-  run_setup
-  loop --once
-  check "scope-check not built (released, no label): no marker" eq "$(marker)$(labels)" in-progress,ready,w:light
   run_setup
   export FAKE_FLEET_REASON=preflight
   loop --once
@@ -479,7 +507,6 @@ case_anything_else() {
 
 case_argv() {
   run_setup
-  passing_scope
   # a ralon shim keeps a copy of the lock ralon reads (the worktree is gone after the iteration)
   printf '#!/usr/bin/env bash\n[ "$1 $2" = "run -C" ] && command cp "$3/agent.lock" "%s/seen.lock"\nexec "%s/ralon" "$@"\n' \
     "$WORLD" "$FAKES_DIR" >"$WORLD/bin/ralon"
@@ -512,24 +539,29 @@ case_argv() {
   check "vetto wraps the loop's own tamperguard step with the claim's render of build.toml" \
     eq "$(jq -c '.[0:7]' "$FAKE_VETTO_LOG")" "$(jq -cn --arg p "$FACTORY_HOME/run/policy/$(field .run_id).build.toml" '["--profile", "strict", "--policy", $p, "--tui", "none", "--"]')"
   check "  and never wraps fleet" eq "$(jq -s 'map(select(any(.[]; test("fleet")))) | length' "$FAKE_VETTO_LOG")" 0
-  check "tamperguard: --range <base>..<integration tip> --json" \
-    eq "$(jq -c '.' "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$(field .base.sha)..$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^")" '["--range", $r, "--json"]')"
+  check "tamperguard: --range <origin main>...<the pushed sha> --json (three dots, the gated commit)" \
+    eq "$(jq -c '.' "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$(git -C "$FAKE_GH_GIT" rev-parse main)...$(pushed)" '["--range", $r, "--json"]')"
   check "the rails lock was rendered from the ticket (ralon-lock.sh → adlc ticket show)" \
     eq "$(jq -sc 'map(select(.[0:2] == ["ticket", "show"]))' "$FAKE_ADLC_LOG")" '[["ticket","show","T-run","--json"]]'
   check "  ralon found <worktree>/agent.lock with the ticket's rail" grep -qxE '[[:space:]]+- "?tests/rail/\*\*"?' "$WORLD/seen.lock"
 }
 
-case_resume() {
-  run_setup
-  # another node's lapsed claim left ticket/T-run/old-node: one commit of work and a record commit
-  local main work rec
+lapsed_branch() {  # lapsed_branch <file>: another node's lapsed claim left ticket/T-run/old-node, one
+  # commit of work (adding <file> to main's tree) and a record commit; sets work and rec (the tip)
+  local main blob tree
   main="$(git -C "$FAKE_GH_GIT" rev-parse main)"
-  work="$(printf 'half done\n' | git -C "$FAKE_GH_GIT" hash-object -w --stdin)"
-  work="$(printf '100644 blob %s\thalf.txt\n' "$work" | git -C "$FAKE_GH_GIT" mktree)"
-  work="$(GIT_COMMITTER_DATE="$((T0 - 200000)) +0000" git -C "$FAKE_GH_GIT" commit-tree "$work" -p "$main" -m "feat(T-run): fleet worker build")"
-  rec="$(GIT_COMMITTER_DATE="$((T0 - 190000)) +0000" git -C "$FAKE_GH_GIT" commit-tree "$work^{tree}" -p "$work" \
+  blob="$(printf 'half done\n' | git -C "$FAKE_GH_GIT" hash-object -w --stdin)"
+  tree="$( (git -C "$FAKE_GH_GIT" ls-tree "$main"; printf '100644 blob %s\t%s\n' "$blob" "$1") | git -C "$FAKE_GH_GIT" mktree)"
+  work="$(GIT_COMMITTER_DATE="$((T0 - 200000)) +0000" git -C "$FAKE_GH_GIT" commit-tree "$tree" -p "$main" -m "feat(T-run): fleet worker build")"
+  rec="$(GIT_COMMITTER_DATE="$((T0 - 190000)) +0000" git -C "$FAKE_GH_GIT" commit-tree "$tree" -p "$work" \
           -m "$(printf 'factory: T-run flail on old-node\n\nFactory-Outcome: flail\nFleet-Reason: flail\nFleet-Strikes: 2\nTicket: T-run\nNode: old-node\n')")"
   git -C "$FAKE_GH_GIT" update-ref refs/heads/ticket/T-run/old-node "$rec"
+}
+
+case_resume() {
+  run_setup
+  local work rec
+  lapsed_branch half.txt
   # and an older one that must lose to it
   git -C "$FAKE_GH_GIT" update-ref refs/heads/ticket/T-run/older-node "$work"
   export FAKE_FLEET_REASON=strikes-exhausted
@@ -547,8 +579,32 @@ case_resume() {
   check "  the record says lapsed" eq "$(field .actions | jq -r 'index("worktree lapsed") != null')" true
 }
 
+case_lapsed_range() {
+  # T22 acceptance 2: a lapsed-branch resume gates the range from the merge-base with origin/main
+  run_setup
+  local work rec main
+  main="$(git -C "$FAKE_GH_GIT" rev-parse main)"
+  lapsed_branch hello.sh   # the lapsed work is in scope
+  loop --once
+  check "a lapsed branch whose work is in scope: built" eq "$RC $(field '"\(.outcome) \(.base.kind) \(.base.sha == "'"$rec"'")"')" "0 built lapsed true"
+  check "  .gate_base is main's sha (the merge-base with origin/main), not the lapsed tip" eq "$(field .gate_base)" "$main"
+  check "  tamperguard's range starts at main and ends at the pushed sha" \
+    eq "$(jq -c '.' "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$main...$(pushed)" '["--range", $r, "--json"]')"
+  check "  so the lapsed commits are inside the gated range" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-list "$main..$(pushed)" | grep -cxE "$work|$rec")" 2
+  check "  rails-proof and scope-check passed on it" eq "$(field '"\(.rails_proof) \(.scope_check)"')" "pass pass"
+  check "  the pushed sha is the gated one" eq "$(pushed)" "$(field .gate_head)"
+  # the lapsed branch's own commits are gated with the rest: its out-of-scope file fails the claim
+  run_setup
+  lapsed_branch outside.sh
+  loop --once
+  check "a lapsed branch whose work is out of scope: scope-fail, nothing pushed" \
+    eq "$(field '"\(.outcome) \(.reason) \(.base.kind)"') $(pushed)" "desk scope-fail lapsed "
+  check "  scope-check named the lapsed file" grep -qxF '  outside.sh' "$FACTORY_HOME/run/logs/$(field .run_id).scope.err"
+}
+
 case_no_transcript() {
-  run_setup; passing_scope
+  run_setup
   loop --once
   check "the marker reached the node (so the grep below is not vacuous): fleet's log" grep -qF "$MARK" "$FACTORY_HOME"/run/logs/*.fleet.json
   collect() {
@@ -566,7 +622,7 @@ case_no_transcript() {
     loop --once; : >"$WORLD/outbound.txt"; collect
     check "$r: no planted text in any outbound payload" no_mark "$WORLD/outbound.txt"
   done
-  run_setup; passing_scope; export FAKE_TAMPERGUARD_VERDICT=tamper
+  run_setup; export FAKE_TAMPERGUARD_VERDICT=tamper
   loop --once; : >"$WORLD/outbound.txt"; collect
   check "tamper: no finding text in any outbound payload" no_mark "$WORLD/outbound.txt"
   check "  (tamperguard did print it, into the node-local log)" grep -qF "$MARK" "$FACTORY_HOME"/run/logs/*
@@ -586,7 +642,6 @@ case_once() {
   check "--max-iterations 2: two iterations, one nap of 600 s between them" \
     eq "$(wc -l <<<"$OUT" | tr -d ' ') $(command cat "$WORLD/naps" | tr '\n' ' ')" "2 600 "
   run_setup
-  passing_scope
   loop --once
   check "--once with a claim: one claim, one fleet run" eq "$(fakegh_calls '.[0] == "api" and any(.[]; . == "ref=refs/locks/issue-1")') $(fleet_calls)" "1 1"
 }
@@ -623,7 +678,6 @@ case_guards() {
   loop --once
   check "a second loop on a live slot: exit 2, nothing run" eq "$RC $(fleet_calls)" "2 0"
   echo 999999 >"$FACTORY_HOME/run/slot-1.mutex/pid"
-  passing_scope
   loop --once
   check "a dead holder's slot mutex is broken: the loop runs" eq "$RC $(field .outcome)" "0 built"
   check "  and the mutex is dropped at exit" test ! -e "$FACTORY_HOME/run/slot-1.mutex"
@@ -698,7 +752,6 @@ case_fakes() {
 
 shim_world() {  # run_setup + a recording `npx` (the PATH and bwrap fleet sees, then the fake fleet) and `ralon` (its PATH)
   run_setup
-  passing_scope
   unset FACTORY_FLEET_PIN
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$PATH" >"%s/fleet.path"\n{ command -v bwrap || echo none; } >"%s/fleet.bwrap"\nshift 3\nexec "%s/fleet" "$@"\n' \
     "$WORLD" "$WORLD" "$FAKES_DIR" >"$WORLD/bin/npx"
@@ -744,9 +797,10 @@ case_bwrap_shim() {
   check "no pin at all: no shim" eq "$(field .bwrap_shim) $(test -e "$SHIM_DIR" && echo shim)" "false "
 }
 
-for c in ${CASES:-success scope-stub tamper policy-render policy-missing-root policy-render-lib quota-paused wall-clock resume-in-place resume-cap lock-lost \
-                  strikes-exhausted flail desk-marker review-unavailable anything-else argv resume no-transcript once \
-                  governor dry-run guards fakes bwrap-shim}; do
+for c in ${CASES:-success scope-fail rails-fail no-adversarial-review tamper policy-render policy-missing-root policy-render-lib \
+                  quota-paused wall-clock resume-in-place resume-cap lock-lost strikes-exhausted flail desk-marker \
+                  review-unavailable anything-else argv resume lapsed-range no-transcript once governor dry-run guards \
+                  fakes bwrap-shim}; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]
