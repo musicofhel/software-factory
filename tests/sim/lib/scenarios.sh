@@ -44,10 +44,6 @@ scn_pr() {  # scn_pr <branch> <ticket|-> [author]: push the branch, open its PR;
     --title "sim scenario: $1" --body "$(printf '%b' "$body")" >>"$LOG"
   pr_of "$1"
 }
-approve() {  # approve <pr> [login]: one APPROVED review
-  gh_state '(.pulls[] | select(.number == $n)).reviews += [{author: {login: $u}, state: "APPROVED"}]' \
-    --argjson n "$1" --arg u "${2:-sim-owner}"
-}
 scn_desk_ticket() {  # scn_desk_ticket <id> <scope-dir>: a tier-0 ticket in the scratch clone's store. Its scope
                      # also names README.md (adlc's forecast calls a scope matching no file `unscoped`, and
                      # ticket-check refuses that) and its body declares <scope-dir>/hello.sh a new path
@@ -83,18 +79,13 @@ mk_lock() {  # mk_lock <issue> <handle> <epoch>: a lock as lib/lock.sh writes it
 janitor_sweep() {
   drive schedule "$SIM/ev-sched.json" "$(main_sha)" .github/workflows/janitor.yml
 }
-queue_and_merge() {  # the walk's stand-ins: GitHub's queue builds the group, main moves to it
-  local g; g="$(queue_standin "$1")"
-  merge_standin "$1" "$g"
-  desk_sync
-}
 
 # ------------------------------------------------------------------ the desk writes the scenario tickets
 # Each scope dir gets a placeholder first: real adlc 1.12.0's forecast calls a ticket whose scope
 # globs match no path `unscoped` and sequences it behind every other ticket (mirror: needs-desk), a
 # rule the fake does not model (intake:I7, TB7). The walk's tickets keep their empty dirs.
 desk_sync
-for d in s t1 victim c2 p2 b1 b2; do mkdir -p "$SIM/desk/sim/$d"; : >"$SIM/desk/sim/$d/.keep"; done
+for d in s t1 victim c2 p2 b1 b2 r n1 n2; do mkdir -p "$SIM/desk/sim/$d"; : >"$SIM/desk/sim/$d/.keep"; done
 desk_ticket T-sim-s 0 sim/s '[]'
 desk_ticket T-sim-q 0 sim/s '[]'
 desk_ticket T-sim-t1 1 sim/t1 '[]'
@@ -103,6 +94,9 @@ desk_ticket T-sim-c2 1 sim/c2 '[]'
 desk_ticket T-sim-p2 0 sim/p2 '[{"to":"T-sim-c2"}]'
 desk_ticket T-sim-b1 0 sim/b1 '[]'
 desk_ticket T-sim-b2 0 sim/b2 '[]'
+desk_ticket T-sim-r 0 sim/r '[]'
+desk_ticket T-sim-n1 0 sim/n1 '[]'
+desk_ticket T-sim-n2 0 sim/n2 '[]'
 desk_records
 desk_push "desk: the failure-scenario tickets, and their records (factory/bin/desk-gates.sh --write)"
 
@@ -259,16 +253,107 @@ scn_put sim/t1/hello.sh 'echo hello'
 scn_commit T-sim-t1; pr="$(scn_pr ticket/T-sim-t1/scn-t1 T-sim-t1)"; approve "$pr"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.tier-jump "$(scn_detail tier-order "$h")" check_fails_naming tier-order "$h" "#$PR_A"
 
-# ------------------------------------------------------------------ scenarios that merge
-# Two tickets race for one file. A merges; B conflicts with the new main and is ejected: labeled
-# autorebase, with an ejection record on main.
-scn_start ticket/T-sim-q/scn-b
-scn_put sim/s/conflict.txt 'b'
-scn_commit T-sim-q; PR_B="$(scn_pr ticket/T-sim-q/scn-b T-sim-q)"; approve "$PR_B"; pr_event "$PR_B"
-queue_and_merge "$PR_A"
-judge S.queue-conflict "#$PR_B labels: $(pr_field "$PR_B" '[.labels[].name] | join(",")'); ejections.jsonl $(git -C "$ORIGIN" cat-file -e "$(main_sha):factory/ledger/ejections.jsonl" 2>/dev/null && echo present || echo absent)" \
-  eval 'ghq -e --argjson n "$PR_B" "any(.pulls[] | select(.number == \$n) | .labels[]; .name == \"autorebase\")" >/dev/null &&
-        git -C "$ORIGIN" cat-file -e "$(main_sha):factory/ledger/ejections.jsonl" 2>/dev/null'
+# ------------------------------------------------------------------ the queue (enqueue.yml, eject.sh)
+# GitHub's view of the attest-verify stub is the walk's labeled stand-in again, so a PR can be green.
+# PRs from the PR-only scenarios stay red: their runs were recorded without it.
+export SIM_STANDIN_GREEN="attest-verify"
+# claim.sh skips a ticket with any open ticket/<id>/* PR, and S.rebase-strike claims T-sim-s: its
+# earlier scenario PRs (PR_A among them) are closed first.
+for n in $(ghq '.pulls[] | select(.state == "OPEN" and (.headRefName | startswith("ticket/T-sim-s/"))) | .number'); do
+  gh_state '(.pulls[] | select(.number == $n)).state = "CLOSED"' --argjson n "$n"
+done
+ej_line() {  # ej_line <pr>: the ejection record of PR <n> on main (factory/ledger/ejections.jsonl), or {}
+  local l; l="$(git -C "$ORIGIN" show "$(main_sha):factory/ledger/ejections.jsonl" 2>/dev/null | jq -c --argjson n "$1" 'select(.pr == $n)' | tail -n1)"
+  [ -n "$l" ] || l='{}'
+  printf '%s\n' "$l"
+}
+ejected() {  # ejected <pr> <reason>: closed, labeled autorebase, and its ejection record says <reason>
+  [ "$(pr_field "$1" .state)" = CLOSED ] &&
+    ghq -e --argjson n "$1" 'any(.pulls[] | select(.number == $n) | .labels[]; .name == "autorebase")' >/dev/null &&
+    jq -e --arg r "$2" '.reason == $r' <<<"$(ej_line "$1")" >/dev/null
+}
+pr_labels() { pr_field "$1" '[.labels[].name] | join(",")'; }
+issue_labels() { ghq --argjson n "$1" '.issues[] | select(.number == $n) | [.labels[].name] | join(",")'; }
+enqueue_tick() {  # the queue's schedule (enqueue.yml from main; GitHub's clock, not a stand-in)
+  printf '{"schedule":"*/15 * * * *"}\n' >"$SIM/ev-sched-enqueue.json"
+  drive schedule "$SIM/ev-sched-enqueue.json" "$(main_sha)" .github/workflows/enqueue.yml
+}
+
+# Two tickets race for one file. X is green but not approved, so the queue passes it by; Y is
+# approved and lands. X approved later conflicts with the new main: the queue ejects it (closed,
+# autorebase, a record on main, the ticket's Issue ready with rebase-strike).
+scn_start ticket/T-sim-s/scn-x
+scn_put sim/s/conflict.txt 'x'
+scn_commit T-sim-s; PR_X="$(scn_pr ticket/T-sim-s/scn-x T-sim-s)"; pr_event "$PR_X"
+scn_start ticket/T-sim-q/scn-y
+scn_put sim/s/conflict.txt 'y'
+scn_commit T-sim-q; PR_Y="$(scn_pr ticket/T-sim-q/scn-y T-sim-q)"; approve "$PR_Y"; pr_event "$PR_Y"
+desk_sync
+approve "$PR_X"; enqueue_tick
+S_ISSUE="$(issue_of T-sim-s)"
+judge S.queue-conflict "#$PR_Y $(queue_line land "$PR_Y" | jq -r .result); #$PR_X pick $(queue_line pick "$PR_X" | jq -c '{result, eject: .eject.result}'), $(pr_field "$PR_X" .state) [$(pr_labels "$PR_X")], record $(ej_line "$PR_X" | jq -c '{reason, strike}'); #$S_ISSUE [$(issue_labels "$S_ISSUE")]" \
+  eval '[ "$(queue_line land "$PR_Y" | jq -r .result)" = landed ] && [ "$(queue_line pick "$PR_X" | jq -r .result)" = conflict ] &&
+        ejected "$PR_X" conflict && has_label "$S_ISSUE" ready && has_label "$S_ISSUE" rebase-strike && ! has_label "$S_ISSUE" in-review'
+
+# The next claim of T-sim-s is the rebase strike: the worktree is cut from main, X's one commit is
+# cherry-picked onto it (a conflict here: main holds Y's line), so fleet builds the ticket anew from
+# main; the strike does not count toward --max-strikes (factory/policy/budget.json), and the new PR
+# takes rebase-strike off the Issue.
+# claim.sh takes the oldest ready Issue, and the mirror numbers the scenario Issues by ticket id:
+# the other ready Issues are held back for this one claim (a labeled stand-in), then put back.
+HELD="$(ghq --argjson s "$S_ISSUE" '[.issues[] | select(.number != $s and any(.labels[]; .name == "ready")) | .number]')"
+standin "the ready Issues $(jq -c . <<<"$HELD") are held back so the node claims #$S_ISSUE"
+gh_state '.issues |= map(if (.number | IN($h[])) then .labels -= [{name: "ready"}] else . end)' --argjson h "$HELD"
+node_run dev-box FAKE_FLEET_FILE=sim/s/hello.sh
+gh_state '.issues |= map(if (.number | IN($h[])) and (any(.labels[]; .name == "ready") | not) then .labels += [{name: "ready"}] else . end)' --argjson h "$HELD"
+RB_PR="$(pr_of ticket/T-sim-s/dev-box)"
+judge S.rebase-strike "rc $RUN_RC: rebase $(jq -c '.rebase // null' <<<"$RUN_LAST"), base $(jq -c '.base.kind // null' <<<"$RUN_LAST"), budget $(jq -c '.budget.max_strikes // null' <<<"$RUN_LAST"); PR ${RB_PR:-none}; #$S_ISSUE [$(issue_labels "$S_ISSUE")]" \
+  eval 'jq -e --argjson x "$PR_X" --arg m "$(main_sha)" ".rebase.pr == \$x and .rebase.result == \"conflict\" and .base.kind == \"origin-main\" and .base.sha == \$m
+          and (.actions | index(\"rebase-conflict\")) != null and (.actions | index(\"fleet-run\")) != null and .budget.max_strikes == 2" <<<"$RUN_LAST" >/dev/null &&
+        [ -n "$RB_PR" ] && ! has_label "$S_ISSUE" rebase-strike && has_label "$S_ISSUE" in-review'
+
+# Green apart, red merged: `make test` fails only with both sim/r files in the tree (lib/world.sh).
+# R is green on the PR; main gains sim/r/main-side; the queue's gates on the merge fail, and `land`
+# ejects R as a red queue run.
+scn_start ticket/T-sim-r/scn-r
+scn_put sim/r/pr-side 'pr'
+scn_commit T-sim-r; PR_R="$(scn_pr ticket/T-sim-r/scn-r T-sim-r)"; pr_event "$PR_R"; R_HEAD="$(pr_field "$PR_R" .headRefOid)"
+desk_sync; printf 'main\n' >"$SIM/desk/sim/r/main-side"
+desk_push "desk: sim/r/main-side (S.queue-red)"
+approve "$PR_R"; enqueue_tick
+judge S.queue-red "#$PR_R PR build-test $(check_of build-test "$R_HEAD"); land $(queue_line land "$PR_R" | jq -c '{result, gates, eject: .eject.result}'), $(pr_field "$PR_R" .state) [$(pr_labels "$PR_R")], record $(ej_line "$PR_R" | jq -c '{reason}')" \
+  eval '[ "$(check_of build-test "$R_HEAD")" = success ] && jq -e ".result == \"red\" and .eject.result == \"ejected\"" <<<"$(queue_line land "$PR_R")" >/dev/null &&
+        ejected "$PR_R" red-queue-run'
+
+# The native mode: GitHub's merge queue is on for main (the fake gh's .merge_queue). enqueue.sh
+# enqueues the head of the order through GraphQL; GitHub's queue (stand-in) builds the group and
+# runs merge_group, and its removal of a PR for a failed check reaches `dequeued`, which ejects.
+gh_state '.merge_queue = {id: "MQ_sim", entries: []}'
+scn_start ticket/T-sim-n1/scn-n1
+scn_put sim/n1/hello.sh 'echo hello'
+scn_commit T-sim-n1; PR_N1="$(scn_pr ticket/T-sim-n1/scn-n1 T-sim-n1)"; approve "$PR_N1"; pr_event "$PR_N1"
+judge S.native-enqueue "pick $(queue_line pick "$PR_N1" | jq -c '{mode, result}'); enqueued $(ghq -c '.enqueued // []')" \
+  ghq -e --argjson n "$PR_N1" --arg h "$(pr_field "$PR_N1" .headRefOid)" '.enqueued == [{pr: $n, head: $h}]'
+standin "GitHub's merge queue builds the group of #$PR_N1 and runs merge_group"
+group="$(queue_standin "$PR_N1")"
+miss="$(required_report "$(main_sha)" "$group")"
+judge S.native-merge "${miss:-every required context reports green}" test -z "$miss"
+standin "GitHub's merge queue merges #$PR_N1 (the group, size 1)"
+gh_state '.merge_queue.entries -= [$n]' --argjson n "$PR_N1"
+merge_standin "$PR_N1" "$group"; desk_sync
+scn_start ticket/T-sim-n2/scn-n2
+scn_put sim/n2/hello.sh 'echo hello'
+scn_commit T-sim-n2; PR_N2="$(scn_pr ticket/T-sim-n2/scn-n2 T-sim-n2)"; approve "$PR_N2"; pr_event "$PR_N2"
+standin "GitHub's merge queue removes #$PR_N2 for a failed check (pull_request_target dequeued, CI_FAILURE)"
+gh_state '.merge_queue.entries -= [$n]' --argjson n "$PR_N2"
+jq -n --argjson n "$PR_N2" --argjson p "$(FAKE_GH_LOG=/dev/null "$SIM_FAKES/gh" api "repos/$REPO/pulls/$PR_N2")" \
+  '{action: "dequeued", number: $n, reason: "CI_FAILURE", pull_request: $p}' >"$SIM/ev-dq.json"
+drive pull_request_target "$SIM/ev-dq.json" "$(main_sha)"
+judge S.native-dequeue "enqueued $(ghq -c --argjson n "$PR_N2" '[(.enqueued // [])[] | select(.pr == $n)] | length'); #$PR_N2 $(pr_field "$PR_N2" .state) [$(pr_labels "$PR_N2")], record $(ej_line "$PR_N2" | jq -c '{reason, dequeued_reason}')" \
+  eval 'ghq -e --argjson n "$PR_N2" "any((.enqueued // [])[]; .pr == \$n)" >/dev/null && ejected "$PR_N2" red-queue-run &&
+        [ "$(ej_line "$PR_N2" | jq -r .dequeued_reason)" = CI_FAILURE ]'
+gh_state '.merge_queue = null'
+unset SIM_STANDIN_GREEN
 
 # A T-sim-t1 PR whose second commit names T-sim-victim. Merged: post-merge completes T-sim-t1 (its
 # head branch's ticket) and reports T-sim-victim `foreign`, never completing it (merge:G11).
@@ -276,10 +361,12 @@ scn_start ticket/T-sim-t1/scn-foreign
 scn_put sim/t1/foreign.sh 'echo one'; scn_commit T-sim-t1
 scn_put sim/t1/foreign2.sh 'echo two'; scn_commit T-sim-victim
 pr="$(scn_pr ticket/T-sim-t1/scn-foreign T-sim-t1)"; approve "$pr"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
-# The ticket gates refuse it on the PR already (the merge below is the stand-in's, not a gate's).
+# The ticket gates refuse it on the PR already, so no queue takes it: a repo admin's merge button does
+# (a labeled stand-in, as every merge here that is no queue's).
 judge S.foreign-trailer-refused "$(scn_detail context "$h"); $(scn_detail commit-check "$h")" \
   eval 'check_fails_naming context "$h" "trailer .Ticket: T-sim-victim" && check_fails_naming commit-check "$h" "trailer .Ticket: T-sim-victim"'
-queue_and_merge "$pr"
+standin "admin merge #$pr"
+admin_merge "$pr"
 pm_line() {  # pm_line <merge-sha> <ticket>: post-merge's JSON line for <ticket> on the push of <merge-sha>
   local log; log="$(jq -r --arg h "$1" 'select(.event == "push" and .head_sha == $h and .job == "complete") | .log' "$SIM/jobs.jsonl" | tail -n1)"
   [ -z "$log" ] || { grep -h '^{"mode":' "$log" || true; } | jq -c --arg t "$2" 'select(.ticket == $t)' | tail -n1
@@ -307,7 +394,8 @@ judge S.held-24h "#$P2 labels $(ghq --argjson n "$P2" '.issues[] | select(.numbe
 # The parent merges. post-merge completes T-sim-p2; on post-merge's completion (workflow_run) the
 # labeler finds T-sim-c2's held depends-on answering otherwise against main now and re-runs it; the
 # re-run replays the PR's event and reads the store at main's tip (lib/gate-context.sh gc_store_sha).
-queue_and_merge "$(pr_of ticket/T-sim-p2/dev-box)"
+standin "admin merge #$(pr_of ticket/T-sim-p2/dev-box)"
+admin_merge "$(pr_of ticket/T-sim-p2/dev-box)"
 rerun_of() {  # rerun_of <job> <head>: the conclusion of the driver's latest re-run of that job, or empty
   jq -r --arg j "$1" --arg h "$2" 'select(.rerun == true and .job == $j and .head_sha == $h) | .conclusion' "$SIM/jobs.jsonl" | tail -n1
 }

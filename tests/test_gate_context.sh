@@ -5,11 +5,19 @@
 #   - the queue-ref parse gh-readonly-queue/<base>/pr-<N>-<sha>;
 #   - each PR class (ticket, desk, halt, human) and every refusal (a malformed ticket ref, a fork's
 #     ticket ref, a stranger's PR, a body or trailer naming another ticket);
+#   - the serial queue (TB9, ticket T28): gates.yml called by enqueue.yml (workflow_call) under the
+#     caller's event (push, workflow_run, schedule, workflow_dispatch; GATE_QUEUE_PR wins over a
+#     pull_request event too) resolves as `queue`: PR GATE_QUEUE_PR read through gh api, base GATE_BASE,
+#     head GATE_HEAD, GC_BASE_BRANCH main (a PR targeting another branch is refused); the head must be the queue commit [GATE_BASE,
+#     PR head] (every other parent shape, and a GATE_QUEUE_PR that is no number, is refused); an
+#     unreadable PR or a base/head outside the checkout is exit 1; identity and the classes as on
+#     merge_group (a desk PR stays desk on a main that moved);
 #   - common.sh's id validator refuses `/`;
 #   - the remaining gate stub (attest-verify) resolves the context first, and keeps run.sh's `not
 #     built` contract (rails-proof and scope-check are built: tests/test_diff_gates.sh; commit-check:
 #     tests/test_commit_check.sh);
-#   - gates.yml runs every factory/bin script from the base checkout ./.base (I16).
+#   - gates.yml runs every factory/bin script from the base checkout ./.base (I16), and takes the queue's
+#     pr, base and head as workflow_call inputs (GATE_QUEUE_PR, GATE_BASE, GATE_HEAD).
 # Offline; every repo is a temp dir, gh is the fake.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
@@ -30,7 +38,7 @@ setup() {
   git -C "$R" add -A; git -C "$R" commit -qm base
   BASE="$(git -C "$R" rev-parse HEAD)"
   git -C "$R" update-ref refs/remotes/origin/main "$BASE"
-  unset GITHUB_EVENT_NAME GITHUB_EVENT_PATH GH_TOKEN
+  unset GITHUB_EVENT_NAME GITHUB_EVENT_PATH GH_TOKEN GATE_QUEUE_PR GATE_BASE GATE_HEAD
 }
 # change <branch> <msg> <op:path>...: a commit on a new branch from BASE; op is + (add/modify) or - (delete)
 change() {
@@ -304,6 +312,171 @@ case_gate_stubs() {
   done
 }
 
+# queue_pr <n> <head-sha> <head-ref> <body> [base-ref] [head-repo] [author]: PR n in the fake's store
+# (GET pulls/<n>), by default from the repo, onto main, by dev-box-owner (a collaborator).
+queue_pr() {
+  jq --argjson n "$1" --arg h "$2" --arg r "$3" --arg body "$4" --arg b "${5:-main}" --arg hr "${6:-$FREPO}" --arg a "${7:-dev-box-owner}" \
+    '.pulls = [.pulls[] | select(.number != $n)] + [{number: $n, headRefName: $r, headRefOid: $h, baseRefName: $b,
+      headRepository: $hr, state: "OPEN", title: "queued", body: $body, author: {login: $a}}]' \
+    "$FAKE_GH_ISSUES" >"$WORLD/s" && mv "$WORLD/s" "$FAKE_GH_ISSUES"
+}
+# qcommit <tree-ish> <subject> <parent>...: a commit in enqueue.sh's queue-commit identity
+# (github-actions[bot] author and committer); prints its sha
+qcommit() {
+  local t="$1" m="$2" p; shift 2
+  local -a ps=(); for p in "$@"; do ps+=(-p "$p"); done
+  printf '%s\n' "$m" | GIT_AUTHOR_NAME='github-actions[bot]' GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+    GIT_COMMITTER_NAME='github-actions[bot]' GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+    git -C "$R" commit-tree "$t^{tree}" "${ps[@]}"
+}
+# queue_env <caller event> <pr> <base> <head>: gates.yml as enqueue.yml calls it (workflow_call): the
+# caller's event name and a payload of its shape, the inputs as GATE_QUEUE_PR, GATE_BASE, GATE_HEAD.
+queue_env() {
+  case "$1" in
+    push) jq -n --arg b "$3" '{ref: "refs/heads/main", before: ("0" * 40), after: $b, repository: {full_name: "Codertocat/Hello-World"}}' ;;
+    workflow_run) jq -n '{action: "completed", workflow_run: {name: "gates", event: "pull_request", conclusion: "success",
+                          pull_requests: [{number: 2}]}}' ;;
+    schedule) jq -n '{schedule: "*/15 * * * *"}' ;;
+    workflow_dispatch) jq -n '{ref: "refs/heads/main", inputs: {dry_run: "false"}}' ;;
+  esac >"$WORLD/event.json"
+  export GITHUB_EVENT_NAME="$1" GITHUB_EVENT_PATH="$WORLD/event.json" GATE_QUEUE_PR="$2" GATE_BASE="$3" GATE_HEAD="$4" GH_TOKEN=ghs_readonly
+}
+# base_branch: GC_BASE_BRANCH as gate_context sets it in R (it is not in the JSON).
+base_branch() {
+  (
+    cd "$R"
+    # shellcheck source=factory/bin/lib/common.sh
+    . "$BIN/lib/common.sh"
+    # shellcheck source=factory/bin/lib/gate-context.sh
+    . "$GC"
+    gate_context >/dev/null 2>&1
+    printf '%s\n' "$GC_BASE_BRANCH"
+  )
+}
+
+case_queue() {
+  setup
+  local h s ev
+  h="$(change ticket/T20/dev-box "$(printf 'work\n\nTicket: T20')" +sim/t20/hello.sh)"
+  queue_pr 7 "$h" ticket/T20/dev-box $'Ticket: T20\nNode: dev-box'
+  # enqueue.sh's queue commit: parents [main, PR head], github-actions[bot], the merge subject.
+  s="$(qcommit "$h" "Merge pull request #7 from Codertocat/ticket/T20/dev-box" "$BASE" "$h")"
+  for ev in push workflow_run schedule workflow_dispatch; do
+    queue_env "$ev" 7 "$BASE" "$s"; : >"$FAKE_GH_LOG"
+    ctx
+    check "$ev caller: exit 0" eq "$RC:$ERR" 0:
+    check "$ev caller: event queue, PR 7, base GATE_BASE, head GATE_HEAD" \
+      eq "$(field '[.event, .pr, .base, .head] | join(" ")')" "queue 7 $BASE $s"
+    check "$ev caller: ticket and class from PR 7's head ref" \
+      eq "$(field '[.head_ref, .ticket, .handle, .class, .author_association] | join(" ")')" "ticket/T20/dev-box T20 dev-box ticket COLLABORATOR"
+    check "$ev caller: one read, gh api repos/<repo>/pulls/7" eq "$(jq -c . "$FAKE_GH_LOG")" "[\"api\",\"repos/$FREPO/pulls/7\"]"
+  done
+  check "GC_BASE_BRANCH is main" eq "$(base_branch)" main
+  queue_pr 7 "$h" ticket/T20/dev-box $'Ticket: T20\nNode: dev-box' release/v1
+  ctx
+  check "  a queue PR that targets release/v1: refused (the queue merges into main only)" eq "$RC:$OUT" 2:
+  check "  naming the branch" grep -q "PR #7 targets release/v1, and the queue merges into main only" <<<"$ERR"
+  queue_pr 7 "$h" ticket/T20/dev-box $'Ticket: T20\nNode: dev-box'
+  # The queue env wins over a pull_request event (GitHub's payload: PR 2, the PR head).
+  pr_event pull_request-opened.json "$h" ticket/T20/other 'Ticket: T20'
+  export GATE_QUEUE_PR=7 GATE_BASE="$BASE" GATE_HEAD="$s" GH_TOKEN=ghs_readonly
+  ctx
+  check "GATE_QUEUE_PR wins over a pull_request event of PR 2: queue, PR 7, PR 7's ref, the queue commit" \
+    eq "$RC:$(field '[.event, .pr, .head_ref, .head] | join(" ")')" "0:queue 7 ticket/T20/dev-box $s"
+  # gates.yml sets GATE_QUEUE_PR to '' (no inputs) on pull_request and merge_group: the event's own path.
+  export GATE_QUEUE_PR='' GATE_BASE='' GATE_HEAD=''
+  ctx
+  check "an empty GATE_QUEUE_PR (gates.yml off the queue) leaves the pull_request event" \
+    eq "$RC:$(field '[.event, .pr, .head] | join(" ")')" "0:pull_request 2 $h"
+}
+
+case_queue_refusals() {
+  setup
+  local h h2 o s n subj="Merge pull request #7 from Codertocat/ticket/T20/dev-box"
+  o="$(change elsewhere "another line of main" +README.md)"
+  h="$(change ticket/T20/dev-box "$(printf 'work\n\nTicket: T20')" +sim/t20/a.sh)"
+  git -C "$R" commit -q --allow-empty -m "$(printf 'more\n\nTicket: T20')"
+  h2="$(git -C "$R" rev-parse HEAD)"
+  queue_pr 7 "$h" ticket/T20/dev-box 'Ticket: T20'
+  queue_pr 8 "$h2" ticket/T21/dev-box 'Ticket: T21'
+  qrefused() {  # qrefused <name> <pr> <head> <stderr regex>
+    queue_env push "$2" "$BASE" "$3"; ctx
+    check "$1: refused (exit 2)" eq "$RC:$OUT" 2:
+    check "  naming why" grep -qE "$4" <<<"$ERR"
+  }
+  local why="queue: head [0-9a-f]{12} is not the merge of PR #[0-9]+'s head onto ${BASE:0:12}"
+  qrefused "one parent (a squash shape)" 7 "$(qcommit "$h" "$subj" "$BASE")" "$why"
+  qrefused "the PR head itself as GATE_HEAD" 7 "$h" "$why"
+  qrefused "parents [another commit, PR head]" 7 "$(qcommit "$h" "$subj" "$o" "$h")" "$why \\(parents $o $h\\)"
+  qrefused "parents [PR head, base] (swapped)" 7 "$(qcommit "$h" "$subj" "$h" "$BASE")" "$why"
+  qrefused "parents [base, a commit that is not PR 7's head]" 7 "$(qcommit "$h2" "$subj" "$BASE" "$h2")" "$why"
+  qrefused "three parents [base, PR head, another]" 7 "$(qcommit "$h" "$subj" "$BASE" "$h" "$o")" "$why"
+  s="$(qcommit "$h" "$subj" "$BASE" "$h")"
+  qrefused "PR 7's queue commit run as PR 8" 8 "$s" "merge of PR #8's head"
+  for n in abc 0 07 -1 '#7' '7 ' 7x; do
+    : >"$FAKE_GH_LOG"
+    qrefused "GATE_QUEUE_PR '$n'" "$n" "$s" "GATE_QUEUE_PR '$n' is not a PR number"
+    check "  no gh call" eq "$(wc -l <"$FAKE_GH_LOG" | tr -d ' ')" 0
+  done
+  # Operational errors: exit 1, never a pass and never a refusal.
+  queue_env push 99 "$BASE" "$s"; ctx
+  check "an unreadable PR (404): exit 1" eq "$RC" 1
+  check "  saying so" grep -qF "cannot read PR #99 of $FREPO" <<<"$ERR"
+  queue_env push 7 "$BASE" "$(printf 'ab%.0s' {1..20})"; ctx
+  check "a head not in the checkout: exit 1" eq "$RC" 1
+  check "  saying so" grep -qF "is not in this checkout" <<<"$ERR"
+  queue_env push 7 "$(printf 'cd%.0s' {1..20})" "$s"; ctx
+  check "a base not in the checkout: exit 1" eq "$RC" 1
+  queue_env push 7 "$BASE" ""; ctx
+  check "no GATE_HEAD: exit 1" eq "$RC" 1
+  check "  saying so" grep -qF "the event has no base and head sha" <<<"$ERR"
+}
+
+case_queue_identity_classes() {
+  setup
+  local h s hd m2 tree
+  # A PR commit whose trailer names another ticket: refused on the queue as on merge_group.
+  h="$(change ticket/T20/dev-box "$(printf 'work\n\nTicket: T-victim')" +sim/t20/a.sh)"
+  queue_pr 7 "$h" ticket/T20/dev-box 'Ticket: T20'
+  s="$(qcommit "$h" "Merge pull request #7 from Codertocat/ticket/T20/dev-box" "$BASE" "$h")"
+  queue_env push 7 "$BASE" "$s"; ctx
+  check "a PR commit with 'Ticket: T-victim', via the queue: refused (exit 2)" eq "$RC:$OUT" 2:
+  check "  naming the commit and the id" grep -qF "commit ${h:0:12} has the trailer 'Ticket: T-victim'" <<<"$ERR"
+  h="$(change ticket/T20/dev-box "$(printf 'work\n\nTicket: T20')" +sim/t20/a.sh)"
+  s="$(qcommit "$h" "Merge pull request #7 from Codertocat/ticket/T20/dev-box" "$BASE" "$h")"
+  queue_pr 7 "$h" ticket/T20/dev-box 'Ticket: T21'
+  queue_env push 7 "$BASE" "$s"; ctx
+  check "a PR body naming T21, via the queue: refused" eq "$RC" 2
+  check "  naming T21" grep -qF "the body says 'Ticket: T21'" <<<"$ERR"
+  queue_pr 7 "$h" ticket/T20/dev-box 'Ticket: T20' main stranger/Hello-World
+  queue_env push 7 "$BASE" "$s"; ctx
+  check "a fork's ticket ref, via the queue: refused" eq "$RC" 2
+  check "  a fork is never a ticket PR" grep -qF "a fork is never a ticket PR" <<<"$ERR"
+  hd="$(change docs/s "docs" +docs/guide.md)"
+  queue_pr 9 "$hd" docs/s '' main "$FREPO" stranger
+  queue_env push 9 "$BASE" "$(qcommit "$hd" "Merge pull request #9 from Codertocat/docs/s" "$BASE" "$hd")"; ctx
+  check "a stranger's PR, via the queue: refused" eq "$RC" 2
+  check "  not a collaborator" grep -qF "not a ticket branch and not a collaborator" <<<"$ERR"
+  # A desk PR through the queue is a desk PR.
+  hd="$(change desk/t "desk" +.adlc/tickets/t21.json +docs/adr/0008.md)"
+  queue_pr 8 "$hd" desk/t ''
+  s="$(qcommit "$hd" "Merge pull request #8 from Codertocat/desk/t" "$BASE" "$hd")"
+  queue_env schedule 8 "$BASE" "$s"; ctx
+  check "a desk PR via the queue: class desk" eq "$RC:$(field '[.event, .class] | join(" ")')" "0:queue desk"
+  # main moved (README) and the queue commit is built on the new main: BASE...HEAD is the PR's diff,
+  # never main's change, so the class is still desk.
+  git -C "$R" checkout -q -B main "$BASE"; echo moved >>"$R/README.md"; git -C "$R" commit -qam "main moves"
+  m2="$(git -C "$R" rev-parse HEAD)"
+  tree="$(git -C "$R" merge-tree --write-tree "$m2" "$hd")"
+  s="$(qcommit "$tree" "Merge pull request #8 from Codertocat/desk/t" "$m2" "$hd")"
+  queue_env workflow_run 8 "$m2" "$s"; ctx
+  check "  on a main that moved since the PR's base: still desk" eq "$RC:$(field '[.base, .class] | join(" ")')" "0:$m2 desk"
+  h="$(change halt/add "halt" +factory/HALT)"
+  queue_pr 10 "$h" halt/add ''
+  queue_env push 10 "$BASE" "$(qcommit "$h" "Merge pull request #10 from Codertocat/halt/add" "$BASE" "$h")"; ctx
+  check "a halt PR via the queue: class halt" eq "$RC:$(field .class)" 0:halt
+}
+
 case_gates_yml_base_scripts() {
   local wf="$REPO_ROOT/.github/workflows/gates.yml" bad
   # Every run: step that calls a factory/bin script calls the base's copy, ./.base/factory/bin/...
@@ -320,14 +493,18 @@ case_gates_yml_base_scripts() {
          '[{"ref":"${{ env.GATE_HEAD }}","fetch-depth":0},{"ref":"${{ env.GATE_BASE }}","path":".base"}]'
     check "$j: no if: (it reports on pull_request and merge_group)" eq "$(yq -r ".jobs[\"$j\"] | has(\"if\")" "$wf")" false
   done
-  check "GATE_BASE / GATE_HEAD are the event's base and head" \
-    eq "$(yq -r '.env.GATE_BASE + " | " + .env.GATE_HEAD' "$wf")" \
-       '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }} | ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}'
-  check "gates run on pull_request and merge_group" eq "$(yq -r '.on | keys | join(" ")' "$wf")" "pull_request merge_group"
+  check "GATE_BASE / GATE_HEAD are the queue's inputs, else the event's base and head; GATE_QUEUE_PR the queue's pr" \
+    eq "$(yq -r '.env.GATE_BASE + " | " + .env.GATE_HEAD + " | " + .env.GATE_QUEUE_PR' "$wf")" \
+       '${{ inputs.base || github.event.pull_request.base.sha || github.event.merge_group.base_sha }} | ${{ inputs.head || github.event.pull_request.head.sha || github.event.merge_group.head_sha }} | ${{ inputs.pr }}'
+  check "gates run on pull_request, merge_group and workflow_call (the serial queue, enqueue.yml)" \
+    eq "$(yq -r '.on | keys | join(" ")' "$wf")" "pull_request merge_group workflow_call"
+  check "workflow_call takes pr, base and head, required strings" \
+    eq "$(yq -o=json -I=0 '.on.workflow_call.inputs | to_entries | map([.key, .value.type, .value.required])' "$wf")" \
+       '[["pr","string",true],["base","string",true],["head","string",true]]'
 }
 
 for c in fixtures-are-githubs pull-request-ticket merge-group queue-ref-parse classes refusals identity node id-validator \
-         gate-stubs gates-yml-base-scripts; do
+         gate-stubs queue queue-refusals queue-identity-classes gates-yml-base-scripts; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

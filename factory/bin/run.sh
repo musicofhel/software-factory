@@ -13,9 +13,25 @@
 #                claimable → nap governor.nothingClaimableSleepMinutes. The Issue's `Ticket: <id>`
 #                line (mirror.sh) names the ticket
 #   fetch        origin main and ticket/<id>/*
+#   rebase       only when the Issue carries `rebase-strike` (the queue ejected the ticket's PR,
+#                factory/bin/eject.sh; specs/factory-step3-v1 TB9, ticket T28): the ticket's last
+#                record in origin/main:factory/ledger/ejections.jsonl names the PR; its head E, fetched
+#                from refs/pull/<pr>/head, must be the record's head and ONE commit carrying `Ticket:
+#                <id>` (T23). E is cherry-picked onto origin/main with `git merge-tree --write-tree
+#                --merge-base E^ origin/main E`. Clean → GATE_BASE = origin/main, GATE_HEAD = one
+#                commit of that tree with the trailer paragraph (Factory-Outcome: rebased,
+#                Rebased-From: E), then the same gates, push, PR and hand-off as a fleet success; no
+#                fleet runs. A conflict, or no usable record (ineligible) → fleet runs as usual but from
+#                origin/main, never the ejected branch. The rebase strike never counts toward
+#                --max-strikes: fleet gets the budget's, unchanged. E must have one parent, an
+#                ancestor of origin/main (a two-commit head is ineligible, never half-applied); a
+#                merge-tree failure other than a conflict is result `error` (fleet runs). The ledger
+#                line carries .rebase = {pr, from, strike, result: clean | conflict | error |
+#                ineligible}, kept in the slot state across a pause or a PR retry; the hand-off, and a
+#                desk label, also remove `rebase-strike`
 #   worktree     .worktrees/<id>, detached, at the newest lapsed origin/ticket/<id>/* branch (its
-#                dead-end material goes to fleet's --dead-end-file) or at origin/main; agent.lock
-#                rendered by lib/ralon-lock.sh
+#                dead-end material goes to fleet's --dead-end-file) or at origin/main (always on a
+#                rebase strike); agent.lock rendered by lib/ralon-lock.sh
 #   budget       maxStrikes and wallClockMinutes of the claim's weight (budget.json), each replaced
 #                by the ticket's own `budget` object from `adlc ticket show` in the worktree when it
 #                holds that key as a positive integer (SPEC-v0.2 L431, node:G14). adlc's `budget` is
@@ -104,7 +120,7 @@ PROG=run
 # shellcheck source=factory/bin/lib/diff-gates.sh
 . "$(dirname "$0")/lib/diff-gates.sh"
 
-usage() { sed -n '2,93p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,109p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -215,6 +231,7 @@ serial() {  # serial <cmd...>: one at a time per node (governor fetches, git fet
 reset_iteration() {
   ISSUE="" TICKET="" TICKET_HASH="" WEIGHT="" WT="" BASE="" BASE_KIND="" LAPSED="" RUN_ID="" RESUMES=0 FLEET_ARGV='[]'
   MAX_STRIKES=0 WALL_MIN=0 STRIKES=0 FLEET_RUN=unknown REASON="" NEXT_SLEEP=0 STOP_RC="" LOGBASE="" DOC="" PR_PENDING=null
+  REBASE="" REBASE_E="" WT_MAIN=0
   REC="$(jq -cn --argjson s "$slot" --argjson i "$ITER" --arg at "$(epoch_to_iso "$(now_epoch)")" --arg h "$HANDLE" \
           --arg a "$ADAPTER@$ADAPTER_VERSION" \
     '{slot: $s, iteration: $i, at: $at, handle: $h, adapter: $a, tokens: null, actions: []}')"
@@ -223,12 +240,14 @@ rec() { REC="$(jq -c "$@" <<<"$REC")"; }
 act() { rec --arg a "$1" '.actions += [$a]'; }
 outcome() { rec --arg o "$1" '.outcome = $o'; }
 
-state_save() {  # state_save <lock-beat-epoch>; PR_PENDING (null or the PR to retry) is saved with it
+state_save() {  # state_save <lock-beat-epoch>; PR_PENDING (null or the PR to retry) and REBASE are saved with it
   jq -cn --argjson n "$ISSUE" --arg t "$TICKET" --arg th "$TICKET_HASH" --arg w "$WEIGHT" --arg wt "$WT" --arg b "$BASE" --arg bk "$BASE_KIND" \
          --arg l "$LAPSED" --arg r "$RUN_ID" --argjson res "$RESUMES" --argjson argv "$FLEET_ARGV" \
          --argjson ms "$MAX_STRIKES" --argjson beat "$1" --arg reason "$REASON" --argjson pr "$PR_PENDING" \
+         --argjson rb "${REBASE:-null}" \
     '{issue: $n, ticket: $t, ticket_hash: $th, weight: $w, worktree: $wt, base: $b, base_kind: $bk, lapsed: $l, run_id: $r,
-      resumes: $res, fleet_argv: $argv, max_strikes: $ms, lock_beat_at: $beat, paused_reason: $reason, pr_pending: $pr}' >"$STATE.tmp"
+      resumes: $res, fleet_argv: $argv, max_strikes: $ms, lock_beat_at: $beat, paused_reason: $reason, pr_pending: $pr,
+      rebase: $rb}' >"$STATE.tmp"
   mv -f "$STATE.tmp" "$STATE"
 }
 state_load() {
@@ -240,6 +259,7 @@ state_load() {
   FLEET_ARGV="$(jq -c .fleet_argv <<<"$s")" MAX_STRIKES="$(jq -r .max_strikes <<<"$s")"
   LOCK_BEAT_AT="$(jq -r .lock_beat_at <<<"$s")"
   PR_PENDING="$(jq -c '.pr_pending // null' <<<"$s")"
+  REBASE="$(jq -c '.rebase // empty' <<<"$s")"   # a rebase strike's claim, across a pause or a PR retry (T28)
   valid_issue "$ISSUE" && valid_ticket_id "$TICKET" && [[ "$RESUMES" =~ ^[0-9]+$ && "$LOCK_BEAT_AT" =~ ^[0-9]+$ ]] ||
     die "slot state $STATE is unreadable; inspect it, then remove it"
   LOGBASE="$RUN_DIR/logs/$RUN_ID"
@@ -257,7 +277,9 @@ lock_check() {  # heartbeat.sh dry run before a push: 0 this node holds the lock
 }
 lock_lost() { REASON=lock-lost; outcome lock-lost; wt_remove; rm -f "$STATE"; }
 handoff() {  # the PR is the claim now (T25): the Issue goes in-review, then the lock is released
-  if gh issue edit "$ISSUE" --repo "$REPO" --add-label in-review --remove-label ready,in-progress >/dev/null 2>>"$LOGBASE.err"; then
+  local rm=ready,in-progress
+  [ -z "$REBASE" ] || rm+=,rebase-strike   # a rebase strike's claim is done once its PR is open (T28)
+  if gh issue edit "$ISSUE" --repo "$REPO" --add-label in-review --remove-label "$rm" >/dev/null 2>>"$LOGBASE.err"; then
     act label-in-review
   else act label-in-review-failed; fi
   release_lock
@@ -271,8 +293,10 @@ facts() {  # the JSON every outbound text is rendered from (I8: ids, codes, coun
   jq -cn --arg h "$HANDLE" --arg t "$TICKET" --argjson n "$ISSUE" --arg r "$REASON" --argjson s "$STRIKES" \
          --argjson ms "$MAX_STRIKES" --arg a "$ADAPTER@$ADAPTER_VERSION" --arg run "$FLEET_RUN" --arg br "${1:-}" \
          --arg head "${2:-}" --arg base "$BASE" --arg bk "$BASE_KIND" --argjson pr "${3:-null}" \
+    --argjson rb "${REBASE:-null}" \
     '{handle: $h, ticket: $t, issue: $n, reason: $r, strikes: $s, max_strikes: $ms, adapter: $a, fleet_run: $run,
-      branch: (if $br == "" then null else $br end), head: $head, base: $base, base_kind: $bk, pr: $pr, tokens: null}'
+      branch: (if $br == "" then null else $br end), head: $head, base: $base, base_kind: $bk, pr: $pr, tokens: null}
+     + (if $rb != null and $rb.result == "clean" then {rebased: {from: $rb.from, pr: $rb.pr, strike: $rb.strike}} else {} end)'
 }
 comment() {  # comment <kind> [branch head pr]; a desk comment ends in the needs-desk marker
   local body m; body="$(run_comment "$1" "$(facts "${2:-}" "${3:-}" "${4:-null}")")"
@@ -282,8 +306,9 @@ comment() {  # comment <kind> [branch head pr]; a desk comment ends in the needs
   if gh issue comment "$ISSUE" --repo "$REPO" --body "$body" >/dev/null 2>>"$LOGBASE.err"; then act comment
   else act comment-failed; fi
 }
-label_desk() {
-  if gh issue edit "$ISSUE" --repo "$REPO" --add-label needs-desk --remove-label ready >/dev/null 2>>"$LOGBASE.err"; then act label-needs-desk
+label_desk() {  # on a rebase strike the desk takes the claim, rebase-strike with it (T28): a returned ticket builds anew
+  local rm=ready; [ -z "$REBASE" ] || rm+=,rebase-strike
+  if gh issue edit "$ISSUE" --repo "$REPO" --add-label needs-desk --remove-label "$rm" >/dev/null 2>>"$LOGBASE.err"; then act label-needs-desk
   else act label-needs-desk-failed; fi
 }
 record_commit() {  # record_commit <parent> <outcome> [trailers...]: prints the record commit's sha
@@ -339,7 +364,10 @@ mirror_make() {  # fleet's model-plane git mirror: bare, no template (no hooks),
 wt_make() {
   local exclude
   WT="$CLONE/.worktrees/$TICKET"
-  LAPSED="$(git -C "$CLONE" for-each-ref --sort=-committerdate --count=1 --format='%(refname)' "refs/remotes/origin/ticket/$TICKET/")"
+  LAPSED=""
+  # On a rebase strike the ticket's branches are the ejected PR's, stale against main: never a base.
+  [ "$WT_MAIN" = 1 ] ||
+    LAPSED="$(git -C "$CLONE" for-each-ref --sort=-committerdate --count=1 --format='%(refname)' "refs/remotes/origin/ticket/$TICKET/")"
   if [ -n "$LAPSED" ]; then BASE_KIND=lapsed; BASE="$(git -C "$CLONE" rev-parse "$LAPSED^{commit}")"
   else BASE_KIND=origin-main; BASE="$(git -C "$CLONE" rev-parse "refs/remotes/origin/main^{commit}")"; fi
   rec --arg b "$BASE" --arg k "$BASE_KIND" --arg l "${LAPSED#refs/remotes/origin/}" \
@@ -423,7 +451,7 @@ finish_release() {  # finish_release <comment?> <sleep> [stop-rc]
   NEXT_SLEEP="$2"; STOP_RC="${3:-}"
 }
 on_success() {
-  local tip tg_out tg verdict score findings rc a
+  local tip
   tip="$(git -C "$CLONE" rev-parse -q --verify "$(jq -r .integrationBranch <<<"$DOC")^{commit}" || true)"
   [ -n "$tip" ] || { REASON=integration-branch-missing; outcome released; finish_release 1 0 1; return; }
   # The node gates exactly the commit it pushes (I17): GATE_BASE is the merge-base of fleet's tip with
@@ -438,6 +466,13 @@ on_success() {
   # fleet's own commits stay in the node's log for the transcript record (wt_remove deletes fleet's
   # branches): one local ref per run, refs/factory/fleet/<run id>, never pushed.
   git -C "$CLONE" update-ref "refs/factory/fleet/$RUN_ID" "$tip" 2>>"$LOGBASE.git.err" || act fleet-ref-failed
+  gate_push "$tip"
+}
+# gate_push <tip>: the tail every built commit takes (a fleet success, or a clean rebase strike):
+# tamperguard, rails-proof and scope-check on GATE_BASE...GATE_HEAD (I17), the lock check, the push of
+# GATE_HEAD, the PR and the hand-off. <tip> is the commit the gate-manifest hashes are read from.
+gate_push() {
+  local tip="$1" tg_out tg verdict score findings rc a
   rec --arg b "$GATE_BASE" --arg h "$GATE_HEAD" '.gate_base = $b | .gate_head = $h'
   # tamperguard over the whole ticket diff, under vetto and this claim's render of build.toml
   # (ADR-0005 decision 8 as amended by T17; lib/policy-render.sh). A root that cannot be derived
@@ -539,7 +574,7 @@ pr_open() {
     act keep-lock
     outcome pr-pending; NEXT_SLEEP="$UNKNOWN_S"
   else
-    REASON=pr-open-failed; outcome desk
+    REASON="pr-open-failed"; outcome desk
     comment desk "ticket/$TICKET/$HANDLE" "$PUSHED_SHA"; label_desk; release_lock
     PR_PENDING=null; rm -f "$STATE"
   fi
@@ -556,6 +591,58 @@ pr_retry() {  # the slot state holds a pushed sha whose PR could not be opened: 
     *) outcome pr-pending; NEXT_SLEEP="$UNKNOWN_S" ;;      # cannot tell: keep the state, ask again
   esac
 }
+# rebase_plan <issue-json>: on an Issue labeled `rebase-strike` (the queue ejected the ticket's PR, T28),
+# the worktree is cut from origin/main and REBASE says what the claim found: {pr, from, strike, result}.
+# REBASE_E is the ejected commit when it can be rebased; result `ineligible` when it cannot (no ledger
+# record, the PR head unreadable or moved, not one commit carrying `Ticket: <id>`).
+rebase_plan() {
+  jq -e 'any(.labels[]?; .name == "rebase-strike")' <<<"$1" >/dev/null || return 0
+  WT_MAIN=1
+  local recj pr e why=""
+  # One line per ejection; a malformed line is skipped, never the end of the read.
+  recj="$(git -C "$CLONE" show "refs/remotes/origin/main:factory/ledger/ejections.jsonl" 2>/dev/null |
+          jq -cR --arg t "$TICKET" 'fromjson? | select(type == "object" and .ticket == $t and (.pr | type) == "number")' 2>/dev/null |
+          tail -n1 || true)"
+  if [ -z "$recj" ]; then why="no-ejection-record"
+  else
+    pr="$(jq -r .pr <<<"$recj")"
+    if ! serial git -C "$CLONE" fetch -q origin "+refs/pull/$pr/head:refs/factory/rebase/$TICKET" 2>>"$LOGBASE.err"; then why="pr-head-unreadable"
+    else
+      e="$(git -C "$CLONE" rev-parse "refs/factory/rebase/$TICKET^{commit}")"
+      if [ "$e" != "$(jq -r .head <<<"$recj")" ]; then why="pr-head-moved"
+      elif [ "$(git -C "$CLONE" rev-list --parents -n1 "$e" | wc -w | tr -d ' ')" != 2 ] ||
+           ! git -C "$CLONE" merge-base --is-ancestor "$e^" "refs/remotes/origin/main"; then why="not-one-commit"
+      elif [ "$(git -C "$CLONE" log -1 --format='%(trailers:key=Ticket,valueonly,unfold,separator=%x2C)' "$e" | tr -d ' ')" != "$TICKET" ]; then
+        why="not-the-ticket-commit"
+      else REBASE_E="$e"
+      fi
+      git -C "$CLONE" update-ref -d "refs/factory/rebase/$TICKET" 2>/dev/null || true
+    fi
+  fi
+  REBASE="$(jq -cn --arg rec "$recj" --arg e "${e:-}" --arg why "$why" '($rec | fromjson? // {}) as $r
+    | {pr: ($r.pr // null), from: (if $e == "" then null else $e end), strike: ($r.strike // null)}
+      + (if $why == "" then {result: null} else {result: "ineligible", detail: $why} end)')"
+  act rebase-strike
+  rec --argjson r "$REBASE" '.rebase = $r'
+}
+# rebase_apply: E cherry-picked onto origin/main (git >= 2.40 for --merge-base). 0 = clean (GATE_BASE,
+# GATE_HEAD set); 1 = not rebased: result conflict (merge-tree rc 1) or error (any other failure).
+rebase_apply() {
+  local main tree rc=0 r
+  main="$(git -C "$CLONE" rev-parse "refs/remotes/origin/main^{commit}")"
+  tree="$(git -C "$CLONE" merge-tree --write-tree --merge-base "$REBASE_E^" "$main" "$REBASE_E" 2>>"$LOGBASE.err")" || rc=$?
+  if [ "$rc" = 0 ] && ! GATE_HEAD="$(run_commit_tree "$(head -n1 <<<"$tree")" "$main" "factory: $TICKET rebased on $HANDLE" \
+                                     "Factory-Outcome: rebased" "Rebased-From: $REBASE_E")"; then rc=2; fi
+  if [ "$rc" != 0 ]; then
+    r=error; [ "$rc" != 1 ] || r=conflict
+    REBASE="$(jq -c --arg r "$r" '.result = $r' <<<"$REBASE")"; rec --argjson r "$REBASE" '.rebase = $r'; act "rebase-$r"
+    return 1
+  fi
+  GATE_BASE="$main"
+  REBASE="$(jq -c '.result = "clean"' <<<"$REBASE")"; rec --argjson r "$REBASE" '.rebase = $r'; act rebase-clean
+  FLEET_RUN=none
+}
+
 on_desk() {  # strikes-exhausted | flail (and a pause past the resume cap)
   local lrc=0
   lock_check || lrc=$?
@@ -663,7 +750,7 @@ iteration() {
   WEIGHT="$(jq -r --argjson n "$ISSUE" '.candidates[] | select(.number == $n) | .weight' <<<"$c")"
   rec --argjson n "$ISSUE" --arg r "$RUN_ID" --arg w "$WEIGHT" '.issue = $n | .run_id = $r | .weight = $w'
   act claim
-  issues="$(gh issue list --repo "$REPO" --state open --limit 1000 --json number,body 2>>"$LOGBASE.err")" || issues='[]'
+  issues="$(gh issue list --repo "$REPO" --state open --limit 1000 --json number,body,labels 2>>"$LOGBASE.err")" || issues='[]'
   issue="$(jq -c --argjson n "$ISSUE" '[.[] | select(.number == $n)][0] // {}' <<<"$issues")"
   TICKET="$(run_ticket_of_issue "$issue")"
   TICKET_HASH="$(run_ticket_hash_of_issue "$issue")"
@@ -677,7 +764,9 @@ iteration() {
     REASON=fetch-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return
   fi
   act fetch
+  rebase_plan "$issue"
   if ! wt_make; then REASON=worktree-failed; outcome released; finish_release 1 0 1; return; fi
+  if [ -n "$REBASE_E" ] && rebase_apply; then gate_push "$GATE_HEAD"; return; fi
   local lrc=0
   "$B/lib/ralon-lock.sh" "$TICKET" --worktree "$WT" --apply 2>>"$LOGBASE.err" || lrc=$?
   if [ "$lrc" != 0 ]; then

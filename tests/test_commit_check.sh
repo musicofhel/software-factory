@@ -8,6 +8,11 @@
 #   - the post-merge exemption: the commit the real post-merge.sh --apply lands passes unsigned, and
 #     every near miss of its shape fails; CC_PM_IDENT is post-merge's identity;
 #   - merge_group: GitHub's queue merge commit is skipped in exactly its measured shape, else checked;
+#   - the serial queue (event `queue`, TB9 ticket T28: gates.yml called by enqueue.yml with
+#     GATE_QUEUE_PR, GATE_BASE, GATE_HEAD): enqueue.sh's queue commit (parents [base, PR head],
+#     github-actions[bot] author and committer, subject `Merge pull request #<N> from `) is skipped and
+#     the PR's own commits are still checked; a wrong identity or subject is checked (so it fails), a
+#     wrong parent shape is refused by gate-context first; neither event skips the other's shape;
 #   - every commit of the range counts (a merge commit inside a PR too), and the range is BASE..HEAD.
 # Offline; every repo is a temp dir, gh and adlc are the fakes, the events GitHub's example payloads.
 set -euo pipefail
@@ -16,6 +21,7 @@ set -euo pipefail
 CC="$BIN/commit-check.sh"
 EV="$REPO_ROOT/tests/fixtures/events"
 FREPO=Codertocat/Hello-World   # the repository of GitHub's example payloads
+FREPO_OWNER="${FREPO%/*}"
 SOB='Signed-off-by: dev <dev@fake>'
 NODE_TR=('Assisted-by: claude-code@2.1.280' 'Ticket: T20' 'Node: dev-box' 'Signed-off-by: node <node@fake>')
 PM_IDENT='github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
@@ -38,7 +44,7 @@ setup() {
   git -C "$R" add -A; git -C "$R" commit -qm base
   BASE="$(git -C "$R" rev-parse HEAD)"
   git -C "$R" update-ref refs/remotes/origin/main "$BASE"
-  unset GITHUB_EVENT_NAME GITHUB_EVENT_PATH GH_TOKEN
+  unset GITHUB_EVENT_NAME GITHUB_EVENT_PATH GH_TOKEN GATE_QUEUE_PR GATE_BASE GATE_HEAD
 }
 # msg <subject> <trailer>...: a message whose last paragraph is the trailers
 msg() { printf '%s\n\n' "$1"; printf '%s\n' "${@:2}"; }
@@ -325,6 +331,98 @@ case_merge_group() {
   fails "the queue shape on a pull_request event is never skipped" "$g" "no Signed-off-by trailer"
 }
 
+# q_world: setup, then PR 7 from ticket/T20/dev-box: the trailered commit H in the fake's store, and S,
+# enqueue.sh's queue commit of it onto BASE.
+q_world() {
+  setup
+  H="$(change ticket/T20/dev-box "$(msg work "${NODE_TR[@]}")" +sim/t20/a.sh)"
+  q_pr 7 "$H"
+  SUBJ="Merge pull request #7 from $FREPO_OWNER/ticket/T20/dev-box"
+  S="$(ct "$PM_IDENT" "$PM_IDENT" "$H" "$SUBJ" "$BASE" "$H")"
+}
+# q_pr <n> <head>: PR n from ticket/T20/dev-box at <head> in the fake's store (GET pulls/<n>)
+q_pr() {
+  jq --argjson n "$1" --arg h "$2" '.pulls = [.pulls[] | select(.number != $n)] + [{number: $n, headRefName: "ticket/T20/dev-box",
+      headRefOid: $h, baseRefName: "main", state: "OPEN", title: "T20", body: "Ticket: T20\nNode: dev-box", author: {login: "dev-box-owner"}}]' \
+    "$FAKE_GH_ISSUES" >"$WORLD/s" && mv "$WORLD/s" "$FAKE_GH_ISSUES"
+}
+# q_event <head> [pr]: gates.yml as enqueue.yml calls it: a push caller's event, the inputs as env
+q_event() {
+  jq -n --arg b "$BASE" '{ref: "refs/heads/main", after: $b}' >"$WORLD/event.json"
+  export GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$WORLD/event.json" GATE_QUEUE_PR="${2:-7}" GATE_BASE="$BASE" GATE_HEAD="$1" GH_TOKEN=ghs_readonly
+}
+
+case_queue_skip() {
+  q_world
+  local h2
+  q_event "$S"; cc
+  check "the serial queue's commit (enqueue.sh's shape): exit 0" eq "$RC:$OUT" 0:
+  check "  skipped, saying so" has "$ERR" "${S:0:12} skipped: the serial queue's merge commit of PR #7 (parents base, PR head)"
+  check "  never called GitHub's" lacks "$ERR" "GitHub's queue"
+  check "  the PR's own commit checked: 1 commit, the ticket rule" \
+    eval 'has "$ERR" "${H:0:12} ok" && has "$ERR" "pass: 1 commit(s) in ${BASE:0:12}..${S:0:12} carry the ticket trailers"'
+  # The PR brings a second commit without Signed-off-by: the queue commit is still skipped, that one fails.
+  git -C "$R" checkout -q ticket/T20/dev-box
+  h2="$(more "$(msg more 'Assisted-by: claude-code@2.1.280' 'Ticket: T20' 'Node: dev-box')" +sim/t20/b.sh)"
+  q_pr 7 "$h2"
+  S="$(ct "$PM_IDENT" "$PM_IDENT" "$h2" "$SUBJ" "$BASE" "$h2")"
+  q_event "$S"; cc
+  fails "a PR commit without Signed-off-by, through the queue" "$h2" "no Signed-off-by trailer (the DCO)"
+  check "  the queue commit still skipped, only the PR commit fails: 1 of 2" \
+    eval 'has "$ERR" "${S:0:12} skipped: the serial queue'"'"'s" && has "$ERR" "FAIL: 1 of 2 commit(s)" && has "$ERR" "${H:0:12} ok"'
+}
+
+case_queue_not_skipped() {
+  q_world
+  local s human='owner <owner@fake>'
+  qns() {  # qns <name> <commit>: on the queue it is checked like any commit, so it fails unsigned
+    q_event "$2"; cc
+    fails "$1" "$2" "no Signed-off-by trailer"
+    check "  not skipped" lacks "$ERR" "skipped"
+  }
+  qns "authored by a human" "$(ct "$human" "$PM_IDENT" "$H" "$SUBJ" "$BASE" "$H")"
+  qns "committed by a human" "$(ct "$PM_IDENT" "$human" "$H" "$SUBJ" "$BASE" "$H")"
+  qns "github-actions without [bot]" \
+    "$(ct 'github-actions <41898282+github-actions[bot]@users.noreply.github.com>' "$PM_IDENT" "$H" "$SUBJ" "$BASE" "$H")"
+  qns "GitHub's merge_group shape (committer GitHub) on the queue" \
+    "$(ct "$human" 'GitHub <noreply@github.com>' "$H" "Merge pull request #7 from o/ticket/T20/dev-box" "$BASE" "$H")"
+  qns "the subject names PR #8" "$(ct "$PM_IDENT" "$PM_IDENT" "$H" "Merge pull request #8 from $FREPO_OWNER/ticket/T20/dev-box" "$BASE" "$H")"
+  qns "the subject names PR #70 (a prefix of the number is not it)" \
+    "$(ct "$PM_IDENT" "$PM_IDENT" "$H" "Merge pull request #70 from $FREPO_OWNER/ticket/T20/dev-box" "$BASE" "$H")"
+  qns "another subject" "$(ct "$PM_IDENT" "$PM_IDENT" "$H" "queue: PR 7" "$BASE" "$H")"
+  # Parents other than [base, PR head]: gate-context refuses the queue run before this body.
+  for s in "$(ct "$PM_IDENT" "$PM_IDENT" "$H" "$SUBJ" "$ROOT" "$H")" "$(ct "$PM_IDENT" "$PM_IDENT" "$H" "$SUBJ" "$BASE")" \
+           "$(ct "$PM_IDENT" "$PM_IDENT" "$H" "$SUBJ" "$H" "$BASE")" "$(ct "$PM_IDENT" "$PM_IDENT" "$H" "$SUBJ" "$BASE" "$H" "$ROOT")"; do
+    q_event "$s"; cc
+    check "parents [$(git -C "$R" rev-list --parents -n1 "$s" | cut -d' ' -f2- | sed "s/$BASE/base/; s/$H/head/; s/$ROOT/root/")]: refused (exit 2), not skipped" \
+      eval '[ "$RC:$OUT" = 2: ] && has "$ERR" "is not the merge of PR #7'"'"'s head" && lacks "$ERR" "skipped"'
+  done
+  # The PR was pushed again after S was built: S's second parent is no longer PR 7's head.
+  git -C "$R" checkout -q ticket/T20/dev-box
+  q_pr 7 "$(more "$(msg again "${NODE_TR[@]}")" +sim/t20/c.sh)"
+  q_event "$S"; cc
+  check "the PR moved past S's second parent: refused (exit 2), not skipped" \
+    eval '[ "$RC" = 2 ] && has "$ERR" "is not the merge of PR #7'"'"'s head" && lacks "$ERR" "skipped"'
+}
+
+case_queue_merge_group_apart() {
+  q_world
+  local s
+  q_pr 104 "$H"
+  # enqueue.sh's shape for PR 104 on a merge_group event: merge_group skips only GitHub's committer.
+  s="$(ct "$PM_IDENT" "$PM_IDENT" "$H" "Merge pull request #104 from $FREPO_OWNER/ticket/T20/dev-box" "$BASE" "$H")"
+  jq --arg b "$BASE" --arg g "$s" '.merge_group.base_sha = $b | .merge_group.head_sha = $g' \
+    "$EV/merge_group-checks_requested.json" >"$WORLD/event.json"
+  export GITHUB_EVENT_NAME=merge_group GITHUB_EVENT_PATH="$WORLD/event.json" GH_TOKEN=ghs_readonly
+  cc
+  fails "enqueue.sh's commit shape on merge_group" "$s" "no Signed-off-by trailer"
+  check "  not skipped" lacks "$ERR" "skipped"
+  # And on a pull_request event, never.
+  ticket_pr "$S"; cc
+  fails "enqueue.sh's commit shape on a pull_request event" "$S" "no Signed-off-by trailer"
+  check "  not skipped" lacks "$ERR" "skipped"
+}
+
 case_merge_in_branch() {
   setup
   local mg
@@ -366,7 +464,7 @@ case_range() {
 }
 
 for c in node-commit untrailered ticket-class desk-halt-human post-merge-exempt post-merge-fakes merge-group \
-         merge-in-branch range; do
+         queue-skip queue-not-skipped queue-merge-group-apart merge-in-branch range; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

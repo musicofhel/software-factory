@@ -3,16 +3,22 @@
 Every stage judges the **desired** behavior of the pipeline (specs/factory-step3-v1/SPEC.md): `pass`
 means the pipeline did the right thing, `red: <gap id>` that it does not yet, with the gap of
 `specs/factory-step3-v1/records/sim/*.md` that explains it and the row that fixes it. After a red
-stage the sim plays a labeled stand-in (`stand-in:` in sim.log: GitHub's queue,
-the merge) so the later stages stay observable. `tests/sim/lib/compare.sh` compares this table with the results in both
-directions: a stage that goes green before its line here says `pass` fails the sim as much as a
-regression does. The row that fixes a gap flips its lines in the same commit. A stage only GitHub
+stage the sim plays a labeled stand-in (`stand-in:` in sim.log) so the later stages stay observable.
+The queue's stand-ins: GitHub's view of the `attest-verify` stub as green (SIM_STANDIN_GREEN, the
+walk and the queue scenarios only, so a PR can reach the queue; jobs.jsonl keeps its real failure),
+a repo admin's merge for the scenario merges that are no queue's, and GitHub's own native merge
+queue (the group, its merge_group run, its merge and its dequeue) in the native scenarios.
+`tests/sim/lib/compare.sh` compares this table with the results in both directions: a stage that
+goes green before its line here says `pass` fails the sim as much as a regression does. The row that
+fixes a gap flips its lines in the same commit. A stage only GitHub
 itself can prove is `red: kit: <line>` (TB12), never `pass`.
 
 Stage names: `world.*`, `desk.*`, `push.*`, `janitor.*` are the setup; `P.*` is T-sim-parent's path
-and `C.*` T-sim-child's (`.pr.<job>` = the job on pull_request, `.mg.<job>` = on merge_group, one
-line per job the driver ran from the YAML; `.identity` = the `context` job resolved this PR's number,
-ticket, class, base and head, on merge_group from the queue ref; `.node-tamper`, `.node-rails`,
+and `C.*` T-sim-child's (`.pr.<job>` = the job on pull_request, `.q.<job>` = on the first-party serial
+queue's commit (enqueue.yml calls gates.yml), one line per job the driver ran from the YAML;
+`.identity` = the `context` job resolved this PR's number, ticket, class, base and head, on the queue
+from the caller's inputs; `.enqueue` = enqueue.yml's `pick` built the queue commit, `.merge` = `land`
+pushed it to main; `.node-tamper`, `.node-rails`,
 `.node-scope` = the node's three diff gates on the commit it pushes, from run.sh's ledger line;
 `.i17-argv` = the node's `diff-gates:` trace lines and tamperguard argv equal those of the PR's
 `rails-proof`, `scope` and `tamper` jobs on the same base...head); `S.*` are the failure scenarios
@@ -54,21 +60,21 @@ not model.
 | P.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | P.hold | pass |
 | P.tier-order | pass |
-| P.enqueue | red: merge:G4 — nothing enqueues a green PR (TB9) |
-| P.mg.context | pass |
-| P.mg.identity | pass |
-| P.mg.build-test | pass |
-| P.mg.rails-proof | pass |
-| P.mg.scope | pass |
-| P.mg.tamper | pass |
-| P.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
-| P.mg.commit-check | pass |
-| P.mg.depends-on | pass |
-| P.mg.tier-order | pass |
-| P.mg.desk | pass |
-| P.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
-| P.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
-| P.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
+| P.enqueue | pass |
+| P.q.context | pass |
+| P.q.build-test | pass |
+| P.q.rails-proof | pass |
+| P.q.scope | pass |
+| P.q.tamper | pass |
+| P.q.dependencies | red: ci:G1 — `if: pull_request` skips it on the queue path (a called workflow sees the caller's event), so a required check never runs there (I18, TB10) |
+| P.q.commit-check | pass |
+| P.q.depends-on | pass |
+| P.q.tier-order | pass |
+| P.q.desk | pass |
+| P.q.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built`; GitHub's view of it is the sim's labeled stand-in (TB11) |
+| P.q.identity | pass |
+| P.merge | pass |
+| P.merged-mark | red: kit: GitHub marks the PR merged once its head is reachable from main, but its merge_commit_sha then is undocumented; post-merge needs it equal to the queue commit (TB12) |
 | P.complete | pass |
 | P.issue-closed | pass |
 | P.lock-released | pass |
@@ -98,21 +104,21 @@ not model.
 | C.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | C.hold | pass |
 | C.tier-order | pass |
-| C.enqueue | red: merge:G4 — nothing enqueues a green PR (TB9) |
-| C.mg.context | pass |
-| C.mg.identity | pass |
-| C.mg.build-test | pass |
-| C.mg.rails-proof | pass |
-| C.mg.scope | pass |
-| C.mg.tamper | pass |
-| C.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
-| C.mg.commit-check | pass |
-| C.mg.depends-on | pass |
-| C.mg.tier-order | pass |
-| C.mg.desk | pass |
-| C.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
-| C.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
-| C.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
+| C.enqueue | pass |
+| C.q.context | pass |
+| C.q.build-test | pass |
+| C.q.rails-proof | pass |
+| C.q.scope | pass |
+| C.q.tamper | pass |
+| C.q.dependencies | red: ci:G1 — `if: pull_request` skips it on the queue path (a called workflow sees the caller's event), so a required check never runs there (I18, TB10) |
+| C.q.commit-check | pass |
+| C.q.depends-on | pass |
+| C.q.tier-order | pass |
+| C.q.desk | pass |
+| C.q.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built`; GitHub's view of it is the sim's labeled stand-in (TB11) |
+| C.q.identity | pass |
+| C.merge | pass |
+| C.merged-mark | red: kit: GitHub marks the PR merged once its head is reachable from main, but its merge_commit_sha then is undocumented; post-merge needs it equal to the queue commit (TB12) |
 | C.complete | pass |
 | C.issue-closed | pass |
 | C.lock-released | pass |
@@ -137,7 +143,12 @@ not model.
 | S.desk-no-records | pass |
 | S.child-before-parent | pass |
 | S.tier-jump | red: ci:G6 — attest-verify.sh is a stub, so no PR is ever green and tier-order has nothing to wait for (TB11; the scenario's PR_A then also needs its attest note) |
-| S.queue-conflict | red: merge:G7 — no ejection: no `autorebase` label, no ejections.jsonl (TB9) |
+| S.queue-conflict | pass |
+| S.rebase-strike | pass |
+| S.queue-red | pass |
+| S.native-enqueue | pass |
+| S.native-merge | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id, so the merge group never reports green (TB10) |
+| S.native-dequeue | pass |
 | S.foreign-trailer | pass |
 | S.foreign-trailer-refused | pass |
 | S.held-24h | pass |

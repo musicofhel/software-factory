@@ -20,7 +20,10 @@
 #                       nothing else, author and committer both $CC_PM_IDENT, one parent, a diff
 #                       that touches only .adlc/ and factory/ledger/. In that shape it needs no
 #                       Signed-off-by; in any other it fails, signed or not.
-# Skipped: on merge_group only, GitHub's own queue merge commit, which carries no trailers. Measured
+# Skipped: on the first-party serial queue (event `queue`, specs/factory-step3-v1 TB9), the queue commit
+# enqueue.sh builds: parents exactly [base, PR head (GET pulls/<N> .head.sha)], author and committer
+# both $CC_PM_IDENT, subject `Merge pull request #<N> from `. Any other shape is checked like every
+# commit. Skipped too: on merge_group only, GitHub's own queue merge commit, which carries no trailers. Measured
 # on 2026-10-26 (records/TB4.md §1: Homebrew/brew, rust-lang/cargo and rust-lang/rust-analyzer queue
 # groups, read-only `gh api`): the group's head commit, committed by `GitHub <noreply@github.com>`
 # and authored by whoever enqueued it (so the author is not the mark), with exactly two parents, the
@@ -46,13 +49,18 @@ CC_GH_IDENT='GitHub <noreply@github.com>'
 # cc_trailer <commit> <key>: the key's values in the last paragraph, one per line (git's parser).
 cc_trailer() { git log -1 --format="%(trailers:key=$2,valueonly,unfold,separator=%x0a)" "$1" | sed 's/[[:space:]]*$//; /^$/d'; }
 
-# cc_queue_commit: the merge_group head when it is GitHub's queue merge commit, else nothing.
+# cc_queue_commit: the head when it is a queue merge commit (GitHub's on merge_group, enqueue.sh's on
+# queue), else nothing.
 cc_queue_commit() {
-  [ "$GC_EVENT" = merge_group ] || return 0
   local -a p
   read -r -a p <<<"$(git rev-list --parents -n1 "$GC_HEAD")"
-  [ "${#p[@]}" = 3 ] && [ "${p[1]}" = "$GC_BASE" ] &&
-    [ "$(git log -1 --format='%cn <%ce>' "$GC_HEAD")" = "$CC_GH_IDENT" ] || return 0
+  [ "${#p[@]}" = 3 ] && [ "${p[1]}" = "$GC_BASE" ] || return 0
+  case "$GC_EVENT" in
+    merge_group) [ "$(git log -1 --format='%cn <%ce>' "$GC_HEAD")" = "$CC_GH_IDENT" ] || return 0 ;;
+    queue) [ "$(git log -1 --format='%an <%ae>|%cn <%ce>' "$GC_HEAD")" = "$CC_PM_IDENT|$CC_PM_IDENT" ] &&
+             [[ "$(git log -1 --format=%s "$GC_HEAD")" == "Merge pull request #$GC_PR from "* ]] || return 0 ;;
+    *) return 0 ;;
+  esac
   local prhead
   prhead="$(gh api "repos/$GC_REPO/pulls/$GC_PR" --jq '.head.sha')" ||
     die "cannot read PR #$GC_PR of $GC_REPO (GH_TOKEN with pull-requests: read)"
@@ -104,7 +112,7 @@ n=0 bad=0
 while IFS= read -r c; do
   [ -n "$c" ] || continue
   if [ "$c" = "$skip" ]; then
-    echo "commit-check: ${c:0:12} skipped: GitHub's queue merge commit of PR #$GC_PR (parents base, PR head)" >&2; continue
+    echo "commit-check: ${c:0:12} skipped: $([ "$GC_EVENT" = queue ] && echo "the serial queue's" || echo "GitHub's queue") merge commit of PR #$GC_PR (parents base, PR head)" >&2; continue
   fi
   n=$((n + 1))
   why="$(cc_check "$c")"

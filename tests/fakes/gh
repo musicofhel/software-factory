@@ -68,6 +68,18 @@
 #        else the repo. merge_commit_sha is the sha of the entry's {pr: <n>, sha} in the state's
 #        .merged list (the commit the PR landed as), else the entry's own mergeCommitOid, else null;
 #        merged is state == MERGED. 404 for an unknown number.
+#        node_id is "PR_<n>"; draft is the entry's isDraft (default false).
+# api:   POST graphql (-f query=..., -F vars; specs/factory-step3-v1 TB9), two documents only:
+#        a query reading repository(owner, name).mergeQueue(branch: "main") — null when the state's
+#        .merge_queue is null or absent (no native queue), else {id, entries: {totalCount}} from
+#        .merge_queue {id, entries: [pr numbers]} — and the mutation enqueuePullRequest(input:
+#        {pullRequestId: PR_<n>, expectedHeadOid}), which appends n to .merge_queue.entries and
+#        {pr, head} to .enqueued and answers {mergeQueueEntry: {position}}. GraphQL errors (no
+#        native queue, an unknown or closed PR, a head that is not expectedHeadOid, n already queued)
+#        print the body {"data": null, "errors": [...]} and exit 1 with "gh: <message>" on stderr, as
+#        gh api does on a GraphQL error. Any other document is unsupported.
+# pr:    close <n> (--comment; the comment is appended to .pr_comments {pr, body}); fails on a PR
+#        that is not open.
 # __forms: prints every form this fake models, one per line (`issue list`, `api GET git/ref/*`, …);
 #        tests/test_sim.sh holds the repo's call sites against it.
 # FAKE_GH_UNKNOWN: a file; every refused form (an unsupported command, subcommand, flag or api
@@ -148,6 +160,7 @@ api() {
   [ "$explicit" = 1 ] || { if [ "$fields" != '{}' ] || [ -n "$explicit_body" ]; then method=POST; else method=GET; fi; }
   local query=""; case "$path" in *\?*) query="${path#*\?}" ;; esac
   path="${path%%\?*}"
+  if [ "$path" = graphql ]; then graphql "$fields" "$jqx"; return; fi
   case "$path" in "repos/$REPO/"*) path="${path#"repos/$REPO/"}" ;; *) http_err 404 "Not Found" ;; esac
   case "$path" in
     branches/*/protection|rulesets|rulesets/*) settings "$method" "$path" "$fields" "$jqx"; return ;;
@@ -170,7 +183,8 @@ api() {
         (.collaborators // []) as $c | (.removed_collaborators // []) as $gone
         | ([(.merged // [])[] | select(.pr == $n) | .sha] | last) as $landed
         | .pulls[] | select(.number == $n) | (.author.login // "someone") as $who
-        | {number, state: (.state | if . == "OPEN" then "open" else "closed" end), merged: (.state == "MERGED"),
+        | {number, node_id: "PR_\(.number)", draft: (.isDraft // false),
+           state: (.state | if . == "OPEN" then "open" else "closed" end), merged: (.state == "MERGED"),
            merge_commit_sha: ($landed // .mergeCommitOid // null),
            title: (.title // ""), body: (.body // ""), user: {login: $who},
            author_association: (.author_association // if $who == ($repo | split("/")[0]) then "OWNER"
@@ -512,10 +526,42 @@ label() {
   esac
 }
 
+# graphql <fields-json> <jq>: the two merge-queue documents (TB9); see the header.
+graphql() {
+  : "${FAKE_GH_ISSUES:?fake gh api graphql needs FAKE_GH_ISSUES}"
+  local f="$1" jqx="$2" q out
+  q="$(jq -r '.query // ""' <<<"$f" | tr -s ' \n\t' ' ')"
+  gql_err() { out="$(jq -cn --arg m "$1" '{data: null, errors: [{type: "UNPROCESSABLE", message: $m}]}')"; printf '%s\n' "$out"; echo "gh: $1" >&2; exit 1; }
+  case "$q" in
+    *"mergeQueue(branch: \"main\")"*)
+      jq -e --arg r "$REPO" --argjson f "$f" '($f.owner + "/" + $f.name) == $r' "$FAKE_GH_ISSUES" >/dev/null 2>&1 ||
+        gql_err "Could not resolve to a Repository with the name '$(jq -r '"\(.owner)/\(.name)"' <<<"$f")'."
+      out="$(jq -c '{data: {repository: {mergeQueue: (if .merge_queue == null then null
+                else {id: .merge_queue.id, entries: {totalCount: (.merge_queue.entries // [] | length)}} end)}}}' "$FAKE_GH_ISSUES")" ;;
+    *"enqueuePullRequest(input:"*)
+      local id head n
+      id="$(jq -r '.id // ""' <<<"$f")"; head="$(jq -r '.head // ""' <<<"$f")"
+      [[ "$id" =~ ^PR_([0-9]+)$ ]] || gql_err "Could not resolve to a node with the global id of '$id'"
+      n="${BASH_REMATCH[1]}"
+      jq -e '.merge_queue != null' "$FAKE_GH_ISSUES" >/dev/null || gql_err "Merge queue is not enabled for this branch"
+      jq -e --argjson n "$n" 'any((.pulls // [])[]; .number == $n and .state == "OPEN")' "$FAKE_GH_ISSUES" >/dev/null ||
+        gql_err "Pull request #$n is not open"
+      jq -e --argjson n "$n" --arg h "$head" 'any(.pulls[]; .number == $n and .headRefOid == $h)' "$FAKE_GH_ISSUES" >/dev/null ||
+        gql_err "Head sha of pull request #$n is not $head (expectedHeadOid)"
+      jq -e --argjson n "$n" '.merge_queue.entries // [] | index($n) == null' "$FAKE_GH_ISSUES" >/dev/null ||
+        gql_err "Pull request #$n is already queued"
+      mutate '.merge_queue.entries = ((.merge_queue.entries // []) + [$n]) | .enqueued = ((.enqueued // []) + [{pr: $n, head: $h}])' \
+        --argjson n "$n" --arg h "$head"
+      out="$(jq -c '{data: {enqueuePullRequest: {mergeQueueEntry: {position: (.merge_queue.entries | length)}}}}' "$FAKE_GH_ISSUES")" ;;
+    *) unsupported "fake gh api graphql: unsupported document" ;;
+  esac
+  if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
+}
+
 pr() {
   : "${FAKE_GH_ISSUES:?fake gh pr needs FAKE_GH_ISSUES}"
   local sub="${1:-}"; shift || true
-  local repo="" state=open limit=30 fields="" head="" base="" title="" body="" have_body=0 labels='[]' rmlabels='[]' n=""
+  local repo="" state=open limit=30 fields="" head="" base="" title="" body="" have_body=0 labels='[]' rmlabels='[]' n="" comment="" have_comment=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -R|--repo) repo="$2"; shift ;;
@@ -529,6 +575,7 @@ pr() {
       -l|--label|--add-label) labels="$(jq -c --arg v "$2" '. + ($v | split(","))' <<<"$labels")"; shift ;;
       --remove-label) rmlabels="$(jq -c --arg v "$2" '. + ($v | split(","))' <<<"$rmlabels")"; shift ;;
       --json) fields="$2"; shift ;;
+      -c|--comment) [ "$sub" = close ] || unsupported "fake gh pr $sub: unsupported argument $1"; comment="$2"; have_comment=1; shift ;;
       -*) unsupported "fake gh pr $sub: unsupported argument $1" ;;
       *) [ -z "$n" ] || unsupported "fake gh pr $sub: unsupported argument $1"; n="$1" ;;
     esac
@@ -597,6 +644,15 @@ pr() {
                 | if $hb == 1 then .body = $body else . end)' \
         --argjson n "$n" --argjson l "$labels" --argjson rm "$rmlabels" --argjson hb "$have_body" --arg body "$body"
       printf 'https://github.com/%s/pull/%s\n' "$REPO" "$n" ;;
+    close)
+      [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any((.pulls // [])[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
+        fail "GraphQL: Could not resolve to a PullRequest with the number of $n."
+      jq -e --argjson n "$n" 'any(.pulls[]; .number == $n and .state == "OPEN")' "$FAKE_GH_ISSUES" >/dev/null ||
+        fail "! Pull request $REPO#$n is already closed"
+      mutate '(.pulls[] | select(.number == $n)).state = "CLOSED"
+              | if $hc == 1 then .pr_comments = ((.pr_comments // []) + [{pr: $n, body: $c}]) else . end' \
+        --argjson n "$n" --argjson hc "$have_comment" --arg c "$comment"
+      printf '✓ Closed pull request %s#%s\n' "$REPO" "$n" >&2 ;;
     *) unsupported "fake gh pr: unsupported subcommand '$sub'" ;;
   esac
 }
@@ -604,7 +660,7 @@ pr() {
 # Every form modeled above, for tests/test_sim.sh.
 forms() {
   printf '%s\n' "issue list" "issue create" "issue edit" "issue comment" "issue close" "issue reopen" \
-    "label list" "label create" "pr list" "pr create" "pr view" "pr edit" \
+    "label list" "label create" "pr list" "pr create" "pr view" "pr edit" "pr close" "api POST graphql" \
     "api GET git/matching-refs/*" "api GET git/ref/*" "api GET git/commits/*" "api POST git/commits" \
     "api POST git/refs" "api PATCH git/refs/*" "api DELETE git/refs/*" \
     "api GET branches/*/protection" "api PUT branches/*/protection" "api DELETE branches/*/protection" \

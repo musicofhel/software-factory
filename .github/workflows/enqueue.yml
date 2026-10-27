@@ -1,0 +1,199 @@
+# The merge queue (specs/factory-step3-v1 TB9, ticket T28; docs/adr/0007-merge-queue.md). One run takes
+# the head of the merge order (tier-order.sh --order: approved, green ticket PRs by tier, then first
+# green) and only it:
+#   native  (GitHub's merge queue is on for main) enqueuePullRequest; GitHub's queue builds, gates
+#           (merge_group) and merges, and `dequeued` below ejects what it removes for a failure
+#   serial  (no native queue: a user-owned repo, records/TB0.md (a)) `pick` builds the merge commit of
+#           the PR onto main in factory-queue/pr-<n>, `gates` runs gates.yml there (workflow_call, the
+#           YAML of main, the queue path of I18), and `land` pushes it to main with the App (the ruleset's
+#           only bypass actor) when every gate passed, or ejects the PR when one failed
+# A conflict or a red queue run ejects (factory/bin/eject.sh): the PR is labeled autorebase and
+# closed, factory/ledger/ejections.jsonl gains a line on main, and the ticket's Issue returns to ready
+# with rebase-strike, which run.sh reads on the next claim.
+#
+# GITHUB_TOKEN events start no workflow, dispatch excepted (records/TB0.md (d)): the run starts on a
+# push to main (a merge, or post-merge's push on the App token), when a `gates` or `post-merge` run
+# completes, on a schedule for the rest, and by hand. Without the App every job runs --dry-run and
+# says so: only the App may push to a protected main, and a GITHUB_TOKEN push would start no
+# post-merge.
+name: enqueue
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [gates, post-merge]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  pull_request_target:
+    types: [dequeued]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "print what would happen, change nothing"
+        type: boolean
+        default: false
+# One queue: a run never cancels another (a cancelled `land` would leave a built, gated commit behind).
+concurrency:
+  group: enqueue
+  cancel-in-progress: false
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  pick:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      queue: ${{ steps.pick.outputs.queue }}
+      pr: ${{ steps.pick.outputs.pr }}
+      base: ${{ steps.pick.outputs.base }}
+      head: ${{ steps.pick.outputs.head }}
+    # The secrets context cannot appear in a step's `if:`; its presence is read here.
+    env:
+      FACTORY_APP_ID: ${{ vars.FACTORY_APP_ID }}
+      HAS_APP_KEY: ${{ secrets.FACTORY_APP_KEY != '' }}
+    steps:
+      # A configured App whose token cannot be minted fails the job: no silent fallback then.
+      - name: mint the factory App token (ruleset bypass actor)
+        id: app
+        if: env.FACTORY_APP_ID != '' && env.HAS_APP_KEY == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-actions: read
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+      - name: the head of the merge order, enqueued (native) or built onto main (serial)
+        id: pick
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          APPLY: ${{ steps.app.outcome == 'success' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false) }}
+          APP: ${{ steps.app.outcome }}
+        run: |
+          if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
+          if [ "$APP" != success ]; then
+            echo "enqueue: FACTORY_APP_ID or FACTORY_APP_KEY is not set, so the queue runs --dry-run (only the App may push to a protected main)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "enqueue pick $mode" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./factory/bin/enqueue.sh pick "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+  # The same gates on the queue commit, from main's gates.yml (I16, I18).
+  gates:
+    needs: pick
+    if: needs.pick.outputs.queue != ''
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/gates.yml
+    with:
+      pr: ${{ needs.pick.outputs.pr }}
+      base: ${{ needs.pick.outputs.base }}
+      head: ${{ needs.pick.outputs.head }}
+  land:
+    needs: [pick, gates]
+    if: always() && needs.pick.outputs.queue != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FACTORY_APP_ID: ${{ vars.FACTORY_APP_ID }}
+      HAS_APP_KEY: ${{ secrets.FACTORY_APP_KEY != '' }}
+    steps:
+      - name: mint the factory App token (ruleset bypass actor)
+        id: app
+        if: env.FACTORY_APP_ID != '' && env.HAS_APP_KEY == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+      - name: land the gated queue commit on main, or eject the PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          APPLY: ${{ steps.app.outcome == 'success' }}
+          Q_PR: ${{ needs.pick.outputs.pr }}
+          Q_BASE: ${{ needs.pick.outputs.base }}
+          Q_QUEUE: ${{ needs.pick.outputs.queue }}
+          Q_HEAD: ${{ needs.pick.outputs.head }}
+          Q_RESULT: ${{ needs.gates.result }}
+        run: |
+          if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "enqueue land $mode (gates: $Q_RESULT)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./factory/bin/enqueue.sh land --pr "$Q_PR" --base "$Q_BASE" --queue "$Q_QUEUE" --head "$Q_HEAD" \
+            --result "$Q_RESULT" "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+  # GitHub's merge queue removed a PR (native mode). pull_request_target runs main's code with the
+  # repo's secrets: the job checks out main only, never the PR head.
+  dequeued:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FACTORY_APP_ID: ${{ vars.FACTORY_APP_ID }}
+      HAS_APP_KEY: ${{ secrets.FACTORY_APP_KEY != '' }}
+    steps:
+      - name: mint the factory App token (ruleset bypass actor)
+        id: app
+        if: env.FACTORY_APP_ID != '' && env.HAS_APP_KEY == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+      - name: eject the PR GitHub's queue removed for a conflict or a failed check
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          APPLY: ${{ steps.app.outcome == 'success' }}
+        run: |
+          if [ "$APPLY" = true ]; then mode=--apply; else mode=--dry-run; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./factory/bin/eject.sh --dequeued "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

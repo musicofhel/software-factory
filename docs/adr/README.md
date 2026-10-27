@@ -12,3 +12,4 @@ directory once the desk adopts it; until then, copy `0003-chassis.md` as the tem
 | [0004](0004-halt-two-person-rule.md) | The HALT two-person rule GitHub cannot express | accepted |
 | [0005](0005-run-loop-cli-reality.md) | The run-loop sketch against the real CLIs | proposed |
 | [0006](0006-bwrap-shim-for-fleet-1-12-0.md) | A temporary bwrap shim for fleet 1.12.0's canary (#1266); retires with the re-pin | accepted |
+| [0007](0007-merge-queue.md) | The merge queue: GitHub's when the repo has one, else a first-party serial queue; ejection and the rebase strike | accepted |

@@ -18,8 +18,27 @@
 #         push          {ref, before, after}
 #         schedule      {schedule: <cron>}       (only-workflow-file names the workflow)
 #         issues        {action, label: {name}, issue: {number}}
+#         pull_request_target  {action, number, pull_request: {...}, [reason]}: GITHUB_SHA/REF = the base
+#                       branch's tip (workflows from there: the caller passes main's sha)
 #         workflow_run  {action: completed, workflow_run: {id, name, path, event, head_sha, head_branch,
 #                       conclusion}}: the driver fires it itself, never a caller (below)
+#       A job's `outputs:` are evaluated on its steps once it ran (needs.<job>.outputs). A job-level
+#       `uses: ./.github/workflows/<f>` (workflow_call) runs <f> from the caller's workflow commit with the
+#       `inputs` context (the caller's `with:`, then on.workflow_call.inputs defaults), the caller's
+#       github context and only GITHUB_TOKEN of the secrets (`secrets: inherit` passes them all); its
+#       jobs are the caller run's jobs and check runs, named `<caller job> / <job>` as GitHub names
+#       them, and jobs.jsonl lines with `call: {caller, workflow, inputs}`; the caller's result is
+#       failure when any called job failed, else success.
+#       GitHub's push events for pushes a job makes: a job whose step minted the App token (an output
+#       token == ghs_sim_app_token, lib's create-github-app-token) and created or moved a refs/heads/*
+#       ref of the origin queues one push event per ref ($SIM/push-queue.jsonl; deletions start none),
+#       played by the outermost drive with the re-runs (a GITHUB_TOKEN push starts no workflow,
+#       records/TB0.md (d)). When a job moves main, every open PR on main whose head is now reachable
+#       from it is marked merged, `.merged += {pr, sha: <new main>}` and `.merged_marks` (GitHub's
+#       indirect merge; its merge_commit_sha is undocumented, a kit line, TB12).
+#       SIM_STANDIN_GREEN (job ids, space-separated; the caller's labeled stand-in): a job of that id
+#       that failed is success in GitHub's view (.runs, .checks, needs, the caller's result), while
+#       jobs.jsonl keeps the real conclusion plus `standin: true`; sim.log says `stand-in:`.
 #       Each run is also recorded as GitHub's Actions API answers it: `.runs` of the fake gh state
 #       ({id, name, path, event, head_sha, head_branch, created_at, run_attempt, jobs: [{id, name,
 #       status, conclusion, started_at, completed_at}]}, ids and times from the `.seq` counter on the
@@ -31,10 +50,12 @@
 #       actions/jobs/<id>/rerun appends to `.reruns`): the job runs again with its run's original
 #       event, sha and workflow file ("Re-runs use ... the same GITHUB_SHA (commit SHA) and
 #       GITHUB_REF (git ref) of the original event", GitHub docs, re-run workflows and jobs), a new
-#       job id replaces the old one in its run, run_attempt + 1, and a new check run is recorded.
+#       job id replaces the old one in its run, run_attempt + 1, and a new check run is recorded; a
+#       second request for a job already re-run is skipped (GitHub refuses a re-run of a queued run).
 #       Each job's `run:` steps see PATH = <job>.pipx-bin:RUNNER_PATH and PIPX_BIN_DIR = that dir,
 #       fresh per job (GitHub: PIPX_BIN_DIR=/opt/pipx_bin on PATH, one VM per job).
-#       Appends one JSON line per job to $SIM/jobs.jsonl: {workflow, job, event, conclusion, log}.
+#       Appends one JSON line per job to $SIM/jobs.jsonl: {workflow, job, event, conclusion, head_sha,
+#       log} (+ standin, call; a workflow_call caller's own line carries `uses`).
 #       Returns 0; a driver error (an action it cannot emulate, a bad expression) exits 1 loudly.
 #   pr_merge_ref <n> <base-sha> <head-sha>   builds refs/pull/<n>/merge as GitHub does (merge-tree);
 #       prints its sha, or nothing on a conflict (GitHub runs no pull_request workflow then)
@@ -74,15 +95,15 @@ def filt($cfg; $key; $vals):
 | if (.on | has($ev)) | not then false
   else
     (if $cfg != null and $cfg.types != null then (.payload.action | IN($cfg.types[]))
-     elif .event == "pull_request" then (.payload.action | IN("opened", "synchronize", "reopened"))
+     elif .event | IN("pull_request", "pull_request_target") then (.payload.action | IN("opened", "synchronize", "reopened"))
      else true end)
-    and (if .event == "pull_request" then filt($cfg; "branches"; [.payload.pull_request.base.ref])
+    and (if .event | IN("pull_request", "pull_request_target") then filt($cfg; "branches"; [.payload.pull_request.base.ref])
          elif .event == "push" then filt($cfg; "branches"; [.payload.ref | sub("^refs/heads/"; "")])
          elif .event == "workflow_run" then
            (.payload.workflow_run.name | IN(($cfg.workflows // [])[]))
            and filt($cfg; "branches"; [.payload.workflow_run.head_branch])
          else true end)
-    and (if .event == "pull_request" or .event == "push" then
+    and (if .event | IN("pull_request", "pull_request_target", "push") then
            (if $cfg == null or $cfg.paths == null then true else any(.files[]; any_glob($cfg.paths; .)) end)
          else true end)
   end'
@@ -110,11 +131,19 @@ drive() {
       ref="refs/pull/$pn/merge"; base_ref="$(jq -r .pull_request.base.ref <<<"$payload")"
       head_ref="$(jq -r .pull_request.head.ref <<<"$payload")"; head_sha="$(jq -r .pull_request.head.sha <<<"$payload")"
       files="$(git -C "$ORIGIN" diff --name-only "$(jq -r .pull_request.base.sha <<<"$payload")...$head_sha" | jq -Rsc 'split("\n")[:-1]')" ;;
+    pull_request_target)
+      base_ref="$(jq -r .pull_request.base.ref <<<"$payload")"; head_ref="$(jq -r .pull_request.head.ref <<<"$payload")"
+      sha="$(git -C "$ORIGIN" rev-parse "refs/heads/$base_ref")" || drv_die "pull_request_target: no base branch $base_ref"
+      ref="refs/heads/$base_ref"; head_sha="$sha"
+      files="$(git -C "$ORIGIN" diff --name-only "$sha...$(jq -r .pull_request.head.sha <<<"$payload")" | jq -Rsc 'split("\n")[:-1]')" ;;
     merge_group)
       sha="$(jq -r .merge_group.head_sha <<<"$payload")"; ref="$(jq -r .merge_group.head_ref <<<"$payload")"; head_sha="$sha" ;;
     push)
+      local before; before="$(jq -r .before <<<"$payload")"
       sha="$(jq -r .after <<<"$payload")"; ref="$(jq -r .ref <<<"$payload")"; head_sha="$sha"
-      files="$(git -C "$ORIGIN" diff --name-only "$(jq -r .before <<<"$payload")" "$sha" | jq -Rsc 'split("\n")[:-1]')" ;;
+      # A created branch (before = 0…0): the paths of its tip commit.
+      if [[ "$before" =~ ^0+$ ]]; then files="$(git -C "$ORIGIN" diff-tree --no-commit-id --name-only -r --root "$sha" | jq -Rsc 'split("\n")[:-1]')"
+      else files="$(git -C "$ORIGIN" diff --name-only "$before" "$sha" | jq -Rsc 'split("\n")[:-1]')"; fi ;;
     schedule|issues|workflow_dispatch|workflow_run)
       sha="$(git -C "$ORIGIN" rev-parse refs/heads/main)"; ref=refs/heads/main; head_sha="$sha" ;;
     *) drv_die "event $event is not simulated" ;;
@@ -149,7 +178,29 @@ drive() {
       DRV_DEPTH=$((DRV_DEPTH - 1))
     done
   fi
-  [ "$DRV_DEPTH" != 0 ] || play_reruns
+  [ "$DRV_DEPTH" != 0 ] || drv_settle
+}
+
+# The outermost drive's tail: every App push event queued meanwhile (oldest first, each with its own
+# workflow_run), then every job re-run requested (POST actions/jobs/<id>/rerun), until neither is left.
+drv_settle() {
+  local ev
+  while :; do
+    if [ -s "$SIM/push-queue.jsonl" ]; then
+      ev="$(head -n1 "$SIM/push-queue.jsonl")"
+      sed -i 1d "$SIM/push-queue.jsonl"
+      jq -c '{ref, before, after}' <<<"$ev" >"$SIM/ev-app-push.json"
+      printf 'sim driver: push event %s %s → %s (pushed by %s on the App token)\n' "$(jq -r .ref <<<"$ev")" \
+        "$(jq -r '.before[0:12]' <<<"$ev")" "$(jq -r '.after[0:12]' <<<"$ev")" "$(jq -r .by <<<"$ev")" >>"$SIM/sim.log"
+      DRV_DEPTH=1
+      drive push "$SIM/ev-app-push.json" "$(jq -r .after <<<"$ev")"
+      DRV_DEPTH=0
+    elif [ "$(jq '(.reruns // []) | length' "$FAKE_GH_ISSUES")" != 0 ]; then
+      play_rerun
+    else
+      break
+    fi
+  done
 }
 
 gh_seq() {  # gh_seq: the next id of the fake gh state's `.seq` counter (run ids, job ids, clock ticks)
@@ -158,13 +209,19 @@ gh_seq() {  # gh_seq: the next id of the fake gh state's `.seq` counter (run ids
 }
 gh_time() { jq -nr --argjson s "$1" --argjson t "${FAKE_GH_NOW:-0}" '$t + $s | todate'; }
 
-# Every job re-run requested since (`.reruns`), in request order, until none is left.
-play_reruns() {
-  local jid run job wdir nwdir res started nid
-  while [ "$(jq '(.reruns // []) | length' "$FAKE_GH_ISSUES")" != 0 ]; do
+# The oldest job re-run requested (`.reruns`).
+play_rerun() {
+  local jid run job wdir nwdir res gres started nid
+  {
     jid="$(jq -r '.reruns[0]' "$FAKE_GH_ISSUES")"
     gh_state '.reruns = .reruns[1:]'
     run="$(jq -c --argjson j "$jid" '.runs[] | select(any(.jobs[]; .id == $j))' "$FAKE_GH_ISSUES")"
+    if [ -z "$run" ] && jq -e --argjson j "$jid" 'any(.runs[]?; ._rerun_of[$j | tostring] != null)' "$FAKE_GH_ISSUES" >/dev/null; then
+      # A second request for a job already re-run in this settle: GitHub refuses a re-run while the
+      # run's re-run is queued, and the sim plays every request only after the event.
+      printf 'sim driver: re-run of job %s skipped: it was re-run already (a duplicate request)\n' "$jid" >>"$SIM/sim.log"
+      return 0
+    fi
     [ -n "$run" ] || drv_die "re-run of job $jid: no run holds it"
     job="$(jq -r --argjson j "$jid" '.jobs[] | select(.id == $j) | .name' <<<"$run")"
     local file wf; file="$(jq -r ._file <<<"$run")"
@@ -173,20 +230,147 @@ play_reruns() {
       drv_die "re-run of $file/$job: a job with needs is not simulated"
     wdir="$(jq -r ._wdir <<<"$run")"; nwdir="$(mktemp -d "$SIM/run.XXXXXX")"
     cp "$wdir/event.json" "$wdir/ctx0.json" "$nwdir/"
+    DRV_RUN_ID="$(jq .id <<<"$run")" DRV_WSHA="$(jq -r ._wsha <<<"$run")" DRV_HEAD_SHA="$(jq -r .head_sha <<<"$run")"
     started="$(gh_seq)"
     res="$(run_job "$file" "$wf" "$job" "$(jq -r .event <<<"$run")" "$nwdir" '{}' "$(jq -r ._sha <<<"$run")" \
            "$(jq -r ._ref <<<"$run")" "$(jq -r ._base_ref <<<"$run")" "$(jq -r ._head_ref <<<"$run")")"
     nid="$(gh_seq)"
-    gh_state '(.runs[] | select(.id == $r)) |= (.run_attempt += 1 | .jobs |= map(if .id == $j then
-                {id: $n, name, status: "completed", conclusion: $c, started_at: $s, completed_at: $e} else . end))' \
-      --argjson r "$(jq .id <<<"$run")" --argjson j "$jid" --argjson n "$nid" --arg c "$res" \
-      --arg s "$(gh_time "$started")" --arg e "$(gh_time "$nid")"
-    jq -cn --arg w "$file" --arg j "$job" --arg e "$(jq -r .event <<<"$run")" --arg c "$res" --arg h "$(jq -r .head_sha <<<"$run")" \
-      --arg l "$nwdir/$job.log" '{workflow: $w, job: $j, event: $e, conclusion: $c, head_sha: $h, log: $l, rerun: true}' >>"$SIM/jobs.jsonl"
-    gh_state '.checks = ((.checks // []) + [{name: $j, workflow: $w, event: $e, head_sha: $h, conclusion: $c}])' \
-      --arg j "$job" --arg w "$file" --arg e "$(jq -r .event <<<"$run")" --arg h "$(jq -r .head_sha <<<"$run")" --arg c "$res"
+    gres="$(drv_standin "$file" "$job" "$res")"
+    gh_state '(.runs[] | select(.id == $r)) |= (.run_attempt += 1 | ._rerun_of[$j | tostring] = $n | .jobs |= map(if .id == $j then
+                {id: $n, name, status: "completed", conclusion: $c, started_at: $s, completed_at: $e} else . end))
+              | .checks = ((.checks // []) + [{name: $jn, workflow: $w, event: $ev, head_sha: $h, conclusion: $c}])' \
+      --argjson r "$DRV_RUN_ID" --argjson j "$jid" --argjson n "$nid" --arg c "$gres" \
+      --arg s "$(gh_time "$started")" --arg e "$(gh_time "$nid")" \
+      --arg jn "$job" --arg w "$file" --arg ev "$(jq -r .event <<<"$run")" --arg h "$DRV_HEAD_SHA"
+    jq -cn --arg w "$file" --arg j "$job" --arg e "$(jq -r .event <<<"$run")" --arg c "$res" --arg g "$gres" --arg h "$DRV_HEAD_SHA" \
+      --arg l "$nwdir/$job.log" '{workflow: $w, job: $j, event: $e, conclusion: $c, head_sha: $h, log: $l, rerun: true}
+        + (if $g != $c then {standin: true} else {} end)' >>"$SIM/jobs.jsonl"
     printf 'sim driver: re-ran %s/%s (job %s → %s): %s\n' "$file" "$job" "$jid" "$nid" "$res" >>"$SIM/sim.log"
-  done
+  }
+}
+
+# drv_standin <file> <job> <conclusion>: GitHub's view of the conclusion: success for a failed job named in
+# SIM_STANDIN_GREEN (the caller's labeled stand-in), else the conclusion itself.
+drv_standin() {
+  if [ "$3" = failure ] && [[ " ${SIM_STANDIN_GREEN:-} " == *" $2 "* ]]; then
+    printf '  stand-in: %s/%s failed; GitHub sees success (SIM_STANDIN_GREEN)\n' "$1" "$2" >>"$SIM/sim.log"
+    echo success
+  else
+    echo "$3"
+  fi
+}
+
+# drv_outputs <job-def> <job ctx file>: the job's `outputs:`, evaluated on the steps it ran ({} for none).
+drv_outputs() {
+  local o; o="$(jq -c '.outputs // {}' <<<"$1")"
+  if [ "$o" = '{}' ] || [ ! -f "$2" ]; then echo '{}'; return; fi
+  jq -c '{ctx: ., status: {success: true, failure: false}}' "$2" |
+    jq -c -L "$SIM_LIB" --argjson o "$o" 'include "expr"; . as $in | $o | map_values(tostring as $v | $in | tmpl($v))' ||
+    drv_die "bad outputs: expression in $(jq -c . <<<"$o")"
+}
+
+# drv_record <file> <check name> <job> <event> <conclusion> <GitHub's conclusion> <log> <started seq> <job seq>
+# [extra json]: one job of the run DRV_RUN_ID as GitHub records it (the run's job and a check run, both
+# named <check name>, on DRV_HEAD_SHA) and as the sim keeps it (a jobs.jsonl line, the real conclusion).
+drv_record() {
+  local extra="${10:-}"; [ -n "$extra" ] || extra='{}'
+  gh_state '(.runs[] | select(.id == $r)).jobs += [{id: $j, name: $n, status: "completed", conclusion: $c,
+              started_at: $s, completed_at: $e}]
+            | .checks = ((.checks // []) + [{name: $n, workflow: $w, event: $ev, head_sha: $h, conclusion: $c}])' \
+    --argjson r "$DRV_RUN_ID" --argjson j "$9" --arg n "$2" --arg c "$6" --arg s "$(gh_time "$8")" --arg e "$(gh_time "$9")" \
+    --arg w "$1" --arg ev "$4" --arg h "$DRV_HEAD_SHA"
+  jq -cn --arg w "$1" --arg j "$3" --arg e "$4" --arg c "$5" --arg g "$6" --arg h "$DRV_HEAD_SHA" --arg l "$7" --argjson x "$extra" \
+    '{workflow: $w, job: $j, event: $e, conclusion: $c, head_sha: $h, log: $l} + (if $g != $c then {standin: true} else {} end) + $x' \
+    >>"$SIM/jobs.jsonl"
+}
+
+# drv_pushes <file> <job> <job ctx file> <refs before>: what the job pushed to refs/heads/* of the origin.
+# On the App token each created or moved ref queues GitHub's push event (drv_settle plays it); a
+# deletion starts none. A move of main marks the PRs it merged (drv_merged_mark).
+drv_pushes() {
+  local app=0 r b a
+  jq -e 'any(.steps[]?; .outputs.token == "ghs_sim_app_token")' "$3" >/dev/null && app=1
+  while read -r r b a; do
+    [ -n "$r" ] || continue
+    if [ "$app" = 1 ]; then
+      jq -cn --arg r "$r" --arg b "$b" --arg a "$a" --arg by "$1/$2" '{ref: $r, before: $b, after: $a, by: $by}' >>"$SIM/push-queue.jsonl"
+      printf 'sim driver: %s/%s pushed %s %s → %s on the App token: push event queued\n' "$1" "$2" "$r" "${b:0:12}" "${a:0:12}" >>"$SIM/sim.log"
+    else
+      printf 'sim driver: %s/%s pushed %s %s → %s on GITHUB_TOKEN: no push event\n' "$1" "$2" "$r" "${b:0:12}" "${a:0:12}" >>"$SIM/sim.log"
+    fi
+    [ "$r" != refs/heads/main ] || drv_merged_mark "$a" "$1/$2"
+  done < <(awk -v z=0000000000000000000000000000000000000000 '
+             NR == FNR { if ($1 != "") b[$1] = $2; next }
+             !($1 in b) { print $1, z, $2; next }
+             b[$1] != $2 { print $1, b[$1], $2 }' <(printf '%s\n' "$4") <(git -C "$ORIGIN" for-each-ref --format='%(refname) %(objectname)' refs/heads/))
+}
+
+# drv_merged_mark <new main> <by>: GitHub marks a PR merged when its head commits become reachable from
+# the base outside the PR ("About pull request merges"); its merge_commit_sha then is undocumented, and
+# modeled as the new main (kit, TB12).
+drv_merged_mark() {
+  local n h
+  while read -r n h; do
+    [ -n "$h" ] && git -C "$ORIGIN" merge-base --is-ancestor "$h" "$1" 2>/dev/null || continue
+    gh_state '(.pulls[] | select(.number == $n)).state = "MERGED" | .merged = ((.merged // []) + [{pr: $n, sha: $s}])
+              | .merged_marks = ((.merged_marks // []) + [{pr: $n, sha: $s, by: $by}])' --argjson n "$n" --arg s "$1" --arg by "$2"
+    printf 'sim driver: #%s marked merged: its head %s is reachable from main %s (%s)\n' "$n" "${h:0:12}" "${1:0:12}" "$2" >>"$SIM/sim.log"
+  done < <(jq -r '(.pulls // [])[] | select(.state == "OPEN" and (.baseRefName // "main") == "main") | "\(.number) \(.headRefOid // "")"' "$FAKE_GH_ISSUES")
+}
+
+# run_call <file> <caller job> <job-def> <caller ctx file> <event> <sha> <ref> <base_ref> <head_ref>: a job-level
+# `uses: ./.github/workflows/<f>` (workflow_call), the called workflow read at DRV_WSHA; prints the
+# caller's result (failure when a called job failed in GitHub's view, else success).
+run_call() {
+  local file="$1" caller="$2" jdef="$3" ctx="$4" event="$5" sha="$6" ref="$7" base_ref="$8" head_ref="$9"
+  local uses cfile cwf with inputs cwdir cj cdef res gres outs started jid cneeds='{}' failed=0
+  uses="$(jq -r .uses <<<"$jdef")"
+  case "$uses" in
+    ./.github/workflows/*.yml|./.github/workflows/*.yaml) cfile="${uses#./}" ;;
+    *) drv_die "$file/$caller: uses: $uses (only a local workflow is simulated)" ;;
+  esac
+  cwf="$(git -C "$ORIGIN" show "$DRV_WSHA:$cfile" | yq -o=json '.' |
+         jq -c '.on |= (if type == "string" then {(.): null} elif type == "array" then (map({(.): null}) | add) else . end)')" ||
+    drv_die "$file/$caller: $cfile is not readable at ${DRV_WSHA:0:12}"
+  jq -e '.on | has("workflow_call")' <<<"$cwf" >/dev/null || drv_die "$file/$caller: $cfile has no on.workflow_call"
+  with="$(jq -c '{ctx: ., status: {success: true, failure: false}}' "$ctx" |
+          jq -c -L "$SIM_LIB" --argjson j "$jdef" 'include "expr"; . as $in | ($j.with // {}) | map_values(tostring as $v | $in | tmpl($v))')" ||
+    drv_die "$file/$caller: bad with: expression"
+  # GitHub's inputs: the caller's value, else the default, else the type's empty value; typed.
+  inputs="$(jq -c --argjson w "$with" '(.on.workflow_call.inputs // {}) as $d
+    | (($w | keys) - ($d | keys)) as $x
+    | if ($x | length) > 0 then error("unknown input(s) \($x | join(","))") else . end
+    | [$d | to_entries[] | .key as $k | .value as $v
+       | if ($w | has($k)) then {key: $k, value: $w[$k]}
+         elif ($v | has("default")) then {key: $k, value: $v.default}
+         elif $v.required == true then error("input \($k) is required")
+         else {key: $k, value: (if $v.type == "boolean" then false elif $v.type == "number" then 0 else "" end)} end
+       | .value |= (if $v.type == "boolean" then (if type == "string" then . == "true" else . end)
+                    elif $v.type == "number" then (if type == "string" then tonumber else . end)
+                    else (if type == "string" then . else tostring end) end)]
+    | from_entries' <<<"$cwf")" || drv_die "$file/$caller: the inputs of $cfile"
+  cwdir="$(mktemp -d "$SIM/run.XXXXXX")"
+  command cp "$(dirname "$ctx")/event.json" "$cwdir/"
+  case "$(jq -c '.secrets // null' <<<"$jdef")" in
+    null) jq --argjson i "$inputs" '.inputs = $i | .secrets = {GITHUB_TOKEN: .secrets.GITHUB_TOKEN}' "$(dirname "$ctx")/ctx0.json" ;;
+    '"inherit"') jq --argjson i "$inputs" '.inputs = $i' "$(dirname "$ctx")/ctx0.json" ;;
+    *) drv_die "$file/$caller: secrets: other than inherit is not simulated" ;;
+  esac >"$cwdir/ctx0.json"
+  printf 'calls %s with inputs %s (jobs in %s)\n' "$cfile" "$inputs" "$cwdir" >>"$(dirname "$ctx")/$caller.log"
+  while IFS= read -r cj; do
+    cdef="$(jq -c --arg j "$cj" '.jobs[$j]' <<<"$cwf")"
+    if jq -e 'has("uses")' <<<"$cdef" >/dev/null; then drv_die "$cfile/$cj: a nested workflow call is not simulated"; fi
+    started="$(gh_seq)"
+    res="$(run_job "$cfile" "$cwf" "$cj" "$event" "$cwdir" "$cneeds" "$sha" "$ref" "$base_ref" "$head_ref")"
+    jid="$(gh_seq)"
+    gres="$(drv_standin "$cfile" "$cj" "$res")"
+    outs="$(drv_outputs "$cdef" "$cwdir/$cj.ctx.json")"
+    drv_record "$cfile" "$caller / $cj" "$cj" "$event" "$res" "$gres" "$cwdir/$cj.log" "$started" "$jid" \
+      "$(jq -cn --arg c "$caller" --arg w "$file" --argjson i "$inputs" '{call: {caller: $c, workflow: $w, inputs: $i}}')"
+    cneeds="$(jq -c --arg j "$cj" --arg r "$gres" --argjson o "$outs" '.[$j] = {result: $r, outputs: $o}' <<<"$cneeds")"
+    [ "$gres" != failure ] || failed=1
+  done < <(jq -r "$JOB_ORDER_JQ" <<<"$cwf")
+  if [ "$failed" = 1 ]; then echo failure; else echo success; fi
 }
 
 run_workflow() {
@@ -209,18 +393,23 @@ run_workflow() {
               base_ref: $br, head_ref: $hr, workflow: ($wf.name // "")},
      env: {}, vars: $vars, secrets: ($sec + {GITHUB_TOKEN: "ghs_sim_github_token"}), inputs: {}, steps: {}, needs: {},
      job: {}, runner: {os: "Linux", temp: ""}, matrix: {}}' >"$wdir/ctx0.json"
+  DRV_WSHA="$wsha" DRV_HEAD_SHA="$head_sha"
+  local jdef gres outs
   while IFS= read -r job; do
+    jdef="$(jq -c --arg j "$job" '.jobs[$j]' <<<"$wf")"
     started="$(gh_seq)"
     res="$(run_job "$file" "$wf" "$job" "$event" "$wdir" "$needs" "$sha" "$ref" "$base_ref" "$head_ref")"
     jid="$(gh_seq)"
-    gh_state '(.runs[] | select(.id == $r)).jobs += [{id: $j, name: $n, status: "completed", conclusion: $c,
-                started_at: $s, completed_at: $e}]' \
-      --argjson r "$rid" --argjson j "$jid" --arg n "$job" --arg c "$res" --arg s "$(gh_time "$started")" --arg e "$(gh_time "$jid")"
-    needs="$(jq -c --arg j "$job" --arg r "$res" '.[$j] = {result: $r, outputs: {}}' <<<"$needs")"
-    jq -cn --arg w "$file" --arg j "$job" --arg e "$event" --arg c "$res" --arg h "$head_sha" --arg l "$wdir/$job.log" \
-      '{workflow: $w, job: $j, event: $e, conclusion: $c, head_sha: $h, log: $l}' >>"$SIM/jobs.jsonl"
-    gh_state '.checks = ((.checks // []) + [{name: $j, workflow: $w, event: $e, head_sha: $h, conclusion: $c}])' \
-      --arg j "$job" --arg w "$file" --arg e "$event" --arg h "$head_sha" --arg c "$res"
+    gres="$(drv_standin "$file" "$job" "$res")"
+    outs="$(drv_outputs "$jdef" "$wdir/$job.ctx.json")"
+    if jq -e 'has("uses")' <<<"$jdef" >/dev/null && [ "$res" != skipped ]; then
+      # A workflow_call caller is no job of its own in GitHub's view: its called jobs are (run_call).
+      jq -cn --arg w "$file" --arg j "$job" --arg e "$event" --arg c "$res" --arg h "$head_sha" --arg l "$wdir/$job.log" \
+        --arg u "$(jq -r .uses <<<"$jdef")" '{workflow: $w, job: $j, event: $e, conclusion: $c, head_sha: $h, log: $l, uses: $u}' >>"$SIM/jobs.jsonl"
+    else
+      drv_record "$file" "$job" "$job" "$event" "$res" "$gres" "$wdir/$job.log" "$started" "$jid"
+    fi
+    needs="$(jq -c --arg j "$job" --arg r "$gres" --argjson o "$outs" '.[$j] = {result: $r, outputs: $o}' <<<"$needs")"
   done < <(jq -r "$JOB_ORDER_JQ" <<<"$wf")
 }
 
@@ -248,6 +437,9 @@ run_job() {
       { echo "job skipped: if: $cond" >>"$log"; echo skipped; return; }
   elif [ "$ok" != true ]; then echo "job skipped: a needed job did not succeed" >>"$log"; echo skipped; return
   fi
+  if jq -e 'has("uses")' <<<"$jdef" >/dev/null; then
+    run_call "$file" "$job" "$jdef" "$ctx" "$event" "$sha" "$ref" "$base_ref" "$head_ref"; return
+  fi
   # env: workflow env, then job env, each value an expression template.
   local envj
   envj="$(jq -c --argjson w "$(jq -c '.env // {}' <<<"$wf")" '$w + (.env // {})' <<<"$jdef")"
@@ -259,7 +451,8 @@ run_job() {
   shell_default="$(jq -r --argjson w "$(jq -c '.defaults.run.shell // null' <<<"$wf")" '.defaults.run.shell // $w // ""' <<<"$jdef")"
   : >"$wdir/$job.out"; : >"$wdir/$job.summary"
   nsteps="$(jq '.steps | length' <<<"$jdef")"
-  local failed=0
+  local failed=0 refs0
+  refs0="$(git -C "$ORIGIN" for-each-ref --format='%(refname) %(objectname)' refs/heads/)"
   for ((k = 0; k < nsteps; k++)); do
     step="$(jq -c --argjson k "$k" '.steps[$k]' <<<"$jdef")"
     id="$(jq -r --argjson k "$k" '.id // "__step\($k)"' <<<"$step")"
@@ -314,6 +507,7 @@ run_job() {
     outs="$(sed -n 's/^\([A-Za-z0-9_-]*\)=\(.*\)$/\1\t\2/p' "$wdir/$job.out" | jq -Rsc 'split("\n")[:-1] | map(split("\t") | {(.[0]): .[1]}) | add // {}')"
     jq --arg id "$id" --argjson o "$outs" --arg c "$outcome" '.steps[$id] = {outputs: $o, outcome: $c, conclusion: $c}' "$ctx" >"$ctx.n" && mv "$ctx.n" "$ctx"
   done
+  drv_pushes "$file" "$job" "$ctx" "$refs0"
   if [ "$failed" = 1 ]; then echo failure; else echo success; fi
 }
 

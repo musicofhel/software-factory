@@ -10,14 +10,16 @@
 #       a malformed ticket ref, an identity mismatch); exit 1 on an operational error.
 #
 # What it resolves (gate_context sets the GC_* variables):
-#   GC_EVENT    pull_request | merge_group | node
+#   GC_EVENT    pull_request | merge_group | queue | node
 #   GC_BASE     pull_request.base.sha | merge_group.base_sha | --base, else the merge-base of
-#               refs/remotes/origin/main and the head (the node; never a lapsed tip)
-#   GC_BASE_BRANCH  the base branch (pull_request.base.ref, merge_group.base_ref; main on the node)
-#   GC_HEAD     pull_request.head.sha | merge_group.head_sha | --head, else HEAD
-#   GC_PR       the PR number: the event's, or on merge_group N of gh-readonly-queue/<base>/pr-<N>-<sha>;
-#               empty on the node
-#   GC_HEAD_REF the PR's head branch: the event's, or on merge_group PR N's, read through
+#               refs/remotes/origin/main and the head (the node; never a lapsed tip); on `queue`,
+#               GATE_BASE
+#   GC_BASE_BRANCH  the base branch (pull_request.base.ref, merge_group.base_ref; main on the node and on
+#               `queue`)
+#   GC_HEAD     pull_request.head.sha | merge_group.head_sha | --head, else HEAD; on `queue`, GATE_HEAD
+#   GC_PR       the PR number: the event's, or on merge_group N of gh-readonly-queue/<base>/pr-<N>-<sha>,
+#               or on `queue` GATE_QUEUE_PR; empty on the node
+#   GC_HEAD_REF the PR's head branch: the event's, or on merge_group and `queue` PR N's, read through
 #               `gh api repos/<repo>/pulls/<N>` with the job's read-only token (GH_TOKEN)
 #   GC_TICKET, GC_HANDLE  from a head ref ticket/<id>/<handle> (on the node: --ticket)
 #   GC_CLASS    ticket | desk | halt | human:
@@ -30,6 +32,13 @@
 #   GC_AUTHOR, GC_ASSOC, GC_BODY, GC_HEAD_REPO  the PR's author login, author_association, body and
 #               head repository (empty on the node)
 #
+# `queue` (specs/factory-step3-v1 TB9, ticket T28): the first-party serial queue's gates run, gates.yml
+# called by enqueue.yml (workflow_call), where GITHUB_EVENT_NAME is the caller's event and the env has
+# GATE_QUEUE_PR, GATE_BASE and GATE_HEAD (the inputs). The PR is GATE_QUEUE_PR, read through `gh api
+# repos/<repo>/pulls/<N>`, and the head must be the queue commit of that PR on that base: exactly two
+# parents, the first GATE_BASE and the second PR N's head sha, and PR N must target main. Anything else
+# is refused. GITHUB_EVENT_PATH (the caller's payload) must still be readable JSON; it is not read.
+#
 # The diff is always three-dot from the merge-base (`BASE...HEAD`), read in the current directory:
 # CI runs the BASE's copy of this file (./.base/factory/bin/...) inside the PR head's checkout, so the
 # head is data and never code (I16).
@@ -39,7 +48,7 @@
 # refused, naming the other id. Missing trailers are commit-check's (TB4), not this check's.
 #
 # Environment: GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REPOSITORY (as a runner sets them), GH_TOKEN
-# for the merge_group lookup.
+# for the merge_group and queue lookups; GATE_QUEUE_PR, GATE_BASE, GATE_HEAD on the queue.
 
 # Paths a desk PR may touch: the ticket store and the desk's ADRs (SPEC-v0.2 L408-410: the contract
 # desk owns the store; L471: desk disagreements are ADRs in docs/adr/).
@@ -122,7 +131,19 @@ gate_context() {
   [ -r "${GITHUB_EVENT_PATH:-}" ] || die "GITHUB_EVENT_PATH is not a readable event file"
   ev="$(jq -c . "$GITHUB_EVENT_PATH")" || die "the event file is not JSON"
   GC_REPO="$(resolve_repo "${repo:-${GITHUB_REPOSITORY:-}}")"
-  case "$GITHUB_EVENT_NAME" in
+  local event="$GITHUB_EVENT_NAME"; [ -z "${GATE_QUEUE_PR:-}" ] || event=queue
+  case "$event" in
+    queue)
+      GC_EVENT=queue GC_PR="$GATE_QUEUE_PR" GC_BASE="${GATE_BASE:-}" GC_HEAD="${GATE_HEAD:-}"
+      valid_issue "$GC_PR" || refuse "queue: GATE_QUEUE_PR '$GC_PR' is not a PR number"
+      pull="$(gh api "repos/$GC_REPO/pulls/$GC_PR")" || die "cannot read PR #$GC_PR of $GC_REPO (GH_TOKEN with pull-requests: read)"
+      [ "$(jq -r '.number // empty' <<<"$pull")" = "$GC_PR" ] || die "repos/$GC_REPO/pulls/$GC_PR answered another PR"
+      # The serial queue merges into main only (enqueue.sh builds every queue commit on main).
+      [ "$(jq -r '.base.ref // empty' <<<"$pull")" = main ] ||
+        refuse "queue: PR #$GC_PR targets $(jq -r '.base.ref // "no branch"' <<<"$pull"), and the queue merges into main only"
+      # shellcheck disable=SC2034  # read by depends-check.sh and tier-order.sh (gc_store_sha)
+      GC_BASE_BRANCH=main
+      gc_pull "$pull" ;;
     pull_request|pull_request_review)
       GC_EVENT=pull_request
       pull="$(jq -c '.pull_request // empty' <<<"$ev")"
@@ -140,12 +161,17 @@ gate_context() {
       pull="$(gh api "repos/$GC_REPO/pulls/$GC_PR")" || die "cannot read PR #$GC_PR of $GC_REPO (GH_TOKEN with pull-requests: read)"
       [ "$(jq -r '.number // empty' <<<"$pull")" = "$GC_PR" ] || die "repos/$GC_REPO/pulls/$GC_PR answered another PR"
       gc_pull "$pull" ;;
-    *) die "event $GITHUB_EVENT_NAME has no gate context (pull_request or merge_group)" ;;
+    *) die "event $GITHUB_EVENT_NAME has no gate context (pull_request, merge_group, or the queue's GATE_QUEUE_PR)" ;;
   esac
   [[ "$GC_BASE" =~ ^[0-9a-f]{40}$ && "$GC_HEAD" =~ ^[0-9a-f]{40}$ ]] || die "the event has no base and head sha"
   valid_issue "$GC_PR" || die "the event has no PR number"
   git cat-file -e "$GC_BASE^{commit}" 2>/dev/null && git cat-file -e "$GC_HEAD^{commit}" 2>/dev/null ||
     die "base $GC_BASE or head $GC_HEAD is not in this checkout (fetch-depth: 0)"
+  if [ "$GC_EVENT" = queue ]; then
+    local -a qp; read -r -a qp <<<"$(git rev-list --parents -n1 "$GC_HEAD")"
+    [ "${#qp[@]}" = 3 ] && [ "${qp[1]}" = "$GC_BASE" ] && [ "${qp[2]}" = "$(jq -r '.head.sha // empty' <<<"$pull")" ] ||
+      refuse "queue: head ${GC_HEAD:0:12} is not the merge of PR #$GC_PR's head onto ${GC_BASE:0:12} (parents ${qp[*]:1})"
+  fi
   local tr rc=0
   tr="$(gc_ticket_ref "$GC_HEAD_REF")" || rc=$?
   case "$rc" in

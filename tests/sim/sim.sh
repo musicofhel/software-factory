@@ -52,7 +52,9 @@ esac
 if [ -n "$KEEP" ]; then rm -rf "$KEEP"; mkdir -p "$KEEP"; SIM="$(cd "$KEEP" && pwd)"
 else SIM="$(mktemp -d "${TMPDIR:-/tmp}/sim.XXXXXX")"; trap 'rm -rf "$SIM"' EXIT; fi
 export SIM ORIGIN="$SIM/origin.git" REPO=sim-owner/factory
-export SIM_VARS='{"JANITOR_DRY_RUN":"false"}' SIM_SECRETS='{}'
+# The factory App is configured (FACTORY_APP_ID, FACTORY_APP_KEY): its pushes start workflows, and the
+# serial queue (enqueue.yml) lands with it (lib/driver.sh, "GitHub's push events").
+export SIM_VARS='{"JANITOR_DRY_RUN":"false","FACTORY_APP_ID":"1"}' SIM_SECRETS='{"FACTORY_APP_KEY":"sim-key"}'
 R="$SIM/results.tsv"; : >"$R"
 LOG="$SIM/sim.log"; : >"$LOG"
 
@@ -177,6 +179,43 @@ merge_standin() {  # merge_standin <n> <commit>: main fast-forwards to <commit> 
   gh_state '(.pulls[] | select(.number == $n)).state = "MERGED" | .merged += [{pr: $n, sha: $s}]' --argjson n "$1" --arg s "$2"
   push_event "$before" "$2"
 }
+admin_merge() {  # admin_merge <n>: a merge commit of PR <n> on main as a repo admin's merge button makes it, PR merged, push workflows
+  local n="$1" base head tree sha
+  base="$(main_sha)"; head="$(pr_field "$n" .headRefOid)"
+  tree="$(git -C "$ORIGIN" merge-tree --write-tree "$base" "$head")" || return 1
+  sha="$(printf 'Merge pull request #%s from %s/%s\n\n%s\n' "$n" "${REPO%%/*}" "$(pr_field "$n" .headRefName)" "$(pr_field "$n" .title)" |
+         GIT_AUTHOR_NAME=sim-owner GIT_AUTHOR_EMAIL=sim-owner@sim.invalid GIT_COMMITTER_NAME=GitHub GIT_COMMITTER_EMAIL=noreply@github.com \
+         git -C "$ORIGIN" commit-tree "$tree" -p "$base" -p "$head")"
+  merge_standin "$n" "$sha"
+  desk_sync
+}
+approve() {  # approve <pr> [login]: one APPROVED review
+  gh_state '(.pulls[] | select(.number == $n)).reviews += [{author: {login: $u}, state: "APPROVED"}]' \
+    --argjson n "$1" --arg u "${2:-sim-owner}"
+}
+queue_line() {  # queue_line <job> <pr>: enqueue.sh's verdict line in the latest enqueue.yml <job> (pick|land) log naming PR <n>, or {}
+  local l
+  l="$(jq -r --arg j "$1" 'select(.workflow == ".github/workflows/enqueue.yml" and .job == $j) | .log' "$SIM/jobs.jsonl" |
+       while IFS= read -r f; do grep -h '^{"mode":' "$f" 2>/dev/null; done | jq -c --argjson n "$2" 'select(.pr == $n)' | tail -n1)"
+  [ -n "$l" ] || l='{}'
+  printf '%s\n' "$l"
+}
+q_stages() {  # q_stages <prefix> <pr> <queue head>: one stage per gates.yml job the queue ran on that commit, pass = success
+  local j c l
+  while IFS=$'\t' read -r j c l; do
+    [ -n "$j" ] || continue
+    if [ "$c" = success ]; then stage "$1.$j" pass "$c"; else stage "$1.$j" red "$c: $(grep -v '^##' "$l" | tail -n1 | cut -c1-160)"; fi
+  done < <(jq -r --argjson n "$2" --arg h "$3" 'select(.call.inputs.pr == ($n | tostring) and .call.inputs.head == $h) | [.job, .conclusion, .log] | @tsv' \
+             "$SIM/jobs.jsonl" | awk -F'\t' '!seen[$1]++')
+}
+q_ctx_is() {  # q_ctx_is <pr> <queue head> <jq condition on the context>
+  q_ctx "$1" "$2" | jq -e "$3" >/dev/null
+}
+q_ctx() {  # q_ctx <pr> <queue head>: the JSON the queue's `context` job printed, or {}
+  local log
+  log="$(jq -r --argjson n "$1" --arg h "$2" 'select(.call.inputs.pr == ($n | tostring) and .call.inputs.head == $h and .job == "context") | .log' "$SIM/jobs.jsonl" | tail -n1)"
+  { [ -n "$log" ] && grep -h '^{"event":' "$log" | tail -n1; } || echo '{}'
+}
 jobs_on() {  # jobs_on <event> <head>: every job the driver ran for that event and head, in run order
   jq -r --arg e "$1" --arg h "$2" 'select(.event == $e and .head_sha == $h) | .job' "$SIM/jobs.jsonl" | awk '!seen[$0]++'
 }
@@ -198,7 +237,7 @@ job_stages() {  # job_stages <prefix> <event> <head>: one stage per job run, pas
 
 # ------------------------------------------------------------------ one ticket's path
 walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
-  local X="$1" id="$2" dir="$3" n pr head base group lock
+  local X="$1" id="$2" dir="$3" n pr head base lock
   n="$(issue_of "$id")"
   [ -n "$n" ] || die "no Issue for $id"
   if [ -n "${4:-}" ]; then :
@@ -245,6 +284,7 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   # Every workflow job on pull_request; the gate context names this PR, its ticket and class.
   local pbase tgn; pbase="$(main_sha)"
   tgn="$(wc -l <"$FAKE_TAMPERGUARD_LOG" | tr -d ' ')"
+  approve "$pr"
   pr_event "$pr"
   job_stages "$X.pr" pull_request "$head"
   # I17: the node ran the same helper with the same argv as CI's three diff gates on this PR. The node
@@ -261,20 +301,21 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   judge "$X.hold" "depends-on: $(check_of depends-on "$head")" test "$(check_of depends-on "$head")" = success
   judge "$X.tier-order" "tier-order: $(check_of tier-order "$head")" test "$(check_of tier-order "$head")" = success
 
-  # The queue, merge_group, the merge.
-  judge "$X.enqueue" "nothing enqueues a green PR" enqueued "$pr"
-  standin "hand-enqueue #$pr: gh-readonly-queue/main/pr-$pr-<base>"
-  pbase="$(main_sha)"
-  group="$(queue_standin "$pr")"
-  job_stages "$X.mg" merge_group "$group"
-  # On merge_group the PR number comes from gh-readonly-queue/main/pr-<N>-<sha>, the ticket from PR N's head ref.
-  judge "$X.mg.identity" "context: $(ctx_of merge_group "$group")" ctx_is merge_group "$group" \
-    ".event == \"merge_group\" and .pr == $pr and .ticket == \"$id\" and .class == \"ticket\" and .base == \"$pbase\" and .head == \"$group\""
-  miss="$(required_report "$(main_sha)" "$group")"
-  judge "$X.mg.required-checks" "${miss:-every required context reports green}" test -z "$miss"
-  stage "$X.merge" red "no queue merges it (no merge queue on a user-owned repo; no first-party queue)"
-  standin "main fast-forwards to the merge group $group"
-  merge_standin "$pr" "$group"
+  # The serial queue (enqueue.yml; no native queue on a user-owned repo, records/TB0.md (a)): the gates
+  # run's workflow_run started it inside pr_event. `pick` built factory-queue/pr-<n> onto main, `gates`
+  # ran gates.yml there (workflow_call), `land` pushed it to main on the App token.
+  local pick land qhead
+  pick="$(queue_line pick "$pr")"; land="$(queue_line land "$pr")"; qhead="$(jq -r '.head // empty' <<<"$pick")"
+  judge "$X.enqueue" "pick: $pick" jq -e '.mode == "serial" and .result == "built" and .base == "'"$pbase"'"' <<<"$pick"
+  q_stages "$X.q" "$pr" "$qhead"
+  # On the queue the PR number is the caller's input, the ticket from PR N's head ref (lib/gate-context.sh).
+  judge "$X.q.identity" "context: $(q_ctx "$pr" "$qhead")" q_ctx_is "$pr" "$qhead" \
+    ".event == \"queue\" and .pr == $pr and .ticket == \"$id\" and .class == \"ticket\" and .base == \"$pbase\" and .head == \"$qhead\""
+  judge "$X.merge" "land: $land; main $(main_sha | cut -c1-12)" \
+    eval '[ "$(jq -r .result <<<"$land")" = landed ] && [ -n "$qhead" ] && git -C "$ORIGIN" merge-base --is-ancestor "$qhead" "$(main_sha)"'
+  # GitHub marks the PR merged once its head is reachable from main; the sim models merge_commit_sha as
+  # the queue commit, which GitHub does not document (a kit line, TB12): red by fiat.
+  stage "$X.merged-mark" red "kit: merge_commit_sha after an indirect merge is undocumented; modeled $(ghq --argjson n "$pr" '[(.merged // [])[] | select(.pr == $n) | .sha[0:12]] | join(",")'), land saw merged_mark $(jq -c '.merged_mark' <<<"$land")"
   desk_sync
   judge "$X.complete" "post-merge" test "$(adlc_desk ticket show "$id" --json | jq -r .ticket.completed)" = true
   judge "$X.issue-closed" "#$n $(issue_state "$n")" test "$(issue_state "$n")" = closed
@@ -295,8 +336,9 @@ ci_trace() {  # ci_trace <head> <job>: the `diff-gates:` lines that job printed 
   [ -n "$log" ] || return 0
   grep -h '^diff-gates: ' "$log" || true
 }
-ci_tg_argv() {  # ci_tg_argv <lines-before>: tamperguard's argv as CI called it since then (one JSON array per call)
-  tail -n +"$(($1 + 1))" "$FAKE_TAMPERGUARD_LOG"
+ci_tg_argv() {  # ci_tg_argv <lines-before> <head>: tamperguard's argv as CI called it on ...<head> since then (one
+                # JSON array per call; the queue's own call on base...<queue commit> follows in the same pr_event)
+  tail -n +"$(($1 + 1))" "$FAKE_TAMPERGUARD_LOG" | jq -c --arg h "$2" 'select(any(.[]; endswith("..." + $h)))'
 }
 i17_same() {  # i17_same <run-id> <gate-base> <gate-head> <pr-base> <pr-head> <node tg argv> <ci tg lines before>
   local g n
@@ -305,7 +347,7 @@ i17_same() {  # i17_same <run-id> <gate-base> <gate-head> <pr-base> <pr-head> <n
     n="$(node_trace "$1" "$g")"
     [ -n "$n" ] && [ "$n" = "$(ci_trace "$5" "$g")" ] || return 1
   done
-  [ -n "$6" ] && [ "$6" = "$(ci_tg_argv "$7")" ] &&
+  [ -n "$6" ] && [ "$6" = "$(ci_tg_argv "$7" "$5")" ] &&
     [ "$6" = "$(jq -cn --arg r "$4...$5" '["--range", $r, "--json"]')" ]
 }
 i17_detail() {
@@ -317,7 +359,7 @@ i17_detail() {
     n="$(node_trace "$1" "$g" | wc -l | tr -d ' ')"; c="$(ci_trace "$5" "$g" | wc -l | tr -d ' ')"
     if [ "$(node_trace "$1" "$g")" = "$(ci_trace "$5" "$g")" ]; then d+="$g $n=$c; "; else d+="$g node $n != CI $c; "; fi
   done
-  printf '%son %s...%s; tamperguard node %s, CI %s' "$d" "${4:0:12}" "${5:0:12}" "${6:-none}" "$(ci_tg_argv "$7" | tr '\n' ' ')"
+  printf '%son %s...%s; tamperguard node %s, CI %s' "$d" "${4:0:12}" "${5:0:12}" "${6:-none}" "$(ci_tg_argv "$7" "$5" | tr '\n' ' ')"
 }
 one_trailered_commit() {  # <base> <head> <id>: exactly one commit, carrying the four trailers
   local c; c="$(git -C "$ORIGIN" rev-list "$1..$2")"
@@ -326,10 +368,6 @@ one_trailered_commit() {  # <base> <head> <id>: exactly one commit, carrying the
     git -C "$ORIGIN" log -1 --format='%(trailers:key=Signed-off-by,valueonly)%(trailers:key=Assisted-by,valueonly)' "$c" | grep -q .
 }
 claim_handed_to_pr() { [ -z "$(lock_of "$1")" ] && has_label "$1" in-review && ! has_label "$1" ready; }
-enqueued() {
-  ghq -e --argjson n "$1" 'any(.queue[]?; .pr == $n)' >/dev/null ||
-    git -C "$ORIGIN" for-each-ref --format=x "refs/heads/factory-queue/pr-$1" | grep -q x
-}
 
 # ================================================================== the walk
 say "sim: adlc $ADLC_MODE, world $SIM"
@@ -369,12 +407,16 @@ judge C.mirror-blocked "#$C_ISSUE labels $(ghq --argjson n "$C_ISSUE" '.issues[]
 judge C.depends-link "$(ghq --argjson n "$C_ISSUE" '.issues[] | select(.number == $n) | .body' | grep -m1 '^Depends-on:' || echo 'no Depends-on line')" \
   eval "ghq --argjson n \"\$C_ISSUE\" '.issues[] | select(.number == \$n) | .body' | grep -qE '^Depends-on: T-sim-parent \\(#$P_ISSUE\\)$'"
 
+# GitHub's view of the attest-verify stub (ci:G6, TB11) is a labeled stand-in for the walk: without
+# it no PR is ever green and nothing reaches the queue (lib/driver.sh SIM_STANDIN_GREEN).
+export SIM_STANDIN_GREEN="attest-verify"
 walk P T-sim-parent sim/parent skip-ready
 
 # The child: the mirror on post-merge's run should make it ready.
 walk C T-sim-child sim/child
 
 # ================================================================== failure scenarios
+unset SIM_STANDIN_GREEN
 . "$SIM_LIB/scenarios.sh"
 
 [ ! -s "$FAKE_GH_UNKNOWN" ] || { say "fake gh refused forms:"; command cat "$FAKE_GH_UNKNOWN" >>"$LOG"; }

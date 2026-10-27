@@ -137,7 +137,9 @@ run_pr_body() {
   jq -r '
     "Ticket: \(.ticket)\nIssue: #\(.issue)\nNode: \(.handle)\n\n"
     + "| | |\n|---|---|\n"
-    + "| fleet run | `\(.fleet_run)` |\n| outcome | built (fleet exit 0, reason none) |\n"
+    + "| fleet run | `\(.fleet_run)` |\n"
+    + (if .rebased then "| outcome | rebased: the ejected `\(.rebased.from[0:12])` (PR #\(.rebased.pr), rebase strike \(.rebased.strike)) cherry-picked onto main; no fleet run |\n"
+       else "| outcome | built (fleet exit 0, reason none) |\n" end)
     + "| strikes | \(.strikes) of \(.max_strikes) |\n| adapter | \(.adapter) |\n"
     + "| tokens | \(.tokens // "not reported by fleet 1.12.0") |\n"
     + "| base | `\(.base[0:12])` (\(.base_kind)) |\n| head | `\(.head[0:12])` |\n"

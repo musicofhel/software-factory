@@ -25,6 +25,17 @@
 # commits never reach the origin but stay in the node's clone (success); a resumed pause and a
 # lapsed branch are squashed the same way, their work kept in the tree (resume-in-place,
 # lapsed-range).
+# T28 (specs/factory-step3-v1 TB9): an Issue labeled `rebase-strike` (eject.sh's ejection: PR #7
+# closed, its head E one ticket commit at refs/pull/7/head, T-run's last line in main's
+# factory/ledger/ejections.jsonl). E applies cleanly → no fleet run, ONE commit of E's change on main
+# (Factory-Outcome: rebased, Rebased-From: E), the same gates on main...it, a new PR whose outcome row
+# says rebased, the hand-off also removes rebase-strike, .rebase result clean (rebase-clean); the gates
+# really judge it (rebase-gated); a conflict → fleet from origin/main, --max-strikes the budget's
+# (rebase-conflict); no record, the PR head unreadable or moved, not one single-parent commit on main,
+# not the ticket's → ineligible, fleet from origin/main (rebase-ineligible); no label → the lapsed-branch
+# claim unchanged (rebase-none); the rebase strike survives a PR retry and a pause (rebase-survives); a
+# gate's desk takes rebase-strike too (rebase-gated); a malformed ledger line is skipped
+# (rebase-malformed-line).
 # tamperguard is laid out as a uv tool (fake_uv): its own install dir, and a python reached through a
 # version link, as on a real node.
 set -euo pipefail
@@ -967,11 +978,288 @@ case_bwrap_shim() {
   check "no pin at all: no shim" eq "$(field .bwrap_shim) $(test -e "$SHIM_DIR" && echo shim)" "false "
 }
 
+# T28 (specs/factory-step3-v1 TB9): the rebase strike. eject_world leaves what eject.sh leaves: PR #7
+# closed, its head E (ONE commit on MAIN0, an older main, carrying T23's trailer paragraph with
+# `Ticket: T-run`) at refs/pull/7/head and on ticket/T-run/<handle>, main moved on by the ledger commit
+# (factory/ledger/ejections.jsonl: another ticket's line, T-run's strike 1 of PR #5, then T-run's strike
+# 2 of PR #7, the last), and the Issue labeled ready + rebase-strike.
+ocommit() {  # ocommit <base> <message> [<path> <content | ->]...: a commit on the origin, <base>'s tree
+  # with those files set (- removes one); its parents are <base>, or $OC_PARENTS when set ("" = a root)
+  local base="$1" msg="$2" idx tree blob p
+  local -a ps=()
+  shift 2
+  idx="$WORLD/oc.index"; rm -f "$idx"
+  GIT_INDEX_FILE="$idx" git -C "$FAKE_GH_GIT" read-tree "$base"
+  while [ $# -gt 0 ]; do
+    if [ "$2" = - ]; then   # mode 0 drops the entry (--force-remove wants a work tree)
+      printf '0 %040d\t%s\n' 0 "$1" | GIT_INDEX_FILE="$idx" git -C "$FAKE_GH_GIT" update-index --index-info
+    else
+      blob="$(printf '%s\n' "$2" | git -C "$FAKE_GH_GIT" hash-object -w --stdin)"
+      GIT_INDEX_FILE="$idx" git -C "$FAKE_GH_GIT" update-index --add --cacheinfo "100644,$blob,$1"
+    fi
+    shift 2
+  done
+  tree="$(GIT_INDEX_FILE="$idx" git -C "$FAKE_GH_GIT" write-tree)"; rm -f "$idx"
+  for p in ${OC_PARENTS-$base}; do ps+=(-p "$p"); done
+  printf '%s\n' "$msg" | git -C "$FAKE_GH_GIT" commit-tree "$tree" ${ps[@]+"${ps[@]}"}
+}
+ticket_msg() {  # ticket_msg <ticket> <handle>: a built ticket commit's message (T23's trailer paragraph)
+  printf 'factory: %s built on %s\n\nFactory-Outcome: built\nFleet-Run: run-old\nFleet-Strikes: 1\nAssisted-by: claude-code@2.1.280\nTicket: %s\nNode: %s\nSigned-off-by: node <node@fake>\n' \
+    "$1" "$2" "$1" "$2"
+}
+ej_line() {  # ej_line <ticket> <pr> <head> <strike>: one ejections.jsonl line as eject.sh writes it
+  jq -cn --arg t "$1" --argjson p "$2" --arg h "$3" --argjson s "$4" --arg b "$MAIN0" \
+    '{at: "2026-10-25T11:00:00Z", pr: $p, ticket: $t, handle: "dev-box", issue: 1, head: $h, base: $b,
+      queue: "main", reason: "conflict", strike: $s}'
+}
+ej_lines() {  # ej_lines <head>: the ledger with T-run's last line naming PR #7 at <head>, strike 2
+  ej_line T-other 3 "$(printf '%040d' 3)" 1; ej_line T-run 5 "$(printf '%040d' 5)" 1; ej_line T-run 7 "$1" 2
+}
+main_moves() {  # main_moves <message> [<path> <content | ->]...: one more commit on origin main
+  local m; m="$(ocommit "$(git -C "$FAKE_GH_GIT" rev-parse main)" "$@")"
+  git -C "$FAKE_GH_GIT" update-ref refs/heads/main "$m"
+}
+eject_record() {  # eject_record <head>: PR #7's head and main's ledger line for it both <head>
+  git -C "$FAKE_GH_GIT" update-ref refs/pull/7/head "$1"
+  main_moves "ledger: PR #7 at ${1:0:12}" factory/ledger/ejections.jsonl "$(ej_lines "$1")"
+}
+eject_world() {  # eject_world <main's hello.sh | -> [handle] [label]: run_setup + the ejection; sets MAIN0, E
+  run_setup
+  local h="${2:-dev-box}" tmp
+  MAIN0="$(ocommit "$(git -C "$FAKE_GH_GIT" rev-parse main)" "main: hello.sh v0" hello.sh 'echo v0')"
+  git -C "$FAKE_GH_GIT" update-ref refs/heads/main "$MAIN0"
+  E="$(GIT_COMMITTER_DATE="$((T0 - 7200)) +0000" ocommit "$MAIN0" "$(ticket_msg T-run "$h")" hello.sh 'echo ejected')"
+  git -C "$FAKE_GH_GIT" update-ref "refs/heads/ticket/T-run/$h" "$E"
+  fakegh_pr 7 "ticket/T-run/$h" CLOSED $((T0 - 7200))
+  # main moves on: the ledger commit; a conflict also changes the line E changed
+  if [ "$1" = - ]; then eject_record "$E"
+  else
+    git -C "$FAKE_GH_GIT" update-ref refs/pull/7/head "$E"
+    main_moves "ledger: PR #7 ejected" factory/ledger/ejections.jsonl "$(ej_lines "$E")" hello.sh "$1"
+  fi
+  tmp="$(mktemp)"
+  jq --arg l "${3-rebase-strike}" '.labels += ["rebase-strike", "autorebase"]
+      | (.issues[] | select(.number == 1)).labels += (if $l == "" then [] else [{name: $l}] end)' "$FAKE_GH_ISSUES" >"$tmp"
+  mv "$tmp" "$FAKE_GH_ISSUES"
+}
+omain() { git -C "$FAKE_GH_GIT" rev-parse main; }
+fleet_arg() { jq -r --arg o "$1" '.argv | if index($o) then .[index($o) + 1] else "absent" end' "$FAKE_FLEET_LOG"; }
+label_edits() {  # the hand-off's issue edits (the ones that add in-review): their label flags
+  jq -sc 'map(select(.[0:2] == ["issue", "edit"] and (index("in-review") != null)) | .[5:])' "$FAKE_GH_LOG"
+}
+rebase_acts() {
+  field '[.actions[] | select(test("^(rebase-|worktree (origin-main|lapsed)$|fleet-run$)"))] | join(",")'
+}
+
+case_rebase_clean() {
+  eject_world -
+  loop --once
+  local main exp; main="$(omain)"
+  check "rebase strike, E applies cleanly on the moved main: exit 0, outcome built" eq "$RC $(field .outcome)" "0 built"
+  check "  no fleet run: no fleet call, no ralon, no rails lock, no mirror, no budget" \
+    eq "$(fleet_calls) $(wc -l <"$FAKE_RALON_LOG" | tr -d ' ') $(field '[.actions | index("fleet-run"), index("ralon-lock"), index("mirror")] | unique | tojson') $(field .budget)" \
+       "0 0 [null] null"
+  check "  .rebase = {pr 7, from E, strike 2 (the ticket's LAST ledger line), clean}" \
+    eq "$(jq -c .rebase <<<"$LAST")" "$(jq -cn --arg e "$E" '{pr: 7, from: $e, strike: 2, result: "clean"}')"
+  check "  actions: rebase-strike, worktree origin-main, rebase-clean (in order)" \
+    eq "$(rebase_acts)" "rebase-strike,worktree origin-main,rebase-clean"
+  check "  the worktree base is origin main, though ticket/T-run/dev-box (the ejected E) exists" \
+    eq "$(jq -c .base <<<"$LAST")" "$(jq -cn --arg s "$main" '{kind: "origin-main", sha: $s}')"
+  check "  pushed ticket/T-run/dev-box over the ejected branch (the lease saw E)" \
+    eq "$(field .pushed.branch) $(pushed)" "ticket/T-run/dev-box $(field .pushed.sha)"
+  check "  ONE commit whose only parent is origin main" eq "$(git -C "$FAKE_GH_GIT" rev-list --parents "$main..$(pushed)")" "$(pushed) $main"
+  exp="$( (git -C "$FAKE_GH_GIT" ls-tree "$main" | grep -v $'\thello.sh$'; git -C "$FAKE_GH_GIT" ls-tree "$E" hello.sh) | git -C "$FAKE_GH_GIT" mktree)"
+  check "  its tree is main's with E's change applied (E's hello.sh, main's ledger file)" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^{tree}")" "$exp"
+  check "  the diff against main is E's: hello.sh only" \
+    eq "$(git -C "$FAKE_GH_GIT" diff --name-only "$main" "$(pushed)") $(git -C "$FAKE_GH_GIT" show "$(pushed):hello.sh")" "hello.sh echo ejected"
+  check "  its subject: factory: T-run rebased on dev-box" eq "$(git -C "$FAKE_GH_GIT" log -1 --format=%s "$(pushed)")" "factory: T-run rebased on dev-box"
+  check "  one trailer paragraph: Factory-Outcome, Rebased-From, Assisted-by, Ticket, Node, Signed-off-by" \
+    eq "$(git -C "$FAKE_GH_GIT" log -1 --format=%B "$(pushed)" | git interpret-trailers --parse | cut -d: -f1 | tr '\n' ' ')" \
+       "Factory-Outcome Rebased-From Assisted-by Ticket Node Signed-off-by "
+  check "  trailers: Factory-Outcome rebased, Rebased-From E" \
+    eq "$(trailer "$(pushed)" Factory-Outcome) $(trailer "$(pushed)" Rebased-From)" "rebased $E"
+  check "  trailers: Ticket, Node, Assisted-by, Signed-off-by as a fleet success's" \
+    eq "$(trailer "$(pushed)" Ticket)|$(trailer "$(pushed)" Node)|$(trailer "$(pushed)" Assisted-by)|$(trailer "$(pushed)" Signed-off-by)" \
+       "T-run|dev-box|claude-code@2.1.280|node <node@fake>"
+  check "  the gates ran on main...the pushed commit (.gate_base, .gate_head)" \
+    eq "$(field .gate_base) $(field .gate_head)" "$main $(pushed)"
+  check "  tamperguard's range is that one" eq "$(jq -c . "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$main...$(pushed)" '["--range", $r, "--json"]')"
+  check "  tamperguard ok, rails-proof pass, scope-check pass" eq "$(field '"\(.tamperguard.verdict) \(.rails_proof) \(.scope_check)"')" "ok pass pass"
+  check "  in order: tamperguard, rails-proof, scope-check, the lock check, the push" \
+    eq "$(field '[.actions[] | select(test("^(tamperguard|rails-proof|scope-check|lock-owned|push )"))] | join(",")')" \
+       "tamperguard,rails-proof,scope-check,lock-owned,push ticket/T-run/dev-box"
+  check "  a new PR #8 from ticket/T-run/dev-box (the ejected #7 stays closed)" \
+    eq "$(field .pr) $(jq -c '[.pulls[] | [.number, .state]]' "$FAKE_GH_ISSUES")" '8 [[7,"CLOSED"],[8,"OPEN"]]'
+  check "  the PR body's outcome row: rebased, the ejected E, PR #7, rebase strike 2" \
+    grep -qxF "| outcome | rebased: the ejected \`${E:0:12}\` (PR #7, rebase strike 2) cherry-picked onto main; no fleet run |" "$WORLD/prs/8.md"
+  check "  and fleet run none, head the pushed sha, base origin main" \
+    eval 'grep -qxF "| fleet run | \`none\` |" "$WORLD/prs/8.md" &&
+          grep -qxF "| head | \`$(pushed | cut -c1-12)\` |" "$WORLD/prs/8.md" &&
+          grep -qxF "| base | \`${main:0:12}\` (origin-main) |" "$WORLD/prs/8.md"'
+  check "  the hand-off: one edit adds in-review, removes ready,in-progress,rebase-strike" \
+    eq "$(label_edits)" '[["--add-label","in-review","--remove-label","ready,in-progress,rebase-strike"]]'
+  check "  the Issue is in-review only, the lock released, no slot state, the worktree gone" \
+    eq "$(labels)|$(lock)|$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)$([ -e "$WT" ] && echo kept)" "in-review,w:light||"
+  check "  the result comment names PR #8" grep -qF 'PR #8' <<<"$(last_comment)"
+  check "  the ledger has the same line" eq "$(tail -n1 "$FACTORY_HOME/run/ledger.jsonl")" "$LAST"
+}
+
+case_rebase_conflict() {
+  eject_world 'echo main'   # main changed the very line E changed
+  loop --once
+  local main; main="$(omain)"
+  check "rebase strike, E conflicts with main: fleet runs as usual, built" eq "$RC $(field .outcome) $(fleet_calls)" "0 built 1"
+  check "  .rebase = {pr 7, from E, strike 2, conflict}" \
+    eq "$(jq -c .rebase <<<"$LAST")" "$(jq -cn --arg e "$E" '{pr: 7, from: $e, strike: 2, result: "conflict"}')"
+  check "  actions: rebase-strike, worktree origin-main, rebase-conflict, fleet-run" \
+    eq "$(rebase_acts)" "rebase-strike,worktree origin-main,rebase-conflict,fleet-run"
+  check "  from origin main though ticket/T-run/dev-box exists: base origin-main, fleet's --base main, no --dead-end-file" \
+    eq "$(field '"\(.base.kind) \(.base.sha)"') $(fleet_arg --base) $(fleet_arg --dead-end-file)" "origin-main $main $main absent"
+  check "  fleet's --max-strikes is the budget's (w:light 2): the rebase strike (2) does not count" \
+    eq "$(fleet_arg --max-strikes) $(field .budget.max_strikes) $(jq .weights.light.maxStrikes "$REPO_ROOT/factory/policy/budget.json")" "2 2 2"
+  check "  the pushed commit is fleet's build on main (Factory-Outcome built, no Rebased-From)" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^") $(trailer "$(pushed)" Factory-Outcome) $(trailer "$(pushed)" Rebased-From)" "$main built "
+  check "  the PR body's outcome row is the fleet one" grep -qxF '| outcome | built (fleet exit 0, reason none) |' "$WORLD/prs/8.md"
+  check "  the hand-off removes rebase-strike too" \
+    eq "$(label_edits) $(labels)" '[["--add-label","in-review","--remove-label","ready,in-progress,rebase-strike"]] in-review,w:light'
+}
+
+ineligible() {  # ineligible <detail> <pr> <from> <strike>: loop once, then the ineligible checks
+  loop --once
+  local main; main="$(omain)"
+  check "$1: .rebase is ineligible, detail $1" \
+    eq "$(jq -c .rebase <<<"$LAST")" "$(jq -cn --argjson p "$2" --arg f "$3" --argjson s "$4" --arg d "$1" \
+                                         '{pr: $p, from: (if $f == "" then null else $f end), strike: $s, result: "ineligible", detail: $d}')"
+  check "  actions: rebase-strike, worktree origin-main, fleet-run (no rebase-clean, no rebase-conflict)" \
+    eq "$(rebase_acts)" "rebase-strike,worktree origin-main,fleet-run"
+  check "  fleet ran once from origin main, never the ejected branch: base origin-main, --base main, no --dead-end-file" \
+    eq "$(fleet_calls) $(field '"\(.base.kind) \(.base.sha)"') $(fleet_arg --base) $(fleet_arg --dead-end-file)" "1 origin-main $main $main absent"
+  check "  --max-strikes the budget's (2)" eq "$(fleet_arg --max-strikes)" 2
+  check "  built, the hand-off removes rebase-strike" \
+    eq "$RC $(field .outcome) $(label_edits) $(labels)" '0 built [["--add-label","in-review","--remove-label","ready,in-progress,rebase-strike"]] in-review,w:light'
+}
+
+case_rebase_ineligible() {
+  local x
+  eject_world -
+  main_moves "ledger: T-run's lines gone" factory/ledger/ejections.jsonl "$(ej_line T-other 3 "$E" 1)"
+  ineligible no-ejection-record null "" null
+  eject_world -
+  main_moves "ledger: removed" factory/ledger/ejections.jsonl -
+  ineligible no-ejection-record null "" null
+  eject_world -
+  git -C "$FAKE_GH_GIT" update-ref -d refs/pull/7/head
+  ineligible pr-head-unreadable 7 "" 2
+  eject_world -
+  x="$(ocommit "$E" "$(ticket_msg T-run dev-box)" hello.sh 'echo pushed after the ejection')"
+  git -C "$FAKE_GH_GIT" update-ref refs/pull/7/head "$x"
+  ineligible pr-head-moved 7 "$x" 2
+  eject_world -   # E is a merge: two parents
+  x="$(ocommit "$MAIN0" "side" side.txt 'side')"
+  x="$(OC_PARENTS="$MAIN0 $x" ocommit "$E" "$(ticket_msg T-run dev-box)")"
+  eject_record "$x"
+  ineligible not-one-commit 7 "$x" 2
+  eject_world -   # E is a root commit: no parent
+  x="$(OC_PARENTS="" ocommit "$E" "$(ticket_msg T-run dev-box)")"
+  eject_record "$x"
+  ineligible not-one-commit 7 "$x" 2
+  eject_world -   # the recorded head is the top of TWO commits (its parent is not on main): never half-applied
+  x="$(ocommit "$MAIN0" "$(ticket_msg T-run dev-box)" other.sh 'echo lower')"
+  x="$(ocommit "$x" "$(ticket_msg T-run dev-box)" hello.sh 'echo ejected')"
+  eject_record "$x"
+  ineligible not-one-commit 7 "$x" 2
+  eject_world -   # ONE commit, but another ticket's
+  x="$(ocommit "$MAIN0" "$(ticket_msg T-other dev-box)" hello.sh 'echo ejected')"
+  eject_record "$x"
+  ineligible not-the-ticket-commit 7 "$x" 2
+  eject_world -   # ONE commit with no trailer paragraph at all
+  x="$(ocommit "$MAIN0" "fix hello" hello.sh 'echo ejected')"
+  eject_record "$x"
+  ineligible not-the-ticket-commit 7 "$x" 2
+}
+
+case_rebase_malformed_line() {
+  # a malformed ejections.jsonl line between two of T-run's lines is skipped, never the end of the read
+  eject_world -
+  main_moves "ledger: a torn line" factory/ledger/ejections.jsonl \
+    "$(ej_line T-run 5 "$(printf '%040d' 5)" 1; echo '{"pr": 6, "ticket": "T-run", torn'; ej_line T-run 7 "$E" 2)"
+  loop --once
+  check "the last good line (PR #7) is used: clean" \
+    eq "$(jq -c .rebase <<<"$LAST")" "$(jq -cn --arg e "$E" '{pr: 7, from: $e, strike: 2, result: "clean"}')"
+}
+
+case_rebase_none() {
+  # the same ejection, but the Issue does not carry rebase-strike: the lapsed-branch claim of before
+  eject_world - old-node ""
+  loop --once
+  check "no rebase-strike label: built, no .rebase key, no rebase-* action" \
+    eq "$RC $(field '"\(.outcome) \(has("rebase")) \([.actions[] | select(startswith("rebase"))] | length)"')" "0 built false 0"
+  check "  the worktree is cut at the lapsed ticket/T-run/old-node (E), as before" \
+    eq "$(jq -c .base <<<"$LAST")" "$(jq -cn --arg s "$E" '{kind: "lapsed", sha: $s, lapsed: "ticket/T-run/old-node"}')"
+  check "  fleet's --base is E, with --dead-end-file" eq "$(fleet_arg --base) $(fleet_arg --dead-end-file | sed 's#.*/##')" "$E dead-end.md"
+  check "  the PR head was never fetched (no refs/factory/rebase/*)" \
+    eq "$(git -C "$WORLD/clone" for-each-ref --format=x refs/factory/rebase | wc -l | tr -d ' ')" 0
+  check "  the hand-off removes ready,in-progress only" \
+    eq "$(label_edits) $(labels)" '[["--add-label","in-review","--remove-label","ready,in-progress"]] in-review,w:light'
+  check "  the PR body's outcome row is the fleet one" grep -qxF '| outcome | built (fleet exit 0, reason none) |' "$WORLD/prs/8.md"
+}
+
+case_rebase_gated() {
+  local x
+  # the rebased commit takes the same gates as a fleet build: each failure is a desk, nothing pushed
+  eject_world -
+  export FAKE_TAMPERGUARD_VERDICT=tamper
+  loop --once
+  check "a clean rebase that tamperguard calls tamper: desk tamper, fleet never ran" \
+    eq "$RC $(field '"\(.outcome) \(.reason) \(.rebase.result)"') $(fleet_calls)" "0 desk tamper clean 0"
+  check "  tamperguard ran on main...the rebased commit; nothing pushed, no new PR" \
+    eq "$(jq -r '.[1]' "$FAKE_TAMPERGUARD_LOG") $(pushed) $(jq '.pulls | length' "$FAKE_GH_ISSUES")" "$(omain)...$(field .gate_head) $E 1"
+  check "  labeled needs-desk, the lock released" eq "$(labels | grep -c needs-desk)|$(lock)" "1|"
+  check "  the desk takes rebase-strike too (a returned ticket builds anew)" \
+    eq "$(jq -sc 'map(select(.[0:2] == ["issue", "edit"] and (index("needs-desk") != null)) | .[5:])' "$FAKE_GH_LOG") $(labels | grep -c rebase-strike)" \
+       '[["--add-label","needs-desk","--remove-label","ready,rebase-strike"]] 0'
+  eject_world -
+  x="$(ocommit "$MAIN0" "$(ticket_msg T-run dev-box)" outside.sh 'echo out of scope')"
+  eject_record "$x"
+  loop --once
+  check "a clean rebase of an out-of-scope E: scope-check fails on it, desk scope-fail" \
+    eq "$(field '"\(.outcome) \(.reason) \(.rebase.result) \(.rails_proof) \(.scope_check)"') $(fleet_calls)" "desk scope-fail clean pass fail 0"
+  check "  scope-check named the path; nothing pushed over the ejected branch" \
+    eq "$(grep -cxF '  outside.sh' "$FACTORY_HOME/run/logs/$(field .run_id).scope.err") $(pushed)" "1 $E"
+}
+
+case_rebase_survives() {
+  # The header: a clean rebase takes "the same ... PR and hand-off as a fleet success", and "the
+  # hand-off also removes rebase-strike". A PR that fails once is retried on the next iteration from
+  # the slot state; a conflict's fleet run may pause and resume. Both are the same claim.
+  eject_world -
+  echo 1 >"$WORLD/pr-create-fails"
+  loop --once
+  check "a clean rebase whose PR create fails once: pr-pending" eq "$(field '"\(.outcome) \(.rebase.result)"')" "pr-pending clean"
+  loop --once
+  check "  the retry opens it: built" eq "$RC $(field .outcome) $(field .pr)" "0 built 8"
+  check "  its body still says rebased (BUG if not: REBASE is not in the slot state)" \
+    grep -qF "| outcome | rebased: the ejected \`${E:0:12}\` (PR #7, rebase strike 2)" "$WORLD/prs/8.md"
+  check "  the hand-off removes rebase-strike (BUG if not: REBASE is not in the slot state)" \
+    eq "$(label_edits) $(labels)" '[["--add-label","in-review","--remove-label","ready,in-progress,rebase-strike"]] in-review,w:light'
+  eject_world 'echo main'
+  export FAKE_FLEET_REASONS="quota-paused success"
+  loop --once
+  check "a conflicting rebase strike whose fleet run pauses: paused" eq "$(field '"\(.outcome) \(.rebase.result)"')" "paused conflict"
+  FACTORY_NOW=$((T0 + 3700)) FAKE_GH_NOW=$((T0 + 3700)); under_cap
+  loop --once
+  check "  resumed and built" eq "$RC $(field .outcome)" "0 built"
+  check "  the hand-off removes rebase-strike (BUG if not: REBASE is not in the slot state)" \
+    eq "$(label_edits) $(labels)" '[["--add-label","in-review","--remove-label","ready,in-progress,rebase-strike"]] in-review,w:light'
+}
+
 for c in ${CASES:-success scope-fail rails-fail no-adversarial-review tamper policy-render policy-missing-root policy-render-lib \
                   quota-paused wall-clock resume-in-place resume-cap lock-lost success-handoff lock-lost-before-push \
                   pr-open-once-fails pr-open-twice-fails budget-override strikes-exhausted flail desk-marker \
                   review-unavailable anything-else argv resume lapsed-range no-transcript once governor dry-run guards \
-                  fakes bwrap-shim}; do
+                  fakes bwrap-shim rebase-clean rebase-conflict rebase-ineligible rebase-none rebase-gated \
+                  rebase-survives rebase-malformed-line}; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

@@ -9,6 +9,13 @@
 # copy. factory/bin/lib/gate-context.sh resolves base, head, PR, ticket and PR class the same way
 # for every gate; `context` prints them.
 #
+# The first-party serial queue (specs/factory-step3-v1 TB9, ticket T28; docs/adr/0007-merge-queue.md)
+# calls this workflow from enqueue.yml (`workflow_call`) with inputs pr, base (main) and head (the
+# queue commit factory-queue/pr-<n>, parents [main, PR head]): the same gates run there, read from the
+# workflow file of MAIN (the caller's), and lib/gate-context.sh resolves that event as `queue` (I18).
+# In a called workflow github.event_name is the caller's, so `dependencies` is skipped there, as on
+# merge_group.
+#
 # `depends-on` and `tier-order` (specs/factory-step3-v1 TB8, ticket T27) read the store at the base, or
 # at origin/main when it descends from the base: labeler.yml re-runs a held job once its parent merged
 # or a lower tier turned green, and a re-run replays the original event. tier-order reads other PRs'
@@ -18,8 +25,13 @@ on:
   pull_request:
     branches: [main]
   merge_group:
+  workflow_call:
+    inputs:
+      pr: { type: string, required: true, description: "the PR number the queue commit merges" }
+      base: { type: string, required: true, description: "main's sha the queue commit is built on" }
+      head: { type: string, required: true, description: "the queue commit (factory-queue/pr-<n>)" }
 concurrency:
-  group: gates-${{ github.event.pull_request.number || github.ref }}
+  group: gates-${{ inputs.pr && format('queue-{0}', inputs.pr) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 permissions:
   contents: read
@@ -27,8 +39,9 @@ permissions:
   actions: read
   security-events: write
 env:
-  GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-  GATE_HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+  GATE_BASE: ${{ inputs.base || github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+  GATE_HEAD: ${{ inputs.head || github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+  GATE_QUEUE_PR: ${{ inputs.pr }}
 jobs:
   context:
     runs-on: ubuntu-latest

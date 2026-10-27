@@ -59,10 +59,11 @@ world_build() {
   # The runner's shims: gh is the fake; pipx installs the fake tamperguard and a shellcheck that
   # reports the pin; make test/lint stubbed (the suite runs this sim, so a job running it would
   # recurse). build-test runs the base's fleet.gate commands (build-test.sh, TB5), which are
-  # `make lint` and `make test`, so the stub sees exactly that list (sim.log). `pipx install` links
-  # its app into $PIPX_BIN_DIR, which the driver makes per job and puts on the job's PATH (GitHub's
-  # runner: PIPX_BIN_DIR=/opt/pipx_bin, on PATH, a fresh VM per job), so only a job that installed
-  # tamperguard can call it.
+  # `make lint` and `make test`, so the stub sees exactly that list (sim.log); `make test` fails only
+  # in a tree holding both sim/r/main-side and sim/r/pr-side (S.queue-red: green apart, red merged).
+  # `pipx install` links its app into $PIPX_BIN_DIR, which the driver makes per job and puts on the
+  # job's PATH (GitHub's runner: PIPX_BIN_DIR=/opt/pipx_bin, on PATH, a fresh VM per job), so only a
+  # job that installed tamperguard can call it.
   mkdir -p "$SIM/runner-bin" "$SIM/runner-home" "$SIM/bin"
   ln -sf "$SIM_FAKES/gh" "$SIM/runner-bin/gh"
   ln -sf "$SIM_FAKES/curl" "$SIM/runner-bin/curl"
@@ -78,6 +79,7 @@ world_build() {
     'fi' \
     'echo "sim pipx: only tamperguard==0.2.0 on python3.14 and shellcheck-py==0.11.0.1 are simulated: $*" >&2; exit 127' >"$SIM/runner-bin/pipx"
   printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "$*" = test ] && [ -e sim/r/main-side ] && [ -e sim/r/pr-side ]; then echo "sim make: \`make test\` fails: sim/r/main-side and sim/r/pr-side together (S.queue-red)" >&2; exit 2; fi' \
     'case "$*" in test|lint) echo "sim make: \`make $*\` stubbed (the suite runs the sim itself)"; exit 0 ;; esac' \
     'exec /usr/bin/make "$@"' >"$SIM/runner-bin/make"
   # The adlc every script reaches: real 1.12.0 through npx (offline), or the fake's git-store mode,
