@@ -181,6 +181,9 @@ Flipped: `P.mirror-ready` and `S.desk-pr` → pass. EXPECTED.md: 117 = 91 pass +
 
 - **Scope deviations:** `tests/test_gate_context.sh` and `tests/test_layout.sh` (§3). The dogfooded
   scope-check names them plus `specs/factory-step3-v1/records/TB7.md`.
+  Dogfooded on the T26 commit `90970ec` (`--ticket T26 --base 90970ec~1 --head 90970ec`):
+  commit-check rc 0 (1 commit carries the trailers), rails-proof rc 0, scope-check rc 2 naming
+  exactly those three paths and nothing else.
 - **No records for T20–T31 on main.** The loop builds these tickets itself, so they stay `needs-desk`
   (`no record`) and no node can claim them. `--check` looks only at the tickets a PR adds or changes,
   so an unrelated desk PR is not blocked. When the desk wants one of them claimable, it runs
