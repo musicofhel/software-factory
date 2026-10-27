@@ -152,14 +152,16 @@ EOF
   fakegh_pr 100 ticket/20/alpha OPEN
   jan --apply
   check "exit 0" eq "$RC" 0
-  check "stale lock, fresh branch, open PR: kept" has_ref refs/locks/issue-20
+  # T25: lock 20's ticket has an open PR, so the PR holds it (pr-open) before the fresh-branch rule is
+  # reached; 21, 22 and 24 have no PR and are the fresh-branch keeps this case is named for.
+  check "stale lock, fresh branch, open PR: kept for the PR" has_ref refs/locks/issue-20
   check "stale lock, fresh branch, no PR, 30 h < 48 h: kept" has_ref refs/locks/issue-21
   check "branch exactly 24 h old is not older than the TTL: kept" has_ref refs/locks/issue-22
   check "branch 24 h and one second old: released" no_ref refs/locks/issue-23
   check "the branch is found through the Issue's Ticket: line (ticket/T9/*): kept" has_ref refs/locks/issue-24
-  check "keep lines name the branch they were kept for" \
-    eq "$(pick '.action == "keep-lock"' 'map([.issue, .kept_for, .result])')" \
-       '[[20,"ticket/20/alpha","kept"],[21,"ticket/21/alpha","kept"],[22,"ticket/22/alpha","kept"],[24,"ticket/T9/alpha","kept"]]'
+  check "keep lines name the branch (or, T25, the PR) they were kept for" \
+    eq "$(pick '.action == "keep-lock"' 'map([.issue, .reason, .kept_for, .result])')" \
+       '[[20,"pr-open","PR #100","kept"],[21,"stale-lock","ticket/21/alpha","kept"],[22,"stale-lock","ticket/22/alpha","kept"],[24,"stale-lock","ticket/T9/alpha","kept"]]'
   check "no comment on a kept lock" eq "$(comments 20)$(comments 24)" '[][]'
   check "every branch is still there" eq "$(git -C "$FAKE_GH_GIT" for-each-ref refs/heads/ticket/ | wc -l | tr -d ' ')" 5
 }
@@ -250,8 +252,10 @@ EOF
   check "retired manifests leave nodes/" eval '! on_nodes nodes/a3.json >/dev/null && ! on_nodes nodes/a5.json >/dev/null'
   check "and are archived with status retired" \
     eq "$(for h in a3 a5; do on_nodes "archive/nodes/$h.json" | jq -c '[.handle, .status]'; done | tr '\n' ' ')" '["a3","retired"] ["a5","retired"] '
+  # 7 node files plus janitor/state.json: T25, the fixture's state has no in_review, so the ready
+  # duty recomputes once and saves it (in the same commit).
   check "one commit on the nodes branch for all of it" \
-    eq "$(git -C "$FAKE_GH_GIT" log --format=%s nodes | head -n1)" "janitor: 7 file(s) at $(jq -nr --argjson e "$NOW" '$e | todate')"
+    eq "$(git -C "$FAKE_GH_GIT" log --format=%s nodes | head -n1)" "janitor: 8 file(s) at $(jq -nr --argjson e "$NOW" '$e | todate')"
   check "token revoked for each retired node (handle, owner)" eq "$(command cat "$WORLD/revoke.log")" $'a3 owner3\na5 a5'
   check "both claims of the retired node released, even the fresh one" \
     eq "$(pick '.action == "release-lock"' 'map([.issue, .reason, .result])')" '[[50,"node-retired","done"],[51,"node-retired","done"]]'
@@ -337,9 +341,11 @@ EOF
 
 # T10 AC4 (step-1 follow-up 1): `ticket list` lists completed tickets too, so the set is the ids
 # whose `ticket show` says not completed. A completion is a change; a completed id never counts.
+# T25: the state carries in_review [] (no PR open), so only the open set can change here; a state
+# without in_review recomputes once (node-lifecycle), which would mask the "no change" check.
 case_ready_open_only() {
   jan_setup <<EOF
-state {"open_set": ["T1","T2"]}
+state {"open_set": ["T1","T2"], "in_review": []}
 EOF
   export FAKE_ADLC_STORE="$WORLD/store.json"
   echo '[{"id":"T1","title":"a"},{"id":"T2","title":"b"},{"id":"T3","title":"c","completed":true}]' >"$FAKE_ADLC_STORE"
@@ -380,6 +386,136 @@ EOF
     eq "$RC $(pick '.action == "ready-recompute"' 'map([.open_set, .removed, .merge_order, .result])')" '0 [[[],["T1"],[],"done"]]'
   check "merge-forecast was not called" eq "$(jq -sc '[.[] | select(.[0] == "merge-forecast")] | length' "$FAKE_ADLC_LOG")" 0
   check "the saved set is empty" eq "$(on_nodes janitor/state.json | jq -c .open_set)" '[]'
+}
+
+# T25: an open PR from this repository's ticket/<id>/* holds the ticket. fork_pr <n> makes PR n
+# come from a fork (the fake gh then answers isCrossRepository true).
+fork_pr() {
+  jq --argjson n "$1" '(.pulls[] | select(.number == $n)).headRepository = "mallory/repo"' "$FAKE_GH_ISSUES" >"$WORLD/i" &&
+    mv "$WORLD/i" "$FAKE_GH_ISSUES"
+}
+issue_writes() { fakegh_calls '.[0] == "issue" and (.[1] == "comment" or .[1] == "edit")'; }
+
+case_held_pr_stale() {
+  jan_setup <<EOF
+node alpha $((NOW - H)) active 8
+lock 80 alpha $((NOW - 30 * H))
+branch ticket/80/alpha $((NOW - 30 * H))
+EOF
+  fakegh_issue 80 "$((NOW - 3 * D))" ready,in-progress
+  fakegh_pr 110 ticket/80/alpha OPEN
+  jan --apply
+  check "exit 0" eq "$RC" 0
+  check "30 h old lock, stale branch, open PR: kept" has_ref refs/locks/issue-80
+  check "keep line: reason pr-open, kept for the PR" \
+    eq "$(pick '.action | test("lock")' 'map([.action, .issue, .reason, .kept_for, .result])')" '[["keep-lock",80,"pr-open","PR #110","kept"]]'
+  check "no comment on the Issue" eq "$(comments 80)" '[]'
+  check "no label change" eq "$(labels 80)" '["ready","in-progress"]'
+  check "no issue comment or edit through gh" eq "$(issue_writes)" 0
+  check "the PR's branch is kept" has_ref refs/heads/ticket/80/alpha
+  check "the ticket is in review in the saved state" eq "$(on_nodes janitor/state.json | jq -c .in_review)" '["80"]'
+}
+
+case_fork_pr_no_hold() {
+  jan_setup <<EOF
+node alpha $((NOW - H)) active 8
+lock 80 alpha $((NOW - 30 * H))
+branch ticket/80/alpha $((NOW - 30 * H))
+EOF
+  fakegh_issue 80 "$((NOW - 3 * D))" ready,in-progress
+  fakegh_pr 110 ticket/80/alpha OPEN
+  fork_pr 110
+  jan --apply
+  check "exit 0" eq "$RC" 0
+  check "a fork's PR holds nothing: the stale lock is released" no_ref refs/locks/issue-80
+  check "release line: reason stale-lock" \
+    eq "$(pick '.action | test("lock")' 'map([.action, .issue, .reason, .result])')" '[["release-lock",80,"stale-lock","done"]]'
+  check "the comment gives the stale reason" eq "$(comments 80 | jq -r '.[0] | test("no heartbeat for more than 24 h")')" true
+  check "in-progress removed" eq "$(labels 80)" '["ready"]'
+  check "the fork's PR puts no ticket in review" eq "$(on_nodes janitor/state.json | jq -c .in_review)" '[]'
+}
+
+case_built_plus_new_claim() {
+  jan_setup <<EOF
+node alpha $((NOW - H)) active 1
+lock 81 alpha $((NOW - 3 * H))
+lock 82 alpha $((NOW - H))
+node beta $((NOW - H)) active 1
+lock 83 beta $((NOW - 30 * H))
+lock 84 beta $((NOW - H))
+node gamma $((NOW - H)) active 1
+lock 85 gamma $((NOW - 3 * H))
+lock 86 gamma $((NOW - H))
+EOF
+  for n in 81 82 83 84 85 86; do fakegh_issue "$n" "$((NOW - 3 * D))" ready,in-progress; done
+  fakegh_pr 111 ticket/81/alpha OPEN
+  fakegh_pr 113 ticket/83/beta OPEN
+  jan --apply
+  check "exit 0" eq "$RC" 0
+  check "1 slot, a fresh lock with an open PR plus a newer claim: both kept" \
+    eval 'has_ref refs/locks/issue-81 && has_ref refs/locks/issue-82'
+  check "1 slot, a stale lock with an open PR plus a newer claim: both kept" \
+    eval 'has_ref refs/locks/issue-83 && has_ref refs/locks/issue-84'
+  check "control, 1 slot and two claims without a PR: the newest goes" \
+    eval 'has_ref refs/locks/issue-85 && no_ref refs/locks/issue-86'
+  check "lines: only the stale PR lock's keep and the control's over-slots release" \
+    eq "$(pick '.action | test("lock")' 'map([.action, .issue, .reason, .result])')" \
+       '[["keep-lock",83,"pr-open","kept"],["release-lock",86,"over-slots","done"]]'
+  check "no comment on the kept Issues" eq "$(for n in 81 82 83 84; do comments "$n"; done | tr -d '\n')" '[][][][]'
+}
+
+case_issue_closed() {
+  jan_setup <<EOF
+node alpha $((NOW - H)) active 8
+lock 87 alpha $((NOW - H))
+lock 88 alpha $((NOW - 30 * H))
+branch ticket/88/alpha $((NOW - H))
+lock 89 alpha $((NOW - H))
+EOF
+  for n in 87 88 89; do fakegh_issue "$n" "$((NOW - 3 * D))" ready,in-progress; done
+  fakegh_close 87; fakegh_close 88
+  fakegh_pr 114 ticket/88/alpha OPEN
+  jan --apply
+  check "exit 0" eq "$RC" 0
+  check "a fresh lock whose Issue is closed: released" no_ref refs/locks/issue-87
+  check "closed Issue beats an open PR and a fresh branch: released" no_ref refs/locks/issue-88
+  check "a fresh lock on an open Issue: held" has_ref refs/locks/issue-89
+  check "release lines: reason issue-closed" \
+    eq "$(pick '.action | test("lock")' 'map([.action, .issue, .reason, .result])')" \
+       '[["release-lock",87,"issue-closed","done"],["release-lock",88,"issue-closed","done"]]'
+  check "the comment says the Issue is closed" \
+    eq "$(for n in 87 88; do comments "$n" | jq -r '.[0] | test("the Issue is closed")'; done | tr '\n' ' ')" "true true "
+  check "in-progress removed" eq "$(labels 87)" '["ready"]'
+  check "the branch with an open PR is kept" has_ref refs/heads/ticket/88/alpha
+}
+
+case_in_review_change_recomputes() {
+  jan_setup <<EOF
+state {"open_set": ["T1"], "in_review": []}
+EOF
+  export FAKE_ADLC_TICKETS='[{"id":"T1"}]'
+  jan --apply
+  check "same sets: no recompute" eval '[ "$RC" = 0 ] && [ -z "$OUT" ] && [ ! -s "$FAKE_MIRROR_LOG" ]'
+  fakegh_pr 120 ticket/T1/alpha OPEN
+  fakegh_pr 121 ticket/T2/x OPEN
+  fork_pr 121
+  : >"$FAKE_ADLC_LOG"
+  jan --apply
+  check "a PR opened: exit 0, recomputed with the same open set" \
+    eq "$RC $(pick '.action == "ready-recompute"' 'map([.open_set, .added, .removed, .in_review, .result])')" \
+       '0 [[["T1"],[],[],["T1"],"done"]]'
+  check "the forecast and the mirror ran" \
+    eq "$(jq -sc '[.[] | select(.[0] == "merge-forecast")] | length' "$FAKE_ADLC_LOG") $(jq -sc 'map(.argv[0:2])' "$FAKE_MIRROR_LOG")" \
+       '1 [["--apply","--forecast"]]'
+  check "in_review saved (the fork's PR left out)" eq "$(on_nodes janitor/state.json | jq -c '[.open_set, .in_review]')" '[["T1"],["T1"]]'
+  : >"$FAKE_ADLC_LOG"; : >"$FAKE_MIRROR_LOG"
+  jan --apply
+  check "nothing changed: no forecast, no mirror, no line" \
+    eval '[ "$RC" = 0 ] && [ -z "$OUT" ] && [ ! -s "$FAKE_MIRROR_LOG" ] && [ "$(jq -sc "[.[] | select(.[0] == \"merge-forecast\")] | length" "$FAKE_ADLC_LOG")" = 0 ]'
+  jq '(.pulls[] | select(.number == 120)).state = "CLOSED"' "$FAKE_GH_ISSUES" >"$WORLD/i" && mv "$WORLD/i" "$FAKE_GH_ISSUES"
+  jan --apply
+  check "the PR closed: recomputed again, in_review [] saved" \
+    eq "$RC $(pick '.action == "ready-recompute"' 'map(.result)') $(on_nodes janitor/state.json | jq -c .in_review)" '0 ["done"] []'
 }
 
 # T10 AC1 wiring: janitor.yml's hook is `revoke-collaborator.sh --apply`, a command line with a flag.
@@ -619,7 +755,8 @@ case_fake_semantics() {
 
 echo "test_janitor"
 for c in stale-lock stale-node over-slots fresh-branch-kept no-pr-48h branch-sweep node-lifecycle preview-ttl \
-         ready-recompute ready-open-only ready-all-completed revoke-hook-wired dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
+         ready-recompute ready-open-only ready-all-completed held-pr-stale fork-pr-no-hold built-plus-new-claim \
+         issue-closed in-review-change-recomputes revoke-hook-wired dry-run-inert refuses-off-hosted lease-race nodes-race hooks-unconfigured fake-semantics; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

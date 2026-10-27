@@ -61,12 +61,18 @@ run_setup() {
   printf '#!/usr/bin/env bash\necho "$1" >>"%s/naps"\n' "$WORLD" >"$WORLD/bin/nap"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$WORLD/bin/adversarial-review"   # fleet's review step: only its presence is checked
   # gh pr create is not in the fake gh: a shim records it (the body in prs/<n>.md) and opens the PR
-  # in the fake's store; everything else goes to tests/fakes/gh.
+  # in the fake's store, unless $WORLD/pr-create-fails holds a count > 0 (that many creates fail);
+  # everything else goes to tests/fakes/gh.
   command cat >"$WORLD/bin/gh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "\${1:-} \${2:-}" = "pr create" ]; then
   for a in "\$@"; do jq -n --arg a "\$a" '\$a'; done | jq -sc . >>"\$FAKE_GH_LOG"
+  fails="\$(command cat "$WORLD/pr-create-fails" 2>/dev/null || echo 0)"   # T25: the next <n> creates fail
+  if [ "\$fails" -gt 0 ]; then
+    echo "\$((fails - 1))" >"$WORLD/pr-create-fails"
+    echo "pull request create failed: HTTP 502 (injected)" >&2; exit 1
+  fi
   shift 2; head="" base="" title="" body=""
   while [ \$# -gt 0 ]; do
     case "\$1" in
@@ -92,6 +98,8 @@ fi
 exec "$FAKES_DIR/gh" "\$@"
 EOF
   chmod +x "$WORLD/bin/claude" "$WORLD/bin/nap" "$WORLD/bin/adversarial-review" "$WORLD/bin/gh"
+  # in-review, as the mirror creates it when the repo lacks it (mirror.sh); run.sh's hand-off adds it (T25)
+  jq '.labels += ["in-review"]' "$FAKE_GH_ISSUES" >"$WORLD/labels.tmp" && mv "$WORLD/labels.tmp" "$FAKE_GH_ISSUES"
   export PATH="$WORLD/bin:$PATH"
   jq -n --arg seen "$(iso $((T0 - 600)))" '
     {handle: "dev-box", owner: "dev-box", os: "linux", cpu: 8, ram_gb: 16, slots: 2, heavy_gates: false,
@@ -183,7 +191,8 @@ case_success() {
     grep -qF '| strikes | 1 of 2 |' "$WORLD/prs/2.md"
   check "  two comments: the claim and the result" eq "$(comments)" 2
   check "  the result comment names the branch and the PR" grep -qF 'PR #2' <<<"$(last_comment)"
-  check "  the lock stays (released at merge)" test -n "$(lock)"
+  # T25: the PR is the claim from here; the hand-off labels the Issue in-review and releases the lock
+  check "  the lock is released at the hand-off (T25), the Issue in-review" eq "$(lock)|$(labels)" "|in-review,w:light"
   check "  the worktree is gone" test ! -e "$WT"
   check "  fleet's local branches are gone" eq "$(git -C "$WORLD/clone" for-each-ref --format=x refs/heads/fleet | wc -l | tr -d ' ')" 0
   check "  no slot state left" test ! -e "$FACTORY_HOME/run/slot-1.json"
@@ -285,6 +294,7 @@ i14() {  # i14 <render> <extra root>...: the render differs from build.toml only
   check "  allow_read starts with the template's own entries" eq "$(allow_read "$1" | jq -c --argjson t "$t" '.[0:($t | length)] == $t')" true
   extra="$(allow_read "$1" | jq -r --argjson t "$t" '.[($t | length):][]')"
   check "  the extra roots are exactly the step's" eq "$extra" "$(printf '%s\n' "${@:2}")"
+  # shellcheck disable=SC2034  # read inside the eval string below
   home="$(cd "$HOME" && pwd -P)"
   while IFS= read -r r; do
     check "  $r: absolute, an existing directory, not \$HOME or above it" \
@@ -439,6 +449,121 @@ case_lock_lost() {
   check "  no lock was re-created" test -z "$(lock)"
 }
 
+# T25: the hand-off. A built ticket's PR is the claim: the Issue goes in-review, the lock is released.
+handoff_checks() {  # handoff_checks: the hand-off after the PR was opened (outcome built)
+  check "  outcome built, a PR from ticket/T-run/dev-box in the record" \
+    eq "$(field '"\(.outcome) \(.pr)"') $(jq -r --argjson p "$(field .pr)" '.pulls[] | select(.number == $p) | .headRefName' "$FAKE_GH_ISSUES")" \
+       "built 2 ticket/T-run/dev-box"
+  check "  the lock ref is gone" test -z "$(lock)"
+  check "  the Issue is in-review, neither ready nor in-progress" eq "$(labels)" in-review,w:light
+  check "  one label edit: add in-review, remove ready,in-progress" \
+    eq "$(jq -sc 'map(select(.[0:2] == ["issue", "edit"] and (index("in-review") != null)) | .[5:])' "$FAKE_GH_LOG")" \
+       '[["--add-label","in-review","--remove-label","ready,in-progress"]]'
+  check "  actions: pr-open, comment, label-in-review, release-lock, in that order" \
+    eq "$(field '[.actions[] | select(IN("pr-open", "comment", "label-in-review", "release-lock"))] | join(",")')" \
+       pr-open,comment,label-in-review,release-lock
+  check "  no keep-lock, no slot state, the worktree gone" \
+    eq "$(field '.actions | index("keep-lock")')$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)$([ -e "$WT" ] && echo kept)" null
+  check "  the result comment names the PR" grep -qF 'PR #2' <<<"$(last_comment)"
+}
+
+case_success_handoff() {
+  run_setup
+  loop --once
+  check "all gates pass: exit 0, the lock checked (heartbeat dry run) before the push" \
+    eq "$RC $(field '.actions | (index("lock-owned") < index("push ticket/T-run/dev-box"))')" "0 true"
+  handoff_checks
+}
+
+case_lock_lost_before_push() {
+  # a ralon shim takes the lock away while fleet runs: <how> is gone (the janitor) or other (another node's)
+  local how other
+  for how in gone other; do
+    run_setup
+    fakegh_lock 1 other-node $((T0 - 60)); other="$(lock)"; git -C "$FAKE_GH_GIT" update-ref -d refs/locks/issue-1
+    printf '#!/usr/bin/env bash\nrc=0; "%s/ralon" "$@" || rc=$?\nif [ "$1 $2" = "run -C" ]; then\n  if [ %s = gone ]; then git -C "$FAKE_GH_GIT" update-ref -d refs/locks/issue-1; else git -C "$FAKE_GH_GIT" update-ref refs/locks/issue-1 %s; fi\nfi\nexit "$rc"\n' \
+      "$FAKES_DIR" "$how" "$other" >"$WORLD/bin/ralon"
+    chmod +x "$WORLD/bin/ralon"
+    loop --once
+    check "the lock is $how after fleet, all gates pass: exit 0, outcome lock-lost" eq "$RC $(field '"\(.outcome) \(.reason)"')" "0 lock-lost lock-lost"
+    check "  the lock check said so after the gates" \
+      eq "$(field '.actions | (index("lock-lost") > index("scope-check")) and (index("lock-owned") == null)')" true
+    check "  nothing pushed to ticket/T-run/*, no PR" \
+      eq "$(git -C "$FAKE_GH_GIT" for-each-ref --format=x refs/heads/ticket | wc -l | tr -d ' ') $(jq '.pulls // [] | length' "$FAKE_GH_ISSUES") $(field .pushed)" "0 0 null"
+    check "  no comment beyond the claim's, no label edit (the claim's labels)" eq "$(comments) $(labels)" "1 in-progress,ready,w:light"
+    check "  no issue edit after the claim" \
+      eq "$(jq -sc 'map(select(.[0:2] == ["issue", "edit"] and (index("in-review") != null or index("needs-desk") != null))) | length' "$FAKE_GH_LOG")" 0
+    check "  the lock is left as it is (not released, not re-created)" eq "$(lock)" "$([ "$how" = other ] && echo "$other")"
+    check "  the worktree and the slot state are gone" eq "$([ -e "$WT" ] && echo kept)$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)" ""
+  done
+}
+
+case_pr_open_once_fails() {
+  run_setup
+  echo 1 >"$WORLD/pr-create-fails"
+  loop --once
+  local sha; sha="$(field .pushed.sha)"
+  check "gh pr create fails once: exit 0, outcome pr-pending" eq "$RC $(field .outcome)" "0 pr-pending"
+  check "  the gated sha was pushed, no PR" eq "$(pushed) $(jq '.pulls // [] | length' "$FAKE_GH_ISSUES")" "$sha 0"
+  check "  actions: pr-open-failed, keep-lock" eq "$(field '[.actions[] | select(IN("pr-open-failed", "keep-lock", "release-lock", "comment"))] | join(",")')" pr-open-failed,keep-lock
+  check "  the slot state holds pr_pending (tries 1, the pushed sha)" \
+    eq "$(jq -c '[.pr_pending.tries, .pr_pending.sha == "'"$sha"'"]' "$FACTORY_HOME/run/slot-1.json")" '[1,true]'
+  check "  the lock is kept, the Issue's labels untouched, no result comment" eq "$(test -n "$(lock)" && echo kept) $(labels) $(comments)" "kept in-progress,ready,w:light 1"
+  check "  the worktree is gone (the pushed sha is all the PR needs)" test ! -e "$WT"
+  loop --once
+  check "the next iteration retries the PR: exit 0, pr-retry on the pushed sha" \
+    eq "$RC $(field '"\(.actions[0]) \(.pr_retry.sha)"')" "0 pr-retry $sha"
+  check "  the lock checked first, then the PR opened; fleet did not run again" \
+    eq "$(field '.actions | index("lock-owned") < index("pr-open")') $(fleet_calls)" "true 1"
+  handoff_checks
+}
+
+case_pr_open_twice_fails() {
+  run_setup
+  echo 2 >"$WORLD/pr-create-fails"
+  loop --once
+  check "gh pr create fails: pr-pending" eq "$(field .outcome)" pr-pending
+  loop --once
+  check "and fails again on the retry: exit 0, outcome desk, reason pr-open-failed" \
+    eq "$RC $(field '"\(.outcome) \(.reason)"')" "0 desk pr-open-failed"
+  check "  no PR, the pushed branch stays" eq "$(jq '.pulls // [] | length' "$FAKE_GH_ISSUES") $(test -n "$(pushed)" && echo pushed)" "0 pushed"
+  check "  labeled needs-desk, ready removed" eq "$(labels)" in-progress,needs-desk,w:light
+  check "  the comment ends in the needs-desk marker, reason pr-open-failed" eq "$(marker)" "$(want_marker pr-open-failed)"
+  check "  the lock is released, no slot state" eq "$(lock)$([ -e "$FACTORY_HOME/run/slot-1.json" ] && echo state)" ""
+  check "  actions: pr-retry, lock-owned, pr-open-failed, comment, label-needs-desk, release-lock" \
+    eq "$(field '.actions | join(",")')" pr-retry,lock-owned,pr-open-failed,comment,label-needs-desk,release-lock
+}
+
+case_budget_override() {
+  # budget_run <ticket budget JSON>: the claim with that `budget` on T-run (null: no budget key); sets MS
+  # (fleet's --max-strikes --wall-clock-minutes)
+  budget_run() {
+    run_setup
+    FAKE_ADLC_TICKETS="$(jq -c --argjson b "$1" 'if $b == null then . else .[0].budget = $b end' <<<"$FAKE_ADLC_TICKETS")"
+    loop --once
+    MS="$(jq -r '"\(.argv[(.argv | index("--max-strikes")) + 1]) \(.argv[(.argv | index("--wall-clock-minutes")) + 1])"' "$FAKE_FLEET_LOG")"
+  }
+  budget_run '{"maxStrikes": 2, "wallClockMinutes": 7}'
+  check "ticket budget {maxStrikes 2, wallClockMinutes 7}: fleet gets --max-strikes 2 --wall-clock-minutes 7" eq "$MS" "2 7"
+  check "  the ledger's budget says ticket" eq "$(jq -c .budget <<<"$LAST")" '{"max_strikes":2,"wall_clock_minutes":7,"source":"ticket"}'
+  check "  the ledger line is the one written" eq "$(tail -n1 "$FACTORY_HOME/run/ledger.jsonl" | jq -r .budget.source)" ticket
+  budget_run '{"maxStrikes": 3}'
+  check "only maxStrikes 3: it alone overrides (the weight's 45 min), source ticket" eq "$MS $(field .budget.source)" "3 45 ticket"
+  budget_run null
+  check "no ticket budget: the weight's (w:light: 2 strikes, 45 min), source weights" \
+    eq "$MS $(jq -c .budget <<<"$LAST")" '2 45 {"max_strikes":2,"wall_clock_minutes":45,"source":"weights"}'
+  budget_run 200000
+  check "a number budget (adlc's token ceiling): the weight's, source weights" eq "$MS $(field .budget.source)" "2 45 weights"
+  local b
+  for b in '{"maxStrikes": 0, "wallClockMinutes": 7}' '{"maxStrikes": "x", "wallClockMinutes": 7}' \
+           '{"maxStrikes": 3, "wallClockMinutes": 0}' '{"maxStrikes": 3, "wallClockMinutes": 10000}' \
+           '{"maxStrikes": "3", "wallClockMinutes": 7}' '{"maxStrikes": 2.5}'; do
+    budget_run "$b"
+    check "an invalid ticket budget $b: the weight's for both, source weights-ticket-budget-invalid" \
+      eq "$MS $(field .budget.source)" "2 45 weights-ticket-budget-invalid"
+  done
+}
+
 desk_case() {
   run_setup
   export FAKE_FLEET_REASON="$1"
@@ -581,8 +706,9 @@ case_argv() {
   check "  and never wraps fleet" eq "$(jq -s 'map(select(any(.[]; test("fleet")))) | length' "$FAKE_VETTO_LOG")" 0
   check "tamperguard: --range <origin main>...<the pushed sha> --json (three dots, the gated commit)" \
     eq "$(jq -c '.' "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$(git -C "$FAKE_GH_GIT" rev-parse main)...$(pushed)" '["--range", $r, "--json"]')"
-  check "the rails lock was rendered from the ticket (ralon-lock.sh → adlc ticket show)" \
-    eq "$(jq -sc 'map(select(.[0:2] == ["ticket", "show"]))' "$FAKE_ADLC_LOG")" '[["ticket","show","T-run","--json"]]'
+  # T25: ticket show twice, ralon-lock.sh's render, then ticket_budget's read of the ticket's budget
+  check "the rails lock was rendered from the ticket (ralon-lock.sh → adlc ticket show), then the budget read (T25)" \
+    eq "$(jq -sc 'map(select(.[0:2] == ["ticket", "show"]))' "$FAKE_ADLC_LOG")" '[["ticket","show","T-run","--json"],["ticket","show","T-run","--json"]]'
   check "  ralon found <worktree>/agent.lock with the ticket's rail" grep -qxE '[[:space:]]+- "?tests/rail/\*\*"?' "$WORLD/seen.lock"
 }
 
@@ -842,7 +968,8 @@ case_bwrap_shim() {
 }
 
 for c in ${CASES:-success scope-fail rails-fail no-adversarial-review tamper policy-render policy-missing-root policy-render-lib \
-                  quota-paused wall-clock resume-in-place resume-cap lock-lost strikes-exhausted flail desk-marker \
+                  quota-paused wall-clock resume-in-place resume-cap lock-lost success-handoff lock-lost-before-push \
+                  pr-open-once-fails pr-open-twice-fails budget-override strikes-exhausted flail desk-marker \
                   review-unavailable anything-else argv resume lapsed-range no-transcript once governor dry-run guards \
                   fakes bwrap-shim}; do
   run_case "$c"

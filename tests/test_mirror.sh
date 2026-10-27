@@ -7,6 +7,11 @@
 # until the ticket's store state changes; one without the marker is recomputed as before.
 # T18 acceptance 1-3 (case rails-required): an open ticket without rails gets needs-desk with the
 # reason `rails: none declared`; with the rail it can be ready; a completed one is never relabeled.
+# T25 (cases depends-on-blocked, forecast-wave-blocked, in-review, links, close-removes-gate-labels):
+# one gate label of ready|needs-desk|blocked|in-review. `blocked` when every reason is dependency
+# order (an open parent, a forecast wave behind wave 1); `in-review` while an open PR from this
+# repository's ticket/<id>/* exists (a fork's or a closed one counts for nothing); `needs-desk` wins.
+# Depends-on lines link the parent's Issue `(#n)`, also one created in the same run.
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -63,6 +68,19 @@ body() { iss "$1" .body | jq -r .; }   # the raw body text (iss prints JSON)
 writes() { fakegh_calls "$WRITES"; }
 has() { [[ "$1" == *"$2"* ]] || { printf '      [%s] lacks [%s]\n' "$1" "$2"; return 1; }; }
 lacks() { [[ "$1" != *"$2"* ]] || { printf '      [%s] has [%s]\n' "$1" "$2"; return 1; }; }
+reasons() { jq -sc --arg t "$1" '.[] | select(.ticket == $t) | .reasons' <<<"$OUT"; }   # the line's reasons
+line() { jq -sc --arg t "$1" ".[] | select(.ticket == \$t) | $2" <<<"$OUT"; }        # line <ticket> <jq>
+dep() { iss "$1" '[.body | split("\n")[] | select(startswith("Depends-on:"))]'; }
+fork_pr() {  # fork_pr <n> <head-branch> <owner/name>: an open PR from another repository's branch
+  local tmp; tmp="$(mktemp)"
+  jq --argjson n "$1" --arg h "$2" --arg r "$3" \
+    '.pulls += [{number: $n, headRefName: $h, headRepository: $r, state: "OPEN", createdAt: "2026-10-25T12:00:00Z"}]' \
+    "$FAKE_GH_ISSUES" >"$tmp" && mv "$tmp" "$FAKE_GH_ISSUES"
+}
+pr_state() {  # pr_state <n> <OPEN|CLOSED|MERGED>
+  local tmp; tmp="$(mktemp)"
+  jq --argjson n "$1" --arg s "$2" '(.pulls[] | select(.number == $n)).state = $s' "$FAKE_GH_ISSUES" >"$tmp" && mv "$tmp" "$FAKE_GH_ISSUES"
+}
 
 # ---------------------------------------------------------------------------------------------
 case_creates() {
@@ -85,9 +103,10 @@ case_creates() {
   check "T1: body carries the ticket body" has "$(body T1)" "Build claim.sh."
   check "created by gh issue create, two calls, labels passed at creation" \
     eq "$(fakegh_calls '.[0] == "issue" and .[1] == "create" and (index("--label") != null)')" 2
-  check "the missing labels were created first" \
-    eq "$(jq -c '[.labels[] | select(. != "in-progress")] | sort' "$FAKE_GH_ISSUES")" '["ready","tier:0","tier:1","w:heavy","w:light"]'
-  check "label-create lines for exactly those" eq "$(lines '.action == "label-create" and .result == "done"')" 5
+  # in-review is created even though no Issue here wants it: run.sh adds it at the PR hand-off (T25).
+  check "the missing labels were created first, in-review always" \
+    eq "$(jq -c '[.labels[] | select(. != "in-progress")] | sort' "$FAKE_GH_ISSUES")" '["in-review","ready","tier:0","tier:1","w:heavy","w:light"]'
+  check "label-create lines for exactly those" eq "$(lines '.action == "label-create" and .result == "done"')" 6
   check "create lines carry the new Issue numbers" \
     eq "$(jq -sc '[.[] | select(.action == "create") | [.ticket, .issue, .result]]' <<<"$OUT")" '[["T1",1,"done"],["T2",2,"done"]]'
   check "the completed ticket gets no line and no Issue" eq "$(lines '.ticket == "T9"')" 0
@@ -182,9 +201,10 @@ case_ready_only_when_gated() {
   check "exit 0" eq "$RC" 0
   local t want
   for t in T1 T8; do check "$t ready" eq "$(labels "$t")" '["ready","tier:1","w:light"]'; done
-  for t in T2 T3 T4 T5 T7 T9 T10 T11; do check "$t needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'; done
+  for t in T2 T3 T4 T5 T7 T9 T11; do check "$t needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'; done
+  # A wave behind wave 1 is dependency order only: blocked, not a case for the desk (T25).
+  check "T10 blocked (its only reason is the forecast wave)" eq "$(labels T10)" '["blocked","tier:1","w:light"]'
   check "T6: needs-desk and no w:/tier: label from an invalid header" eq "$(labels T6)" '["needs-desk"]'
-  reasons() { jq -sc --arg t "$1" '.[] | select(.ticket == $t) | .reasons' <<<"$OUT"; }
   check "T2 reason" eq "$(reasons T2)" '["spec-lint: no record"]'
   check "T3 reason" eq "$(reasons T3)" '["coldstart: 1 unresolved gap(s)"]'
   check "T4 reason" eq "$(reasons T4)" '["coldstart: stale (the ticket changed after coldstart ran)"]'
@@ -234,7 +254,6 @@ Ticket: T7' app/github-actions true
   t6="$(iss T6 .)"
   mir --apply
   check "exit 0" eq "$RC" 0
-  reasons() { jq -sc --arg t "$1" '.[] | select(.ticket == $t) | .reasons' <<<"$OUT"; }
   check "T1, with the default rail: ready" eq "$(labels T1)" '["ready","tier:1","w:light"]'
   for t in T2 T3 T4; do
     check "$t: needs-desk" eq "$(labels "$t")" '["needs-desk","tier:1","w:light"]'
@@ -267,13 +286,14 @@ case_depends_on_lines() {
   ticket T5 "adr" "$HDR"
   mir --apply
   check "exit 0" eq "$RC" 0
-  dep() { iss "$1" '[.body | split("\n")[] | select(startswith("Depends-on:"))]'; }
-  check "T4 depends on T1, T2, T3 (edges point prerequisite → dependent)" eq "$(dep T4)" '["Depends-on: T1","Depends-on: T2","Depends-on: T3"]'
-  check "T3 depends on T1, T2" eq "$(dep T3)" '["Depends-on: T1","Depends-on: T2"]'
-  check "T2 depends on T1" eq "$(dep T2)" '["Depends-on: T1"]'
+  # Each line links the parent's Issue (T25). Creates go parents first: T1 #1 and T5 #2 (no
+  # parents), then T2 #3, T3 #4, T4 #5, so every link names a number that exists.
+  check "T4 depends on T1, T2, T3 (edges point prerequisite → dependent)" eq "$(dep T4)" '["Depends-on: T1 (#1)","Depends-on: T2 (#3)","Depends-on: T3 (#4)"]'
+  check "T3 depends on T1, T2" eq "$(dep T3)" '["Depends-on: T1 (#1)","Depends-on: T2 (#3)"]'
+  check "T2 depends on T1" eq "$(dep T2)" '["Depends-on: T1 (#1)"]'
   check "T1 and T5 depend on nothing" eq "$(dep T1)$(dep T5)" '[][]'
   check "Depends-on lines sit right under the Ticket line" \
-    eq "$(iss T3 '.body | split("\n")[1:4]')" '["Ticket: T3","Depends-on: T1","Depends-on: T2"]'
+    eq "$(iss T3 '.body | split("\n")[1:4]')" '["Ticket: T3","Depends-on: T1 (#1)","Depends-on: T2 (#3)"]'
   # The janitor and summon.sh read the ticket id with this exact expression (factory/bin/janitor.sh).
   check "the janitor's Ticket-line parser reads every Issue's id" \
     eq "$(jq -c '[.issues[] | [(.body // "") | splits("\r?\n") | capture("^ticket:[ \t]*(?<id>[A-Za-z0-9._-]+)[ \t]*$"; "i") | .id] | first] | sort' "$FAKE_GH_ISSUES")" \
@@ -281,7 +301,7 @@ case_depends_on_lines() {
   # A new edge changes the body of the dependant only.
   set_ticket T5 '.edges = [{to: "T1"}]'
   mir --apply
-  check "T1 now depends on T5" eq "$(dep T1)" '["Depends-on: T5"]'
+  check "T1 now depends on T5" eq "$(dep T1)" '["Depends-on: T5 (#2)"]'
   check "only T1 changed" eq "$(jq -sc '[.[] | select(.action != "unchanged") | .ticket]' <<<"$OUT")" '["T1"]'
 }
 
@@ -296,13 +316,16 @@ case_dry_run_inert() {
   check "no flag: exit 0" eq "$RC" 0
   check "no flag: the store is byte-identical" eq "$(sha256sum <"$FAKE_GH_ISSUES")" "$before"
   check "no flag: zero write calls" eq "$(writes)" 0
-  check "the plan names a label create, an update and a close, all planned" \
-    eq "$(jq -sc '[.[] | [.action, .result]]' <<<"$OUT")" '[["label-create","planned"],["update","planned"],["close","planned"]]'
+  # Two label creates: w:light, and in-review, which the mirror always creates when missing (T25).
+  check "the plan names two label creates, an update and a close, all planned" \
+    eq "$(jq -sc '[.[] | [.action, .label // .ticket, .result]]' <<<"$OUT")" \
+       '[["label-create","in-review","planned"],["label-create","w:light","planned"],["update","T1","planned"],["close","T2","planned"]]'
   mir --dry-run
   check "--dry-run: exit 0, still nothing written" eval '[ "$RC" = 0 ] && [ "$(writes)" = 0 ] && [ "$(sha256sum <"$FAKE_GH_ISSUES")" = "$before" ]'
   mir --apply
   check "--apply takes exactly the planned actions" \
-    eq "$(jq -sc '[.[] | [.action, .result]]' <<<"$OUT")" '[["label-create","done"],["update","done"],["close","done"]]'
+    eq "$(jq -sc '[.[] | [.action, .label // .ticket, .result]]' <<<"$OUT")" \
+       '[["label-create","in-review","done"],["label-create","w:light","done"],["update","T1","done"],["close","T2","done"]]'
 }
 
 case_closes_completed() {
@@ -469,7 +492,8 @@ case_forecast_file() {
   check "exit 0" eq "$RC" 0
   check "the janitor's FILE is used: adlc merge-forecast is not called" \
     eq "$(jq -sc 'map(select(.[0] == "merge-forecast")) | length' "$FAKE_ADLC_LOG")" 0
-  check "the FILE decides: T2 ready, T1 waits" eq "$(labels T2)$(labels T1)" '["ready","tier:1","w:light"]["needs-desk","tier:1","w:light"]'
+  # T1 waits in wave 2: dependency order only, so blocked rather than needs-desk (T25).
+  check "the FILE decides: T2 ready, T1 waits (blocked)" eq "$(labels T2)$(labels T1)" '["ready","tier:1","w:light"]["blocked","tier:1","w:light"]'
   : >"$FAKE_ADLC_LOG"
   mir --apply
   check "without --forecast the mirror runs adlc merge-forecast --json itself" \
@@ -480,6 +504,182 @@ case_forecast_file() {
   printf 'not json\n' >"$WORLD/bad.json"
   mir --apply --forecast "$WORLD/bad.json"
   check "a FILE that is not a forecast: exit 1" eq "$RC" 1
+}
+
+case_depends_on_blocked() {
+  mir_setup
+  ticket T1 "parent" "$HDR" "T2"
+  ticket T2 "child" "$HDR"
+  ticket T3 "completed parent, never mirrored" "$HDR" "T2" true
+  ticket T4 "second open parent" "$HDR" "T2"
+  local t; for t in T1 T2 T3 T4; do gated "$t"; done
+  mir --apply
+  check "exit 0" eq "$RC" 0
+  local ready='["ready","tier:1","w:light"]'
+  check "T1 and T4, no parent: ready" eq "$(labels T1)$(labels T4)" "$ready$ready"
+  check "T2: blocked, not needs-desk" eq "$(labels T2)" '["blocked","tier:1","w:light"]'
+  check "T2: one reason naming the open parents; the completed T3 is not waited on" eq "$(reasons T2)" '["blocked: waits on T1, T4"]'
+  check "T2's body shows the verdict and the reason" has "$(body T2)" $'\nGate: blocked\n- blocked: waits on T1, T4\n'
+  check "T2 links its parents' Issues; T3, completed with no Issue, is a bare line" \
+    eq "$(dep T2)" "[\"Depends-on: T1 (#$(iss T1 .number))\",\"Depends-on: T3\",\"Depends-on: T4 (#$(iss T4 .number))\"]"
+  # One parent completes: still blocked, on the other one.
+  set_ticket T1 '.completed = true'
+  mir --apply
+  check "T1 completed: its Issue is closed" eq "$(iss T1 '[.state, .stateReason]')" '["closed","completed"]'
+  check "T2 still blocked, now on T4 only (body edited, labels kept)" \
+    eq "$(line T2 '[.gate, .reasons, .add, .remove, .body_changed]')" '["blocked",["blocked: waits on T4"],[],[],true]'
+  # The last parent completes: ready.
+  set_ticket T4 '.completed = true'
+  mir --apply
+  check "T4 completed: its Issue is closed" eq "$(iss T4 .state)" '"closed"'
+  check "T2: every parent completed, ready replaces blocked" \
+    eq "$(line T2 '[.gate, .reasons, .add, .remove]')" '["ready",[],["ready"],["blocked"]]'
+  check "T2's labels" eq "$(labels T2)" "$ready"
+  check "T2 keeps the links to its parents' closed Issues" \
+    eq "$(dep T2)" "[\"Depends-on: T1 (#$(iss T1 .number))\",\"Depends-on: T3\",\"Depends-on: T4 (#$(iss T4 .number))\"]"
+  local before; before="$(writes)"
+  mir --apply
+  check "a rerun writes nothing" eq "$(writes)" "$before"
+}
+
+case_forecast_wave_blocked() {
+  mir_setup
+  ticket T1 "wave 1" "$HDR" "T5"
+  ticket T2 "wave 2 only" "$HDR"
+  ticket T3 "wave 2, no rails" "$HDR"; set_ticket T3 '.rails = []'
+  ticket T4 "wave 2, no spec-lint" "$HDR"
+  ticket T5 "wave 2, behind an open parent" "$HDR"
+  gated T1; gated T2; gated T3; gated T5
+  record '{"gate":"coldstart","ticket":"T4","data":{"cache":{"ticketHash":"hash-T4","gaps":[]}}}'
+  record '{"gate":"merge-forecast","ticket":"T4","data":{}}'
+  export FAKE_ADLC_FORECAST='{"waves":[["T1"],["T2","T3","T4","T5"]],"mergeOrder":["T1","T2","T3","T4","T5"],"pairs":[],"gateFailures":[]}'
+  mir --apply
+  check "exit 0" eq "$RC" 0
+  local wave='merge-forecast: in wave 2, not wave 1'
+  check "T1 ready" eq "$(labels T1)" '["ready","tier:1","w:light"]'
+  check "T2: the wave is its only reason: blocked" \
+    eq "$(line T2 '[.gate, .reasons]')" "[\"blocked\",[\"$wave\"]]"
+  check "T2's labels" eq "$(labels T2)" '["blocked","tier:1","w:light"]'
+  check "T5: a wave and an open parent, both dependency order: blocked" \
+    eq "$(line T5 '[.gate, .reasons]')" "[\"blocked\",[\"$wave\",\"blocked: waits on T1\"]]"
+  check "T3: the wave plus no rails: needs-desk" \
+    eq "$(line T3 '[.gate, .reasons]')" "[\"needs-desk\",[\"rails: none declared\",\"$wave\"]]"
+  check "T4: the wave plus a missing record: needs-desk" \
+    eq "$(line T4 '[.gate, .reasons]')" "[\"needs-desk\",[\"spec-lint: no record\",\"$wave\"]]"
+  check "T3's and T4's labels" eq "$(labels T3)$(labels T4)" '["needs-desk","tier:1","w:light"]["needs-desk","tier:1","w:light"]'
+  # The desk adds T3's rail: only the wave is left, so needs-desk turns into blocked.
+  set_ticket T3 '.rails = ["factory/policy/**"]'
+  mir --apply
+  check "T3 with the rail: blocked replaces needs-desk" \
+    eq "$(line T3 '[.gate, .add, .remove]')" '["blocked",["blocked"],["needs-desk"]]'
+  # The forecast moves T2 into wave 1: ready.
+  export FAKE_ADLC_FORECAST='{"waves":[["T1","T2"],["T3","T4","T5"]],"mergeOrder":["T1","T2","T3","T4","T5"],"pairs":[],"gateFailures":[]}'
+  mir --apply
+  check "T2 in wave 1: ready replaces blocked" eq "$(line T2 '[.gate, .add, .remove]')" '["ready",["ready"],["blocked"]]'
+}
+
+case_in_review() {
+  mir_setup
+  ticket T1 "open PR" "$HDR" "T5"
+  ticket T2 "fork PR only" "$HDR"
+  ticket T3 "closed and merged PRs only" "$HDR"
+  ticket T4 "a PR for T44" "$HDR"
+  ticket T5 "blocked, with an open PR" "$HDR"
+  ticket T6 "no rails, with an open PR" "$HDR"; set_ticket T6 '.rails = []'
+  local t; for t in T1 T2 T3 T4 T5 T6; do gated "$t"; done
+  fakegh_pr 40 ticket/T1/alpha
+  fork_pr 41 ticket/T2/alpha stranger/repo          # same branch name, another repository
+  fakegh_pr 42 ticket/T3/alpha CLOSED; fakegh_pr 43 ticket/T3/beta MERGED
+  fakegh_pr 44 ticket/T44/alpha                     # not T4's: the id ends at the slash
+  fakegh_pr 45 ticket/T5/alpha
+  fakegh_pr 46 ticket/T6/alpha
+  mir --apply
+  check "exit 0" eq "$RC" 0
+  local ready='["ready","tier:1","w:light"]' review='["in-review","tier:1","w:light"]'
+  check "the repo lacked in-review: the mirror created it" eq "$(lines '.action == "label-create" and .label == "in-review" and .result == "done"')" 1
+  check "T1, otherwise ready, with an open PR: in-review, not ready" eq "$(labels T1)" "$review"
+  check "T1's line" eq "$(line T1 '[.gate, .reasons]')" '["in-review",["in-review: PR #40 is open"]]'
+  check "T1's body names the PR" has "$(body T1)" $'\nGate: in-review\n- in-review: PR #40 is open\n'
+  check "T2: a fork's PR from ticket/T2/* is ignored: ready" eq "$(labels T2)" "$ready"
+  check "T3: closed and merged PRs are ignored: ready" eq "$(labels T3)" "$ready"
+  check "T4: ticket/T44/* is not T4's: ready" eq "$(labels T4)" "$ready"
+  check "T5: blocked on T1 with an open PR: in-review, the wait kept as a reason" \
+    eq "$(line T5 '[.gate, .reasons]')" '["in-review",["blocked: waits on T1","in-review: PR #45 is open"]]'
+  check "T5's labels" eq "$(labels T5)" "$review"
+  # The PR holds the ticket whatever the store says: the reasons are about claiming it, and they
+  # stay in the body for the desk (real adlc's forecast gate failures hit every open ticket).
+  check "T6: in-review wins over needs-desk, the reason kept" \
+    eq "$(line T6 '[.gate, .reasons]')" '["in-review",["rails: none declared","in-review: PR #46 is open"]]'
+  check "T6's labels" eq "$(labels T6)" "$review"
+  local before; before="$(writes)"
+  mir --apply
+  check "a rerun writes nothing" eq "$(writes)" "$before"
+  # T1's PR closes; T4 gets two open PRs.
+  pr_state 40 CLOSED
+  fakegh_pr 60 ticket/T4/a; fakegh_pr 61 ticket/T4/b
+  mir --apply
+  check "T1's PR closed: ready replaces in-review" eq "$(line T1 '[.gate, .add, .remove]')" '["ready",["ready"],["in-review"]]'
+  check "T4 with two open PRs: in-review names both" \
+    eq "$(line T4 '[.gate, .reasons, .add, .remove]')" '["in-review",["in-review: PR #60, #61 is open"],["in-review"],["ready"]]'
+  check "T5 unchanged (still in review, T1 still open)" eq "$(line T5 .action)" '"unchanged"'
+}
+
+case_links() {
+  mir_setup
+  local m='<!-- factory-mirror: generated from the ADLC ticket store by factory/bin/mirror.sh; edits here are overwritten -->'
+  ticket T3 "child, listed first" "$HDR"
+  ticket T4 "parent, created in this run" "$HDR" "T3"
+  ticket T1 "parent with an Issue already" "$HDR" "T3"
+  ticket T5 "completed parent, never mirrored" "$HDR" "T3" true
+  local t; for t in T1 T3 T4 T5; do gated "$t"; done
+  fakegh_issue 7 1761300000 "ready,tier:1,w:light" "parent with an Issue already" "$m"$'\nTicket: T1' app/github-actions true
+  mir --apply
+  check "exit 0" eq "$RC" 0
+  local n4 n3; n4="$(iss T4 .number)"; n3="$(iss T3 .number)"
+  check "the parent T4 is created before its child T3" \
+    eq "$(jq -sc '[.[] | select(.action == "create") | .ticket]' <<<"$OUT")$(( n4 < n3 ))" '["T4","T3"]1'
+  check "T3 links the existing #7, T4's new Issue, and T5 bare (it has none)" \
+    eq "$(dep T3)" "[\"Depends-on: T1 (#7)\",\"Depends-on: T4 (#$n4)\",\"Depends-on: T5\"]"
+  check "no placeholder reaches an Issue" eval '[ "$(jq '"'"'[.issues[].body | select(contains("(#?)"))] | length'"'"' "$FAKE_GH_ISSUES")" = 0 ]'
+  local before; before="$(writes)"
+  mir --apply
+  check "a second run writes nothing" eq "$(writes)" "$before"
+  check "and every line is unchanged" eq "$(lines '.action != "unchanged"')" 0
+  # A parent whose create fails: the child is created with a bare line, linked once the parent exists.
+  ticket T6 "parent whose create fails" "$HDR" "T7"
+  ticket T7 "child of T6" "$HDR"
+  gated T6; gated T7
+  FAKE_GH_FAIL='issue create .*parent whose create fails' mir --apply
+  check "the failed create: exit 1" eq "$RC" 1
+  check "T6 has no Issue, T7's line is bare" eq "$(jq '[.issues[] | select(.body | contains("\nTicket: T6"))] | length' "$FAKE_GH_ISSUES")$(dep T7)" '0["Depends-on: T6"]'
+  mir --apply
+  check "the next run creates T6" eq "$(line T6 '[.action, .result]')" '["create","done"]'
+  # T7's plan was `unchanged` (its bare line equals the unlinked body); T6's create makes it a body edit.
+  check "and in the same run T7 links T6's Issue (a body edit)" \
+    eq "$(line T7 '[.action, .body_changed, .result]')$(dep T7)" "[\"update\",true,\"done\"][\"Depends-on: T6 (#$(iss T6 .number))\"]"
+  before="$(writes)"
+  mir --apply
+  check "then nothing is written" eq "$(writes)" "$before"
+}
+
+case_close_removes_gate_labels() {
+  mir_setup
+  ticket T1 "in review" "$HDR"
+  ticket T2 "blocked child" "$HDR"
+  ticket T3 "parent" "$HDR" "T2"
+  local t; for t in T1 T2 T3; do gated "$t"; done
+  fakegh_pr 40 ticket/T1/alpha
+  mir --apply
+  check "setup: T1 in-review, T2 blocked" \
+    eq "$(labels T1)$(labels T2)" '["in-review","tier:1","w:light"]["blocked","tier:1","w:light"]'
+  gh issue edit "$(iss T1 .number)" --repo test/repo --add-label in-progress >/dev/null
+  set_ticket T1 '.completed = true'; set_ticket T2 '.completed = true'
+  mir --apply
+  check "exit 0" eq "$RC" 0
+  check "T1 closed, in-review removed" eq "$(line T1 '[.action, .remove, .result]')" '["close",["in-review"],"done"]'
+  check "T2 closed, blocked removed" eq "$(line T2 '[.action, .remove, .result]')" '["close",["blocked"],"done"]'
+  check "T1's Issue: closed, in-progress kept" eq "$(iss T1 '[.state, ([.labels[].name] | sort)]')" '["closed",["in-progress","tier:1","w:light"]]'
+  check "T2's Issue: closed, no gate label" eq "$(iss T2 '[.state, ([.labels[].name] | sort)]')" '["closed",["tier:1","w:light"]]'
 }
 
 case_read_failures_write_nothing() {
@@ -584,7 +784,8 @@ case_fake_semantics() {
 adlc() { "$FAKES_DIR/adlc" "$@"; }
 
 for c in creates updates-idempotent ready-only-when-gated rails-required depends-on-lines dry-run-inert closes-completed all-completed \
-         stranger-issues node-needs-desk forecast-file read-failures-write-nothing refuses-apply workflow fake-semantics; do
+         stranger-issues node-needs-desk forecast-file depends-on-blocked forecast-wave-blocked in-review links \
+         close-removes-gate-labels read-failures-write-nothing refuses-apply workflow fake-semantics; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

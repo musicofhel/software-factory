@@ -354,6 +354,44 @@ factory-step2-followups-v1 asked for. The measurements are in specs/factory-step
    it. The choice is Aaron's (HANDOFF Q1 of specs/factory-step3-v1). Until then a real ticket fails its
    test gate on a node, and CI runs the same list on a runner, where it passes.
 
+## Amendment 2026-10-26: T25, the claim across an open PR
+
+Ticket T25 (TB6 of specs/factory-step3-v1) ends the kept lock. Before it, a built ticket's lock stayed
+until the merge, was never heartbeated, and counted toward the node's slots, while the Issue stayed
+`ready`. After 24 h the janitor released it and a second node rebuilt the ticket, and the node's next
+claim was cut `over-slots` (node:G3, merge:G8a, merge:G8b, sim_merge_held). The records are in
+specs/factory-step3-v1/records/TB6.md.
+
+1. **The PR is the claim.** When run.sh has opened (or found) the PR, it labels the Issue `in-review`,
+   removes `ready` and `in-progress`, and releases the lock. From then on an open PR from this
+   repository's `ticket/<id>/*` holds the ticket. claim.sh skips it, the mirror gives it `in-review`,
+   never `ready`, and the janitor keeps a lock left beside such a PR (`pr-open`) and leaves it out of
+   the TTL and the slot count. A fork's branch name proves nothing (`isCrossRepository`), so a stranger
+   cannot hold a ticket by naming a branch after it. The janitor releases any lock whose Issue is
+   closed (`issue-closed`, merge:G8c).
+2. **The lock is checked before every push.** `heartbeat.sh --dry-run` runs before the success push, the
+   desk push and the pause push. Exit 2 (the lock is gone or another node's) is `lock-lost`: nothing is
+   pushed, labeled or commented (node:G13).
+3. **A PR that cannot be opened is retried once.** The pushed sha, fleet's tip and the tamperguard
+   verdict go to the slot state as `pr_pending`. The lock is kept and heartbeated with the state. The
+   next iteration (after the governor) checks the lock and opens the PR again. A second failure is
+   `pr-open-failed`: a desk comment, `needs-desk`, and the lock is released (node:G12).
+4. **The ticket's budget.** adlc 1.12.0's `budget` is a number, a token ceiling that the store does not
+   validate (`@adlc/tickets/schemas/ticket.schema.json:33-35`). run.sh leaves that form to adlc. The
+   SPEC-v0.2 L431 override is a `budget` object with `maxStrikes` and/or `wallClockMinutes` (positive
+   integers). Read with `adlc ticket show` in the worktree, it replaces the weight's values from
+   budget.json, all or nothing: one invalid value keeps the weight's values for both. The ledger line
+   names the source (`ticket`, `weights`, `weights-store-unreadable`, `weights-ticket-budget-invalid`)
+   (node:G14).
+5. **`blocked`.** SPEC-v0.2 L213 defines it. The mirror gives `blocked` instead of `needs-desk` when the
+   only reasons are dependency order: an open parent (`blocked: waits on <ids>`), or a forecast wave
+   behind wave 1. The summoner never fires on it (its label list is exactly needs-approval,
+   needs-acceptance and factory:halt). digest.sh is still a stub, so nothing reads `blocked` there
+   yet. `Depends-on:` lines carry the parent's Issue, `Depends-on: T21 (#2)`. A parent created in the
+   same run is created first and then linked. The line is for humans: the hold reads the store (TB8).
+6. **Ruling (no page; SPEC §TB6).** The forecast's serial order stands. The merge-queue hold of TB8 is
+   defense in depth, because adlc lets a child complete before its parent (merge:G3).
+
 ## Consequences
 
 - SPEC-v0.2's sketch is wrong in five spellings (ralon `--lock`, vetto `--profile`, `cux status --json`,

@@ -7,11 +7,14 @@
 # One fetch reads the remote's nodes branch, refs/locks/issue-* and refs/heads/ticket/**; gh reads
 # the Issues and the open PRs. Then, for every duty:
 #
-#   ready    the open ticket set differs from janitor/state.json on the nodes branch: `adlc
+#   ready    the open ticket set, or the in-review set (the tickets with an open PR from this
+#            repository's ticket/<id>/*), differs from janitor/state.json on the nodes branch: `adlc
 #            merge-forecast --json`, then `mirror.sh --apply --forecast FILE` recomputes the ready
-#            labels. The set is saved only after the mirror succeeds. Open = not completed: `adlc
+#            labels. The sets are saved only after the mirror succeeds. Open = not completed: `adlc
 #            ticket list --json` lists completed tickets too, so each id's `ticket show --json` is
-#            read (as the mirror does) and a completed one is left out; a completion is a change.
+#            read (as the mirror does) and a completed one is left out; a completion is a change. A
+#            PR opened or closed is a change too: the mirror then moves the Issue to or from
+#            `in-review`, so a PR held open never leaves its ticket `ready` for a second build.
 #   previews a deploy record previews/<name>.json on the nodes branch past its expires_at, or whose
 #            pr is no longer open, is torn down ($JANITOR_PREVIEW_HOOK teardown <name> <record-file>)
 #            and the record removed.
@@ -22,11 +25,14 @@
 #            a halt notice sent if it
 #            held any (summon.sh --kind halt), and the manifest moved to archive/nodes/<h>.json.
 #   claims   a lock is released (ref deleted, a comment on the Issue, in-progress removed) when its
-#            commit is older than claim.staleAfterHours, when its node is stale or retired, or when
-#            its node holds more locks than its slots (newest first). A lock whose ticket/<id>/*
-#            branch has a commit newer than claim.staleAfterHours is never released, except one
-#            that is stale, has no open PR for that branch and is older than
-#            claim.unpushedBranchReleaseAfterHours: released, and the branch kept.
+#            Issue is closed (the ticket is done: issue-closed), when its commit is older than
+#            claim.staleAfterHours, when its node is stale or retired, or when its node holds more
+#            locks than its slots (newest first). A lock whose ticket has an open PR from this
+#            repository's ticket/<id>/* is kept (pr-open) and counts toward no slot: the PR holds
+#            the ticket (run.sh releases its lock at the hand-off, ticket T25; a lock left beside a
+#            PR is kept until the Issue closes). A lock whose ticket/<id>/* branch has a commit newer
+#            than claim.staleAfterHours is never released, except one that is stale, has no open PR
+#            and is older than claim.unpushedBranchReleaseAfterHours: released, the branch kept.
 #   branches ticket/<id>/* is deleted when its Issue is closed, or when it had no lock at the start
 #            of the run and no commit for claim.unclaimedBranchDeleteAfterDays. A branch with an
 #            open PR is never deleted (that would close the PR).
@@ -50,7 +56,7 @@ PROG=janitor
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 remote=origin repo=""
 while [ $# -gt 0 ]; do
@@ -172,7 +178,11 @@ ISSUES="$(gh issue list --repo "$REPO" --state all --limit 1000 --json number,st
   jq -c '[.[] | .number as $n | {number, state: (.state | ascii_downcase), labels: [.labels[].name],
                  key: ([(.body // "") | splits("\r?\n") | capture("^ticket:[ \t]*(?<id>[A-Za-z0-9._-]+)[ \t]*$"; "i") | .id]
                        | first // ($n | tostring))}]')" || die "cannot list Issues"
-PRS="$(gh pr list --repo "$REPO" --state open --limit 1000 --json number,headRefName)" || die "cannot list open PRs"
+PRS="$(gh pr list --repo "$REPO" --state open --limit 1000 --json number,headRefName,isCrossRepository)" || die "cannot list open PRs"
+# The tickets in review: an open PR from this repository's ticket/<id>/* (a fork's branch name
+# proves nothing). Sorted ids.
+IN_REVIEW="$(jq -c '[.[] | select(.isCrossRepository != true) | .headRefName
+                     | capture("^ticket/(?<id>[^/]+)/.") | .id] | unique' <<<"$PRS")"
 
 # ------------------------------------------------------------------------------------- plan
 plan_nodes() {  # manifests -> [{handle, owner, path, slots, before, after, age}]
@@ -191,29 +201,33 @@ plan_claims() {  # uses LOCKS BRANCHES PRS ISSUES and the node plan $1
   jq -nc "${TTL_ARGS[@]}" --argjson locks "$LOCKS" --argjson branches "$BRANCHES" --argjson prs "$PRS" \
         --argjson issues "$ISSUES" --argjson nodes "$1" '
     ($issues | map({key: (.number | tostring), value: .}) | from_entries) as $byn
-    | ($prs | map(.headRefName)) as $heads
+    | [$prs[] | select(.isCrossRepository != true)] as $own_prs
     | ($nodes | map({key: .handle, value: .}) | from_entries) as $nodeby
     | [ $locks[] | . as $l | $byn[$l.issue | tostring] as $iss
         | ($iss.key // ($l.issue | tostring)) as $id
         | [ $branches[] | select(.id == $id) ] as $bs
+        | ([$own_prs[] | select(.headRefName | startswith("ticket/\($id)/")) | .number] | min) as $pr
         | {issue, ref, sha, at, holder, payload_slots, age: ($now - .at), ticket: $id,
-           has_issue: ($iss != null), in_progress: (($iss.labels // []) | index("in-progress") != null),
+           has_issue: ($iss != null), issue_closed: ($iss.state == "closed"),
+           in_progress: (($iss.labels // []) | index("in-progress") != null),
            fresh_branch: ([$bs[] | select(($now - .at) <= $stale_s) | .name] | first),
-           open_pr: any($bs[]; .name | IN($heads[])),
+           open_pr: ($pr != null), pr: $pr,
            node: ($nodeby[$l.holder // ""].after // null), node_slots: ($nodeby[$l.holder // ""].slots // null)}
         | .base = (if .node == "retired" then "node-retired" elif .node == "stale" then "node-stale"
                    elif .age > $stale_s then "stale-lock" else null end)
-        | if .base == null then . + {verdict: "hold"}
+        | if .issue_closed then . + {verdict: "release", reason: "issue-closed"}
+          elif .open_pr then . + {verdict: (if .base == null then "hold" else "keep" end), reason: "pr-open"}
+          elif .base == null then . + {verdict: "hold"}
           elif .fresh_branch == null then . + {verdict: "release", reason: .base}
-          elif (.open_pr | not) and .age > $nopr_s then
+          elif .age > $nopr_s then
             . + {verdict: "release", reason: "no-pr-48h", branch_kept: .fresh_branch}
           else . + {verdict: "keep", reason: .base} end ]
     | group_by(.holder // "")
     | map(. as $g
         | ($g[0].node_slots // ([$g[].payload_slots | numbers] | max)) as $limit
-        | ([$g[] | select(.verdict != "release")] | length) as $live
+        | ([$g[] | select(.verdict != "release" and (.open_pr | not))] | length) as $live
         | (if $limit == null or ($g[0].holder == null) then 0 else ([$live - $limit, 0] | max) end) as $excess
-        | ([$g[] | select(.verdict != "release" and .fresh_branch == null)]
+        | ([$g[] | select(.verdict != "release" and .fresh_branch == null and (.open_pr | not))]
            | sort_by(-.at, -.issue) | .[:$excess] | map(.issue)) as $cut
         | $g[] | if (.issue | IN($cut[])) then . + {verdict: "release", reason: "over-slots", slots: $limit} else . end)
     | sort_by(.issue)'
@@ -250,7 +264,7 @@ NODES_EDITS="$WORK/edits"           # fixed nodes-branch edits, "put|rm <TAB> pa
 
 # ------------------------------------------------------------------------------------- ready
 ready_pass() {
-  local line tickets ids id done_ open prev ffile="$WORK/forecast.json" rc=0
+  local line tickets ids id done_ open prev prev_review ffile="$WORK/forecast.json" rc=0
   line='{"action": "ready-recompute"}'
   tickets="$("${ADLC[@]}" ticket list --json)" || { fail_line "$line" "adlc ticket list failed"; return 0; }
   ids="$(jq -r 'if type == "array" then .[].id else error("not a list") end' <<<"$tickets" 2>/dev/null)" ||
@@ -266,7 +280,8 @@ ready_pass() {
   done <<<"$ids"
   open="$(jq -c sort <<<"$open")"
   prev="$(jq -c '.open_set // null' <<<"$STATE")"
-  [ "$open" != "$prev" ] || return 0
+  prev_review="$(jq -c '.in_review // null' <<<"$STATE")"
+  [ "$open" != "$prev" ] || [ "$IN_REVIEW" != "$prev_review" ] || return 0
   if [ "$open" = '[]' ]; then
     # No open ticket: `adlc merge-forecast` exits 1 ("no active tickets found"); the forecast is empty.
     echo '{"pairs":[],"waves":[],"mergeOrder":[],"firstWaveWidth":0,"certifiedWidth":0,"warnings":[],"gateFailures":[]}' >"$ffile"
@@ -276,18 +291,18 @@ ready_pass() {
   if [ "$rc" != 0 ] && [ "$rc" != 2 ] || ! jq -e 'type == "object"' "$ffile" >/dev/null 2>&1; then
     fail_line "$line" "adlc merge-forecast failed (exit $rc)"; return 0
   fi
-  line="$(jq -c --argjson open "$open" --argjson prev "$prev" --argjson rc "$rc" \
+  line="$(jq -c --argjson open "$open" --argjson prev "$prev" --argjson rc "$rc" --argjson review "$IN_REVIEW" \
     '{action: "ready-recompute", open_set: $open, previous: $prev,
-      added: ($open - ($prev // [])), removed: (($prev // []) - $open),
+      added: ($open - ($prev // [])), removed: (($prev // []) - $open), in_review: $review,
       merge_order: .mergeOrder, certified_width: .certifiedWidth, forecast_exit: $rc}' "$ffile")"
   if [ "$apply" = 0 ]; then emit "$line" planned; return 0; fi
   if "$MIRROR" --apply --forecast "$ffile" >&2; then
     emit "$line" "done"
-    jq --argjson open "$open" --arg at "$(epoch_to_iso "$NOW")" \
-      '{open_set: $open, forecast: {mergeOrder, waves, certifiedWidth}, recomputed_at: $at}' "$ffile" >"$WORK/state.json"
+    jq --argjson open "$open" --argjson review "$IN_REVIEW" --arg at "$(epoch_to_iso "$NOW")" \
+      '{open_set: $open, in_review: $review, forecast: {mergeOrder, waves, certifiedWidth}, recomputed_at: $at}' "$ffile" >"$WORK/state.json"
     printf 'put\tjanitor/state.json\t%s\n' "$WORK/state.json" >>"$NODES_EDITS"
   else
-    fail_line "$line" "mirror failed; the open set is not saved, so the next run retries"
+    fail_line "$line" "mirror failed; the open and in-review sets are not saved, so the next run retries"
   fi
 }
 
@@ -385,7 +400,8 @@ node_lines() {  # node-stale / node-retire lines for the node plan, with result 
 # ------------------------------------------------------------------------------------- claims
 reason_text() {  # reason_text <claim-json>
   jq -r --argjson sh "$STALE_H" --argjson nh "$NOPR_H" --argjson nsh "$NODE_STALE_H" --argjson rd "$RETIRE_D" '
-    { "stale-lock": "no heartbeat for more than \($sh) h and no commit on a ticket/\(.ticket)/* branch in the last \($sh) h",
+    { "issue-closed": "the Issue is closed, so the ticket needs no claim",
+      "stale-lock": "no heartbeat for more than \($sh) h and no commit on a ticket/\(.ticket)/* branch in the last \($sh) h",
       "node-stale": "node `\(.holder)` is stale (no heartbeat on the nodes branch for more than \($nsh) h)",
       "node-retired": "node `\(.holder)` is retired (silent for more than \($rd) days)",
       "over-slots": "node `\(.holder)` holds more locks than its \(.slots) slot(s); the newest go first",
@@ -400,7 +416,7 @@ claims_pass() {
     n="$(jq -r .issue <<<"$c")"; ref="$(jq -r .ref <<<"$c")"; sha="$(jq -r .sha <<<"$c")"
     line="$(jq -c '{action: (if .verdict == "keep" then "keep-lock" else "release-lock" end), issue, ref, sha, holder,
                     ticket, reason, lock_age_hours: (.age / 3600 | floor)}
-                   + (if .verdict == "keep" then {kept_for: .fresh_branch} else {} end)
+                   + (if .verdict == "keep" then {kept_for: (if .open_pr then "PR #\(.pr)" else .fresh_branch end)} else {} end)
                    + (if .branch_kept then {branch_kept: .branch_kept} else {} end)' <<<"$c")"
     if jq -e '.verdict == "keep"' <<<"$c" >/dev/null; then emit "$line" kept; continue; fi
     body="janitor: released the claim lock \`$ref\` (held by \`$(jq -r '.holder // "unknown"' <<<"$c")\`, last heartbeat $(epoch_to_iso "$(jq -r .at <<<"$c")")). Reason: $(reason_text "$c"). The Issue is claimable again."

@@ -8,9 +8,12 @@
 #   common: [--repo owner/name] [--manifest nodes/<handle>.json]
 #
 # Claimable = open, labeled `ready` and exactly one known `w:<weight>` with weight <= capacity,
-# oldest first, and no refs/locks/issue-<n>. On --apply it POSTs the lock ref; on 422 or any other
-# error it moves to the next Issue, never retrying the same one. On success it assigns @me, adds
-# `in-progress` and writes the one claim comment. One claim per run (one run loop per slot).
+# oldest first, no refs/locks/issue-<n>, not labeled `in-review`, and no open PR from this
+# repository's ticket/<id>/* for the Issue's `Ticket: <id>` (the PR is the claim once run.sh opens
+# it, ticket T25; the mirror drops `ready` for it, and this covers the hour before). On --apply it
+# POSTs the lock ref; on 422 or any other error it moves to the next Issue, never retrying the same
+# one. On success it assigns @me, adds `in-progress` and writes the one claim comment. One claim per
+# run (one run loop per slot).
 # Nothing claimable, or losing every race, is not an error: exit 0 with "claimed": null. Exit 1
 # when every attempt failed for a reason other than 422 (GitHub unreachable, nodes branch missing).
 #
@@ -22,7 +25,7 @@ PROG=claim
 # shellcheck source=factory/bin/lib/lock.sh
 . "$(dirname "$0")/lib/lock.sh"
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 json=0 check="" capacity="${FACTORY_CAPACITY:-light}" repo="" manifest="" handle="" slots=""
 run_id="${FACTORY_RUN_ID:-}"
@@ -69,16 +72,26 @@ fi
 
 # gh issue list returns newest first and 30 by default; ask for enough and sort ourselves.
 issues="$(gh issue list --repo "$REPO" --state open --label ready --limit 1000 \
-            --json number,title,createdAt,labels)" || die "cannot list ready Issues"
+            --json number,title,createdAt,labels,body)" || die "cannot list ready Issues"
 locks="$(lock_index)" || die "cannot list lock refs"
+prs="$(gh pr list --repo "$REPO" --state open --limit 1000 --json number,headRefName,isCrossRepository)" ||
+  die "cannot list open PRs"
 
-plan="$(jq -c --argjson locks "$locks" --argjson cap "$cap" '
+plan="$(jq -c --argjson locks "$locks" --argjson cap "$cap" --argjson prs "$prs" '
   def rank: {"light": 1, "heavy": 2}[.];
-  [ .[] | . + {weights: [.labels[].name | select(startswith("w:")) | ltrimstr("w:")]} ]
+  [ .[] | . + {weights: [.labels[].name | select(startswith("w:")) | ltrimstr("w:")],
+               ticket: ([(.body // "") | splits("\r?\n") | capture("^Ticket:[ \t]*(?<id>[^ \t]+)[ \t]*$") | .id] | first)} ]
   | sort_by(.createdAt, .number)
   | ($locks | map(.issue)) as $held
+  | [ .[] | . as $i
+      | [$prs[] | select(.isCrossRepository != true and $i.ticket != null
+                         and (.headRefName | startswith("ticket/\($i.ticket)/"))) | .number] as $open
+      | select(($i.labels | map(.name) | index("in-review")) != null or $open != [])
+      | {number, pr: ($open | min)} ] as $review
+  | ($review | map(.number)) as $in_review
   | { locked:     [ .[] | select(.number | IN($held[])) | .number ],
-      candidates: [ .[] | select((.number | IN($held[])) | not)
+      in_review:  $review,
+      candidates: [ .[] | select((.number | IN($held[])) | not) | select((.number | IN($in_review[])) | not)
                         | select((.weights | length) == 1 and (.weights[0] | rank) != null
                                  and (.weights[0] | rank) <= $cap)
                         | {number, title, weight: .weights[0], created_at: .createdAt} ] }' <<<"$issues")"
@@ -93,6 +106,7 @@ emit() {  # emit <claimed|null> <attempts-json> <extra-json>
   if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
     jq -r '"\(.mode) as \(.handle // "(no handle)"), capacity \(.capacity), repo \(.repo)",
            (.locked[] | "  locked     #\(.)"),
+           (.in_review[] | "  in review  #\(.number)\(if .pr then " (PR #\(.pr))" else "" end)"),
            (.candidates[] | "  claimable  #\(.number) w:\(.weight) \(.created_at) \(.title)"),
            (.attempts[] | "  attempt    #\(.issue): \(.result)\(if .detail then " (\(.detail))" else "" end)"),
            (if .mode == "dry-run" then

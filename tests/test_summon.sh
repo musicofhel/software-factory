@@ -137,7 +137,7 @@ case_refuses_other_kinds() {
   summon_setup
   issue_event "$WORLD/ev.json" issue 3 needs-desk "x" ""
   local k
-  for k in factory:halt needs-desk digest HALT "" "halt "; do
+  for k in factory:halt needs-desk blocked in-review digest HALT "" "halt "; do
     DISCORD_WEBHOOK="$HOOK" sm --kind "$k" --apply --event "$WORLD/ev.json"
     check "kind [$k]: exit 2" eq "$RC" 2
   done
@@ -191,6 +191,8 @@ case_workflow_triggers() {
     eq "$(grep -E '^  [a-z_]+:' <<<"$on" | tr -d ' :' | sort | paste -sd,)" "issues,pull_request,push"
   check "the job runs on a push, or on one of the three summons labels" \
     eval 'grep -Fq "contains(fromJSON('"'"'[\"needs-approval\",\"needs-acceptance\",\"factory:halt\"]'"'"'), github.event.label.name)" "$WF"'
+  check "blocked and in-review never summon (T25: a dependant waits, a PR is in review; no human is asked)" \
+    eval '! grep -Eq "\"(blocked|in-review)\"" "$WF"'
   check "the factory:halt label and the push both map to --kind halt" \
     eval 'grep -Fq "KIND: \${{ (github.event_name == '"'"'push'"'"' || github.event.label.name == '"'"'factory:halt'"'"') && '"'"'halt'"'"' || github.event.label.name }}" "$WF"'
   check "the job posts (--apply) with the SUMMONER_WEBHOOK secret" \

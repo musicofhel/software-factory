@@ -27,8 +27,8 @@ not model.
 | desk.write | pass |
 | push.mirror | pass |
 | P.mirror-ready | red: intake:I1 — nothing writes the spec-lint/coldstart/merge-forecast records mirror.sh needs (TB7) |
-| C.mirror-blocked | red: intake:I2 — a child waiting on its parent is `needs-desk`, not `blocked` (TB6) |
-| C.depends-link | red: intake:I12 — `Depends-on: <id>` with no `(#<issue>)` link (TB6) |
+| C.mirror-blocked | pass |
+| C.depends-link | pass |
 | P.claim | pass |
 | P.fleet-preflight | pass |
 | P.node-tamper | pass |
@@ -36,7 +36,7 @@ not model.
 | P.node-scope | pass |
 | P.commit-shape | pass |
 | P.pr-open | pass |
-| P.claim-released | red: node:G3 — the lock is kept across the PR and the Issue stays `ready` (TB6) |
+| P.claim-released | pass |
 | P.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
 | P.pr.context | pass |
 | P.pr.identity | pass |
@@ -65,7 +65,7 @@ not model.
 | P.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
 | P.complete | pass |
 | P.issue-closed | pass |
-| P.lock-released | red: merge:G8c — nothing releases the lock after the merge (TB6) |
+| P.lock-released | pass |
 | C.mirror-ready | pass |
 | C.claim | pass |
 | C.fleet-preflight | pass |
@@ -74,7 +74,7 @@ not model.
 | C.node-scope | pass |
 | C.commit-shape | pass |
 | C.pr-open | pass |
-| C.claim-released | red: node:G3 — the lock is kept across the PR and the Issue stays `ready` (TB6) |
+| C.claim-released | pass |
 | C.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
 | C.pr.context | pass |
 | C.pr.identity | pass |
@@ -103,7 +103,7 @@ not model.
 | C.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
 | C.complete | pass |
 | C.issue-closed | pass |
-| C.lock-released | red: merge:G8c — nothing releases the lock after the merge (TB6) |
+| C.lock-released | pass |
 | S.out-of-scope | pass |
 | S.tamper-skip | pass |
 | S.rail-edit | pass |
@@ -125,8 +125,8 @@ not model.
 | S.queue-conflict | red: merge:G7 — no ejection: no `autorebase` label, no ejections.jsonl (TB9) |
 | S.foreign-trailer | pass |
 | S.foreign-trailer-refused | pass |
-| S.held-24h | red: merge:G8a — the janitor releases the 25 h lock and the Issue stays `ready` for a second build (TB6) |
-| S.built-plus-claim | red: merge:G8b — the built PR's lock counts toward the slot; the new claim is cut `over-slots` (TB6) |
+| S.held-24h | pass |
+| S.built-plus-claim | pass |
 | S.class-halt-add | pass |
 | S.halt-add | red: merge:G17 — adding HALT waits on `gates / <job>` contexts and one approval (TB10) |
 | S.class-halt-remove | pass |

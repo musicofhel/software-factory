@@ -16,6 +16,10 @@
 #   worktree     .worktrees/<id>, detached, at the newest lapsed origin/ticket/<id>/* branch (its
 #                dead-end material goes to fleet's --dead-end-file) or at origin/main; agent.lock
 #                rendered by lib/ralon-lock.sh
+#   budget       maxStrikes and wallClockMinutes of the claim's weight (budget.json), each replaced
+#                by the ticket's own `budget` object from `adlc ticket show` in the worktree when it
+#                holds that key as a positive integer (SPEC-v0.2 L431, node:G14). adlc's `budget` is
+#                a token ceiling when it is a number: that form is adlc's and left to it
 #   fleet        ralon run -C <wt> -- fleet run --tickets <id> --concurrency 1 --no-pr --no-complete
 #                --base <sha> --adapter <a> --max-strikes <n> --wall-clock-minutes <m>
 #                --pre-strike-argv '["<abs>/factory/bin/quota-gate.sh"]' --pre-strike-env <json>
@@ -39,11 +43,20 @@
 #                                   tamperguard (dg_tamper_argv, under vetto + the claim's render of
 #                                   build.toml, $FACTORY_HOME/run/policy/<run id>.build.toml,
 #                                   lib/policy-render.sh; dg_tamper_judge), rails-proof.sh, then
-#                                   scope-check.sh. All pass → push that same sha to
-#                                   ticket/<id>/<handle>, open the PR, comment; the lock stays
-#                                   (released at merge). tamper, a rail edit or a scope failure →
-#                                   comment, label needs-desk, release, no push. A gate error →
-#                                   release, no push, stop the slot (exit 1)
+#                                   scope-check.sh. All pass → check this node still holds the
+#                                   lock (heartbeat.sh dry run; gone or another node's →
+#                                   lock-lost, no push, node:G13), push that same sha to
+#                                   ticket/<id>/<handle>, open the PR, comment; then hand the claim
+#                                   to the PR (T25): label the Issue in-review (ready and
+#                                   in-progress removed), release the lock. The PR is the claim from
+#                                   here: claim.sh and the mirror skip a ticket with an open PR, so
+#                                   it neither holds a slot nor goes stale while it waits. A PR that
+#                                   cannot be opened keeps the lock and the slot state
+#                                   (pr_pending); the next iteration retries it once, then
+#                                   pr-open-failed → comment, label needs-desk, release (node:G12).
+#                                   tamper, a rail edit or a scope failure → comment, label
+#                                   needs-desk, release, no push. A gate error → release, no push,
+#                                   stop the slot (exit 1)
 #     quota-paused | wall-clock     push the partial branch, heartbeat the lock, keep the worktree;
 #                                   the next iteration (after the governor) re-runs the identical
 #                                   fleet argv there, which resumes it. A fourth pause of one claim
@@ -56,7 +69,9 @@
 #                                   release, comment the reason, stop the slot (exit 1): fleet says
 #                                   these need a human, and re-claiming would repeat them
 #   then the worktree and its mirror are removed (except while paused). A mirror that cannot be
-#   built → reason mirror-failed, release, comment, stop the slot (exit 1).
+#   built → reason mirror-failed, release, comment, stop the slot (exit 1). Every push (success,
+#   pause, desk) first checks the lock is still this node's; a lost lock is lock-lost: nothing
+#   pushed, labeled or commented, the claim is someone else's now.
 #
 # Labeling needs-desk: the result comment ends in the needs-desk marker (lib/desk-marker.sh: ticket,
 # the Issue's Ticket-Hash at claim time, reason, handle), written before the label, and the one
@@ -89,7 +104,7 @@ PROG=run
 # shellcheck source=factory/bin/lib/diff-gates.sh
 . "$(dirname "$0")/lib/diff-gates.sh"
 
-usage() { sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,93p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -146,6 +161,7 @@ if [ -z "$FLEET_PIN" ]; then
   for w in "${FLEET[@]}"; do [[ "$w" =~ ^@adlc/cli@(.+)$ ]] && FLEET_PIN="${BASH_REMATCH[1]}"; done
 fi
 read -r -a SLEEP <<<"${FACTORY_SLEEP:-sleep}"
+read -r -a ADLC <<<"${FACTORY_ADLC:-npx -y @adlc/cli@1.12.0}"
 B="$FACTORY_ROOT/factory/bin"
 COMMON=(--repo "$REPO" --manifest "$M" --handle "$HANDLE")
 
@@ -198,7 +214,7 @@ serial() {  # serial <cmd...>: one at a time per node (governor fetches, git fet
 # Per-iteration variables. REC accumulates the ledger line.
 reset_iteration() {
   ISSUE="" TICKET="" TICKET_HASH="" WEIGHT="" WT="" BASE="" BASE_KIND="" LAPSED="" RUN_ID="" RESUMES=0 FLEET_ARGV='[]'
-  MAX_STRIKES=0 WALL_MIN=0 STRIKES=0 FLEET_RUN=unknown REASON="" NEXT_SLEEP=0 STOP_RC="" LOGBASE="" DOC=""
+  MAX_STRIKES=0 WALL_MIN=0 STRIKES=0 FLEET_RUN=unknown REASON="" NEXT_SLEEP=0 STOP_RC="" LOGBASE="" DOC="" PR_PENDING=null
   REC="$(jq -cn --argjson s "$slot" --argjson i "$ITER" --arg at "$(epoch_to_iso "$(now_epoch)")" --arg h "$HANDLE" \
           --arg a "$ADAPTER@$ADAPTER_VERSION" \
     '{slot: $s, iteration: $i, at: $at, handle: $h, adapter: $a, tokens: null, actions: []}')"
@@ -207,12 +223,12 @@ rec() { REC="$(jq -c "$@" <<<"$REC")"; }
 act() { rec --arg a "$1" '.actions += [$a]'; }
 outcome() { rec --arg o "$1" '.outcome = $o'; }
 
-state_save() {
+state_save() {  # state_save <lock-beat-epoch>; PR_PENDING (null or the PR to retry) is saved with it
   jq -cn --argjson n "$ISSUE" --arg t "$TICKET" --arg th "$TICKET_HASH" --arg w "$WEIGHT" --arg wt "$WT" --arg b "$BASE" --arg bk "$BASE_KIND" \
          --arg l "$LAPSED" --arg r "$RUN_ID" --argjson res "$RESUMES" --argjson argv "$FLEET_ARGV" \
-         --argjson ms "$MAX_STRIKES" --argjson beat "$1" --arg reason "$REASON" \
+         --argjson ms "$MAX_STRIKES" --argjson beat "$1" --arg reason "$REASON" --argjson pr "$PR_PENDING" \
     '{issue: $n, ticket: $t, ticket_hash: $th, weight: $w, worktree: $wt, base: $b, base_kind: $bk, lapsed: $l, run_id: $r,
-      resumes: $res, fleet_argv: $argv, max_strikes: $ms, lock_beat_at: $beat, paused_reason: $reason}' >"$STATE.tmp"
+      resumes: $res, fleet_argv: $argv, max_strikes: $ms, lock_beat_at: $beat, paused_reason: $reason, pr_pending: $pr}' >"$STATE.tmp"
   mv -f "$STATE.tmp" "$STATE"
 }
 state_load() {
@@ -223,6 +239,7 @@ state_load() {
   LAPSED="$(jq -r .lapsed <<<"$s")" RUN_ID="$(jq -r .run_id <<<"$s")" RESUMES="$(jq -r .resumes <<<"$s")"
   FLEET_ARGV="$(jq -c .fleet_argv <<<"$s")" MAX_STRIKES="$(jq -r .max_strikes <<<"$s")"
   LOCK_BEAT_AT="$(jq -r .lock_beat_at <<<"$s")"
+  PR_PENDING="$(jq -c '.pr_pending // null' <<<"$s")"
   valid_issue "$ISSUE" && valid_ticket_id "$TICKET" && [[ "$RESUMES" =~ ^[0-9]+$ && "$LOCK_BEAT_AT" =~ ^[0-9]+$ ]] ||
     die "slot state $STATE is unreadable; inspect it, then remove it"
   LOGBASE="$RUN_DIR/logs/$RUN_ID"
@@ -232,6 +249,18 @@ state_load() {
 release_lock() {
   if "$B/release.sh" "$ISSUE" --apply "${COMMON[@]}" >/dev/null 2>>"$LOGBASE.err"; then act release-lock
   else act release-lock-failed; warn "could not release the lock on #$ISSUE"; fi
+}
+lock_check() {  # heartbeat.sh dry run before a push: 0 this node holds the lock, 2 lost, 1 unknown
+  local rc=0
+  "$B/heartbeat.sh" "$ISSUE" --dry-run "${COMMON[@]}" >/dev/null 2>>"$LOGBASE.err" || rc=$?
+  case "$rc" in 0) act lock-owned ;; 2) act lock-lost; return 2 ;; *) act lock-check-failed; return 1 ;; esac
+}
+lock_lost() { REASON=lock-lost; outcome lock-lost; wt_remove; rm -f "$STATE"; }
+handoff() {  # the PR is the claim now (T25): the Issue goes in-review, then the lock is released
+  if gh issue edit "$ISSUE" --repo "$REPO" --add-label in-review --remove-label ready,in-progress >/dev/null 2>>"$LOGBASE.err"; then
+    act label-in-review
+  else act label-in-review-failed; fi
+  release_lock
 }
 heartbeat_lock() {  # exit 2 from heartbeat.sh = the lock is gone or another node's
   local rc=0
@@ -323,6 +352,32 @@ wt_make() {
   grep -qxF /.factory-run/ "$exclude" 2>/dev/null || printf '/.factory-run/\n' >>"$exclude"
   act "worktree $BASE_KIND"
   if [ -n "$LAPSED" ]; then run_dead_end "$LAPSED" "$WT/.factory-run/dead-end.md"; act dead-end-material; fi
+}
+
+# ------------------------------------------------------------------ budget
+ticket_budget() {  # sets MAX_STRIKES, WALL_MIN (the weight's, budget.json) and BUDGET_SOURCE
+  local shown b k v
+  MAX_STRIKES="$(budget ".weights.\"$WEIGHT\".maxStrikes")"
+  WALL_MIN="$(budget ".weights.\"$WEIGHT\".wallClockMinutes")"
+  BUDGET_SOURCE=weights
+  # The ticket's own budget, read from the store the claim builds on (the worktree's).
+  if ! shown="$(cd "$WT" && "${ADLC[@]}" ticket show "$TICKET" --json 2>>"$LOGBASE.err")" ||
+     ! b="$(jq -ce --arg t "$TICKET" 'select(.ticket.id == $t) | [.ticket.budget // null]' <<<"$shown" 2>/dev/null)"; then
+    BUDGET_SOURCE=weights-store-unreadable; return 0
+  fi
+  b="$(jq -c '.[0]' <<<"$b")"
+  [ "$(jq -r 'type' <<<"$b")" = object ] || return 0       # none, or adlc's token ceiling (a number)
+  for k in maxStrikes wallClockMinutes; do
+    v="$(jq -r --arg k "$k" 'if has($k) then .[$k] | if type == "number" then tostring else "invalid" end else "" end' <<<"$b")"
+    [ -n "$v" ] || continue
+    if ! [[ "$v" =~ ^[1-9][0-9]{0,3}$ ]]; then BUDGET_SOURCE=weights-ticket-budget-invalid; break; fi
+    case "$k" in maxStrikes) MAX_STRIKES="$v" ;; wallClockMinutes) WALL_MIN="$v" ;; esac
+    BUDGET_SOURCE=ticket
+  done
+  if [ "$BUDGET_SOURCE" = weights-ticket-budget-invalid ]; then   # all or nothing: never half a bad override
+    MAX_STRIKES="$(budget ".weights.\"$WEIGHT\".maxStrikes")"
+    WALL_MIN="$(budget ".weights.\"$WEIGHT\".wallClockMinutes")"
+  fi
 }
 
 # ------------------------------------------------------------------ fleet
@@ -441,25 +496,70 @@ on_success() {
     *) rec '.scope_check = "error"'
        REASON=scope-check-error; outcome released; finish_release 1 0 1; return ;;
   esac
+  local lrc=0
+  lock_check || lrc=$?
+  case "$lrc" in
+    0) ;;
+    2) lock_lost; return ;;
+    *) REASON=lock-check-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return ;;
+  esac
   push_sha "$GATE_HEAD" || { REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
-  local open pr="" url facts_pr
-  open="$(gh pr list --repo "$REPO" --head "ticket/$TICKET/$HANDLE" --state open --json number 2>>"$LOGBASE.err" | jq -r '.[0].number // empty')" || open=""
-  if [ -n "$open" ]; then pr="$open"; act pr-exists
+  PR_PENDING="$(jq -cn --arg sha "$PUSHED_SHA" --arg tip "$tip" --arg v "$verdict" --argjson s "$score" --argjson f "$findings" \
+    --arg run "$FLEET_RUN" --argjson st "$STRIKES" \
+    '{sha: $sha, tip: $tip, tamperguard: {verdict: $v, score: $s, findings: $f}, fleet_run: $run, strikes: $st, tries: 0}')"
+  wt_remove   # the pushed sha is all the PR needs; fleet's tip stays under refs/factory/fleet/<run id>
+  pr_open
+}
+# pr_open: open (or find) the PR for the pushed sha in PR_PENDING, then hand the claim to it. A PR
+# that cannot be opened keeps the lock and saves PR_PENDING in the slot state for one retry on the
+# next iteration; a second failure goes to the desk (pr-open-failed).
+pr_open() {
+  local found prn="" url facts_pr tries
+  PUSHED_SHA="$(jq -r .sha <<<"$PR_PENDING")"
+  tries="$(jq -r '.tries + 1' <<<"$PR_PENDING")"
+  found="$(gh pr list --repo "$REPO" --head "ticket/$TICKET/$HANDLE" --state open --json number 2>>"$LOGBASE.err" | jq -r '.[0].number // empty')" || found=""
+  if [ -n "$found" ]; then prn="$found"; act pr-exists
   else
-    facts_pr="$(facts "ticket/$TICKET/$HANDLE" "$PUSHED_SHA" | jq -c --arg v "$verdict" --argjson s "$score" --argjson f "$findings" \
-      --argjson g "$(run_gate_hashes "$tip")" '. + {tamperguard: {verdict: $v, score: $s, findings: $f}, gates: $g}')"
+    facts_pr="$(facts "ticket/$TICKET/$HANDLE" "$PUSHED_SHA" | jq -c --argjson p "$PR_PENDING" \
+      --argjson g "$(run_gate_hashes "$(jq -r .tip <<<"$PR_PENDING")")" '. + {tamperguard: $p.tamperguard, gates: $g}')"
     if url="$(run_pr_body "$facts_pr" | gh pr create --repo "$REPO" --base main --head "ticket/$TICKET/$HANDLE" \
                  --title "$TICKET: built by $HANDLE (issue #$ISSUE)" --body-file - 2>>"$LOGBASE.err")"; then
-      pr="$(sed -nE 's#.*/pull/([0-9]+)$#\1#p' <<<"$url" | tail -n1)"; act pr-open
+      prn="$(sed -nE 's#.*/pull/([0-9]+)$#\1#p' <<<"$url" | tail -n1)"; act pr-open
     else act pr-open-failed; fi
   fi
-  [ -z "$pr" ] || rec --argjson p "$pr" '.pr = $p'
-  comment built "ticket/$TICKET/$HANDLE" "$PUSHED_SHA" "${pr:-null}"
-  outcome built
-  act keep-lock
-  wt_remove; rm -f "$STATE"
+  if [ -n "$prn" ]; then
+    rec --argjson p "$prn" '.pr = $p'
+    comment built "ticket/$TICKET/$HANDLE" "$PUSHED_SHA" "$prn"
+    handoff
+    outcome built; PR_PENDING=null; rm -f "$STATE"
+  elif [ "$tries" -lt 2 ]; then
+    PR_PENDING="$(jq -c --argjson t "$tries" '.tries = $t' <<<"$PR_PENDING")"
+    heartbeat_lock || act heartbeat-lock-lost   # the retry's lock check acts on a lost lock
+    state_save "$(now_epoch)"
+    act keep-lock
+    outcome pr-pending; NEXT_SLEEP="$UNKNOWN_S"
+  else
+    REASON=pr-open-failed; outcome desk
+    comment desk "ticket/$TICKET/$HANDLE" "$PUSHED_SHA"; label_desk; release_lock
+    PR_PENDING=null; rm -f "$STATE"
+  fi
+}
+pr_retry() {  # the slot state holds a pushed sha whose PR could not be opened: try once more
+  act pr-retry
+  STRIKES="$(jq -r '.strikes // 0' <<<"$PR_PENDING")"; FLEET_RUN="$(run_id_safe "$(jq -r '.fleet_run // empty' <<<"$PR_PENDING")")"
+  rec --arg s "$(jq -r .sha <<<"$PR_PENDING")" '.pr_retry = {sha: $s}'
+  local lrc=0
+  lock_check || lrc=$?
+  case "$lrc" in
+    0) pr_open ;;
+    2) lock_lost ;;
+    *) outcome pr-pending; NEXT_SLEEP="$UNKNOWN_S" ;;      # cannot tell: keep the state, ask again
+  esac
 }
 on_desk() {  # strikes-exhausted | flail (and a pause past the resume cap)
+  local lrc=0
+  lock_check || lrc=$?
+  if [ "$lrc" = 2 ]; then lock_lost; return; fi
   push_record "$(worker_tip)" "$REASON" "Fleet-Reason: $REASON" "Fleet-Strikes: $STRIKES" || true
   comment desk "${PUSHED_SHA:+ticket/$TICKET/$HANDLE}" "$PUSHED_SHA"
   label_desk
@@ -471,6 +571,9 @@ on_pause() {
     rec --argjson m "$MAX_RESUMES" '.note = "resume cap \($m) reached"'
     on_desk; return
   fi
+  local lrc=0
+  lock_check || lrc=$?
+  if [ "$lrc" = 2 ]; then lock_lost; return; fi
   push_record "$(worker_tip)" "$REASON" "Fleet-Reason: $REASON" "Fleet-Strikes: $STRIKES" || true
   if ! heartbeat_lock; then
     REASON=lock-lost; outcome lock-lost; wt_remove; rm -f "$STATE"; return
@@ -539,6 +642,10 @@ iteration() {
     *) outcome governor-error; STOP_RC=1; return ;;
   esac
 
+  if [ -f "$STATE" ] && [ "$PR_PENDING" != null ]; then  # the built ticket's PR, once more
+    LOGBASE="$RUN_DIR/logs/$RUN_ID"
+    pr_retry; return
+  fi
   if [ -f "$STATE" ]; then  # resume the paused claim: the identical argv, in the same worktree
     act resume
     if [ ! -d "$WT" ]; then REASON=worktree-missing; outcome released; finish_release 1 0 1; return; fi
@@ -556,8 +663,6 @@ iteration() {
   WEIGHT="$(jq -r --argjson n "$ISSUE" '.candidates[] | select(.number == $n) | .weight' <<<"$c")"
   rec --argjson n "$ISSUE" --arg r "$RUN_ID" --arg w "$WEIGHT" '.issue = $n | .run_id = $r | .weight = $w'
   act claim
-  MAX_STRIKES="$(budget ".weights.\"$WEIGHT\".maxStrikes")"
-  WALL_MIN="$(budget ".weights.\"$WEIGHT\".wallClockMinutes")"
   issues="$(gh issue list --repo "$REPO" --state open --limit 1000 --json number,body 2>>"$LOGBASE.err")" || issues='[]'
   issue="$(jq -c --argjson n "$ISSUE" '[.[] | select(.number == $n)][0] // {}' <<<"$issues")"
   TICKET="$(run_ticket_of_issue "$issue")"
@@ -579,8 +684,10 @@ iteration() {
     REASON="$([ "$lrc" = 2 ] && echo rails-refused || echo rails-lock-failed)"; outcome released; finish_release 1 0 1; return
   fi
   act ralon-lock
+  ticket_budget
   FLEET_ARGV="$(fleet_argv)"
-  rec --argjson ms "$MAX_STRIKES" --argjson wm "$WALL_MIN" '.budget = {max_strikes: $ms, wall_clock_minutes: $wm}'
+  rec --argjson ms "$MAX_STRIKES" --argjson wm "$WALL_MIN" --arg src "$BUDGET_SOURCE" \
+    '.budget = {max_strikes: $ms, wall_clock_minutes: $wm, source: $src}'
   if ! run_fleet; then REASON=mirror-failed; outcome released; finish_release 1 0 1; return; fi
   dispatch
 }

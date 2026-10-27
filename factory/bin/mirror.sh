@@ -12,14 +12,17 @@
 #
 #   open ticket       one Issue: created if missing, reopened if closed, and its title, body and
 #                     labels edited only where they differ (a run with nothing new writes nothing)
-#   completed ticket  its Issue is closed (reason completed, `ready` removed); none is created
+#   completed ticket  its Issue is closed (reason completed; ready, blocked and in-review removed);
+#                     none is created
 #
-# The Issue body is the marker line, `Ticket: <id>`, one `Depends-on: <id>` per ticket holding an
-# edge to this one (ADLC edges point prerequisite → dependent), `Ticket-Hash: <ticketHash>` (the
-# store state a node claims; run.sh copies it into its needs-desk marker), the gate verdict and its
-# reasons, then the ticket body verbatim. Labels: `w:<weight>` and `tier:<n>` from the body header
-# (`weight: light|heavy`, `tier: 0|1|2`, `charter: C<n>`), plus `ready` when all of these hold and
-# `needs-desk` otherwise:
+# The Issue body is the marker line, `Ticket: <id>`, one `Depends-on: <id> (#<issue>)` per ticket
+# holding an edge to this one (ADLC edges point prerequisite → dependent; the `(#<issue>)` link is
+# the parent's mirror Issue, left off while it has none: an Issue created in the same run is linked
+# once it exists, parents first), `Ticket-Hash: <ticketHash>` (the store state a node claims; run.sh
+# copies it into its needs-desk marker), the gate verdict and its reasons, then the ticket body
+# verbatim. The dependency itself is read from the store, never from this line (TB8). Labels:
+# `w:<weight>` and `tier:<n>` from the body header (`weight: light|heavy`, `tier: 0|1|2`,
+# `charter: C<n>`), plus exactly one gate label: `ready` when all of these hold,
 #   header          weight, tier and charter parse
 #   rails           the ticket declares at least one rail (the desk's convention is `factory/policy/**`
 #                   at least, factory/RULES.md and ADR-0002); fleet's rails-guard fails every strike
@@ -31,13 +34,22 @@
 #   merge-forecast  the ticket has a merge-forecast record that is not a failure, and the forecast
 #                   certifies it now: no forecast gateFailures, the ticket is in wave 1, and no
 #                   SEQUENCE pair puts it behind a wave-1 ticket earlier in mergeOrder
+#   parents         every ticket with an edge to it is completed (reason `blocked: waits on <ids>`;
+#                   the forecast's serial order stands, the queue's Depends-on hold is the backstop)
+# `blocked` (SPEC-v0.2 L213) instead of `needs-desk` when the only reasons are dependency order: an
+# open parent, or the forecast's `in wave <k>, not wave 1`. A dependant is healthy, not a dead letter
+# for the desk, and nothing summons for it. `needs-desk` for any other reason. `in-review` instead of
+# any of them while an open PR from this repository's `ticket/<id>/*` exists (run.sh hands the
+# claim to the PR, ticket T25): the PR is the claim, so no node may build the ticket again, and the
+# reasons above are about claiming it. They stay listed in the body for the desk to read.
 # One exception (step-2 ruling Q3, factory/RULES.md): an open Issue a node labeled `needs-desk` keeps
 # it, and gets no `ready`, while its newest trusted marker-or-claim comment is the run loop's
 # needs-desk marker for this ticket at the store's current ticketHash (format and rule:
 # factory/bin/lib/desk-marker.sh). A desk edit (a new ticketHash) or a new claim cycle (a claim
 # comment after the marker) ends the hold; a `needs-desk` without the marker is recomputed as above.
-# Other labels (in-progress, ...) are never touched. An Issue is the mirror's when its author is in
-# MIRROR_AUTHORS and its body has a `Ticket: <id>` line (the first one counts); the marker line is a
+# Other labels (in-progress, ...) are never touched; `in-review` is created when the repo lacks it,
+# because run.sh adds it at the hand-off before the mirror may have. An Issue is the mirror's when
+# its author is in MIRROR_AUTHORS and its body has a `Ticket: <id>` line (the first one counts); the marker line is a
 # notice for humans, not proof, so a hand edit that keeps the Ticket line is overwritten on the next
 # run, while a mirror Issue wiped of its Ticket line is reported as an orphan and a fresh Issue is
 # created. A human's Issue is never adopted. A bot outside MIRROR_AUTHORS carrying the marker is a
@@ -64,7 +76,7 @@ PROG=mirror
 # shellcheck source=factory/bin/lib/desk-marker.sh
 . "$(dirname "$0")/lib/desk-marker.sh"
 
-usage() { sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,71p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 forecast="" repo=""
 while [ $# -gt 0 ]; do
@@ -145,6 +157,11 @@ gh issue list --repo "$REPO" --state open --label needs-desk --limit "$LIMIT" --
 [ "$(jq length "$WORK/desk.json")" -lt "$LIMIT" ] || die "gh returned $LIMIT needs-desk Issues, its limit; the list may be truncated"
 gh label list --repo "$REPO" --json name --limit "$LIMIT" >"$WORK/labels.json" || die "gh label list failed"
 [ "$(jq length "$WORK/labels.json")" -lt "$LIMIT" ] || die "gh returned $LIMIT labels, its limit; the list may be truncated"
+# Open PRs: a ticket with an open PR from this repository's ticket/<id>/* is in review (a fork's
+# branch name proves nothing, so a stranger cannot hold a ticket by naming a branch after it).
+gh pr list --repo "$REPO" --state open --limit "$LIMIT" --json number,headRefName,isCrossRepository \
+  >"$WORK/prs.json" || die "gh pr list failed"
+[ "$(jq length "$WORK/prs.json")" -lt "$LIMIT" ] || die "gh returned $LIMIT open PRs, its limit; the list may be truncated"
 
 # ------------------------------------------------------------------------------------- plan
 # Pure: tickets, gate records, forecast and Issues in; one action object per line out.
@@ -153,7 +170,9 @@ def lines: gsub("\r"; "") | split("\n");
 def norm: gsub("\r"; "") | sub("\\s+$"; "");
 def etype: .type // .gate;
 def latest($g; $id): [$E[] | select(etype == $g and .ticket == $id)] | last;
-def owned: test("^(ready|needs-desk|w:.+|tier:.+)$");
+def owned: test("^(ready|needs-desk|blocked|in-review|w:.+|tier:.+)$");
+# Dependency order only: what `blocked` stands for (a forecast wave behind wave 1, an open parent).
+def dependency: test("^(merge-forecast: in wave [0-9]+, not wave 1|blocked: waits on .+)$");
 
 def header:
   (.body | lines) as $l | ($l | index("")) as $i
@@ -218,7 +237,8 @@ def record_reasons($t):
       | if $k == null then ["merge-forecast: not in the forecast"] else ["merge-forecast: in wave \($k + 1), not wave 1"] end
     end;
 
-[ $I[] | (.body // "") as $b
+($P | map(select(.isCrossRepository != true))) as $same_prs
+| [ $I[] | (.body // "") as $b
   | . + {tid: ([$b | lines | .[] | (capture("^Ticket:[ \t]*(?<id>[^ \t]+)[ \t]*$") | .id)?] | first),
          labels: [.labels[].name], marked: ($b | contains($marker))} ] as $issues
 | [$issues[] | select(.author.login | IN($authors[]))] as $mine
@@ -233,35 +253,49 @@ def record_reasons($t):
     end;
 [$issues[] | select(.marked and (.author.login | IN($authors[]) | not) and .author.is_bot == true)] as $impostors
 | ($T | map(.id)) as $ids
+| ($T | map({key: .id, value: .completed}) | from_entries) as $done
+| def issue_of($id): [$mine[] | select(.tid == $id) | .number] | min;
 
-| ( $T[] as $t
+  ( $T[] as $t
     | ([$mine[] | select(.tid == $t.id)] | sort_by(.number)) as $own
     | ($own[0] // null) as $cur
     | [$impostors[] | select(.tid == $t.id)] as $imp
     | ( if $t.completed then
           if $cur != null and $cur.state == "OPEN" then
-            {action: "close", ticket: $t.id, issue: $cur.number, add: [], remove: [$cur.labels[] | select(. == "ready")]}
+            {action: "close", ticket: $t.id, issue: $cur.number, add: [],
+             remove: [$cur.labels[] | select(IN("ready", "blocked", "in-review"))]}
           else empty end
         elif $cur == null and ($imp | length) > 0 then empty
         else
           ($t | header) as $h
-          | (header_reasons($h) + rails_reasons($t) + record_reasons($t) + forecast_reasons($t.id)) as $store
+          | ([$T[] | select(any(.edges[]?; .to == $t.id)) | .id] | unique) as $deps
+          | [$deps[] | select($done[.] != true)] as $open_parents
+          | (header_reasons($h) + rails_reasons($t) + record_reasons($t) + forecast_reasons($t.id)
+             + if $open_parents == [] then [] else ["blocked: waits on \($open_parents | join(", "))"] end) as $store
           | desk_hold($cur; $t) as $hold
           | ($store + if $hold == null then []
                       else ["node: `\($hold.node)` stopped it (\($hold.reason)); needs-desk holds until the ticket changes or a new claim"]
                       end) as $reasons
-          | (if $reasons == [] then "ready" else "needs-desk" end) as $gate
+          | ([$same_prs[] | select(.headRefName | startswith("ticket/\($t.id)/")) | .number] | sort) as $prs
+          | (if $prs != [] then "in-review"
+             elif ($reasons | all(dependency) | not) then "needs-desk"
+             elif $reasons == [] then "ready"
+             else "blocked" end) as $gate
+          | ($reasons + if $gate == "in-review" then ["in-review: PR \($prs | map("#\(.)") | join(", ")) is open"] else [] end) as $reasons
           | ([if ($h.weight | weight_ok) then "w:\($h.weight)" else empty end]
              + [if ($h.tier | tier_ok) then "tier:\($h.tier)" else empty end] + [$gate]) as $want
-          | ([$T[] | select(any(.edges[]?; .to == $t.id)) | .id] | unique) as $deps
+          | [$deps[] | {id: ., issue: issue_of(.)}] as $links
           | ($t.title | norm | sub("^\\s+"; "") | if . == "" then "Ticket \($t.id)" else . end) as $title
-          | ([$marker, "Ticket: \($t.id)"] + ($deps | map("Depends-on: \(.)")) + ["Ticket-Hash: \($t.hash)"]
+          | ([$marker, "Ticket: \($t.id)"]
+             + ($links | map("Depends-on: \(.id)" + if .issue == null then " (#?)" else " (#\(.issue))" end))
+             + ["Ticket-Hash: \($t.hash)"]
              + ["", "Gate: \($gate)"] + ($reasons | map("- " + .)) + ["", "---", "", ($t.body | norm)]
              | join("\n") | norm) as $body
-          | {ticket: $t.id, gate: $gate, reasons: $reasons, desk_hold: $hold, title: $title, body: $body}
+          | {ticket: $t.id, gate: $gate, reasons: $reasons, desk_hold: $hold, title: $title, body: $body,
+             pending: [$links[] | select(.issue == null) | .id]}
           + if $cur == null then {action: "create", issue: null, add: $want, remove: []}
             else ($want - $cur.labels) as $add | ([$cur.labels[] | select(owned)] - $want) as $rm
-              | ($cur.title != $title) as $tc | (($cur.body // "" | norm) != $body) as $bc
+              | ($cur.title != $title) as $tc | (($cur.body // "" | norm) != ($body | gsub(" \\(#\\?\\)"; ""))) as $bc
               | {issue: $cur.number, add: $add, remove: $rm, title_changed: $tc, body_changed: $bc,
                  action: (if $cur.state != "OPEN" then "reopen"
                           elif $tc or $bc or ($add | length) > 0 or ($rm | length) > 0 then "update"
@@ -277,10 +311,10 @@ def record_reasons($t):
     | {action: "orphan", ticket: .tid, issue: .number, reason: "a mirror Issue whose ticket is not in the store; left as is"} )
 '
 plan="$(jq -c -n --slurpfile T "$WORK/tickets.jsonl" --slurpfile GM "$WORK/gm.json" --slurpfile FF "$WORK/forecast.json" \
-  --slurpfile II "$WORK/issues.json" --slurpfile DD "$WORK/desk.json" --arg marker "$MARKER" --argjson authors "$AUTHORS" \
+  --slurpfile II "$WORK/issues.json" --slurpfile DD "$WORK/desk.json" --slurpfile PP "$WORK/prs.json" --arg marker "$MARKER" --argjson authors "$AUTHORS" \
   --arg desk_re "$DESK_MARKER_RE" --arg claim_re "$DESK_CLAIM_RE" --argjson desk_trusted "$DESK_TRUSTED" \
   --argjson desk_cap "$DESK_COMMENT_CAP" \
-  "$DESK_JQ"'$T as $T | $GM[0].entries as $E | $FF[0] as $F | $II[0] as $I | $DD[0] as $D | '"$PLAN_JQ")" || die "could not compute the plan"
+  "$DESK_JQ"'$T as $T | $GM[0].entries as $E | $FF[0] as $F | $II[0] as $I | $DD[0] as $D | $PP[0] as $P | '"$PLAN_JQ")" || die "could not compute the plan"
 
 # ------------------------------------------------------------------------------------- write
 emit() {  # emit <plan-object> <result> [detail]
@@ -293,11 +327,12 @@ gh_detail() { tail -n1 "$ERR"; }
 
 label_color() {
   case "$1" in
-    ready) echo 0e8a16 ;; needs-desk) echo d93f0b ;; w:*) echo 1d76db ;; *) echo 5319e7 ;;
+    ready) echo 0e8a16 ;; needs-desk) echo d93f0b ;; blocked) echo fbca04 ;; in-review) echo 0052cc ;;
+    w:*) echo 1d76db ;; *) echo 5319e7 ;;
   esac
 }
 missing_labels="$(jq -r -n --argjson have "$(jq -c 'map(.name)' "$WORK/labels.json")" \
-  '[inputs | (.add // [])[]] | unique - $have | .[]' <<<"$plan")"
+  '[inputs | (.add // [])[]] + ["in-review"] | unique - $have | .[]' <<<"$plan")"
 while IFS= read -r l; do
   [ -n "$l" ] || continue
   line="$(jq -cn --arg l "$l" '{action: "label-create", label: $l}')"
@@ -310,9 +345,22 @@ while IFS= read -r l; do
 done <<<"$missing_labels"
 
 csv() { jq -r "$1 | join(\",\")" <<<"$2"; }
+# Parents first: a line whose Depends-on parent gets its Issue in this run waits for that create, so
+# its body links the new number. CREATED maps ticket → the Issue number created in this run.
+CREATED='{}'
+order="$(jq -sc '
+  def step: ([.left[] | select(.action == "create") | .ticket]) as $wait
+    | [.left[] | select([(.pending // [])[] | select(IN($wait[]))] == [])] as $go
+    | if $go == [] then {left: [], out: (.out + .left)} else {left: (.left - $go), out: (.out + $go)} end;
+  {left: ., out: []} | until(.left == []; step) | .out[]' <<<"$plan")"
 while IFS= read -r p; do
   [ -n "$p" ] || continue
   action="$(jq -r .action <<<"$p")"
+  # A parent created above links an Issue whose body is otherwise unchanged: that is a body edit.
+  if [ "$apply" = 1 ] && [ "$action" = unchanged ] &&
+     jq -e --argjson c "$CREATED" 'any((.pending // [])[]; $c[.] != null)' <<<"$p" >/dev/null; then
+    p="$(jq -c '.action = "update" | .body_changed = true' <<<"$p")"; action=update
+  fi
   case "$action" in
     unchanged) emit "$p" unchanged; continue ;;
     conflict) FAILED=1; emit "$p" conflict; continue ;;
@@ -320,7 +368,10 @@ while IFS= read -r p; do
   esac
   if [ "$apply" = 0 ]; then emit "$p" planned; continue; fi
   n="$(jq -r '.issue // empty' <<<"$p")"
-  jq -j '.body // ""' <<<"$p" >"$WORK/body.md"
+  # Link the parents created in this run; a parent with no Issue yet stays a bare `Depends-on: <id>`.
+  jq -j --argjson c "$CREATED" '.body // "" | reduce ($c | to_entries[]) as $e (.;
+      split("Depends-on: \($e.key) (#?)") | join("Depends-on: \($e.key) (#\($e.value))"))
+    | gsub(" \\(#\\?\\)"; "")' <<<"$p" >"$WORK/body.md"
   add="$(csv .add "$p")"; rm_l="$(csv .remove "$p")"
   case "$action" in
     create)
@@ -328,7 +379,9 @@ while IFS= read -r p; do
       while IFS= read -r l; do [ -z "$l" ] || largs+=(--label "$l"); done < <(jq -r '.add[]' <<<"$p")
       if gh_try gh issue create --repo "$REPO" --title "$(jq -r .title <<<"$p")" --body-file "$WORK/body.md" "${largs[@]}"; then
         url="$(tail -n1 "$WORK/gh.out")"; n="${url##*/}"
-        if valid_issue "$n"; then emit "$(jq -c --argjson n "$n" '.issue = $n' <<<"$p")" "done"
+        if valid_issue "$n"; then
+          emit "$(jq -c --argjson n "$n" '.issue = $n' <<<"$p")" "done"
+          CREATED="$(jq -c --arg t "$(jq -r .ticket <<<"$p")" --argjson n "$n" '. + {($t): $n}' <<<"$CREATED")"
         else FAILED=1; emit "$p" failed "gh issue create printed no Issue URL: $url"; fi
       else
         FAILED=1; emit "$p" failed "$(gh_detail)"
@@ -357,6 +410,6 @@ while IFS= read -r p; do
       fi ;;
     *) die "internal: unknown plan action '$action'" ;;
   esac
-done <<<"$plan"
+done <<<"$order"
 
 exit "$FAILED"

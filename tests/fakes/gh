@@ -47,7 +47,8 @@
 # pr:    list (--state open|closed|merged|all, default open; --head <branch>; --limit default 30;
 #        --json fields; newest first) on the "pulls" array of FAKE_GH_ISSUES: {number, headRefName,
 #        state: OPEN|CLOSED|MERGED, createdAt} plus, for PRs `pr create` opened, baseRefName, title,
-#        body, labels [{name}], reviews [{author: {login}, state}], author {login}, headRefOid.
+#        body, labels [{name}], reviews [{author: {login}, state}], author {login}, headRefOid;
+#        isCrossRepository is true when the entry has a headRepository other than the repo (a fork).
 #        create (--repo, --base, --head, --title, --body | --body-file, --label repeatable; the head
 #        branch must exist on FAKE_GH_GIT; the number is max(issue, PR numbers) + 1, refs/pull/<n>/head
 #        is written as GitHub does; prints the PR URL; the author is @me),
@@ -489,13 +490,14 @@ pr() {
   [ -n "$repo" ] || fail "fake gh pr: --repo is required (tests never infer the repo from a remote)"
   [ "$repo" = "$REPO" ] || fail "GraphQL: Could not resolve to a Repository with the name '$repo'."
   local shape='{baseRefName: "main", title: "", body: "", labels: [], reviews: [], author: {login: "someone"}} + .
-               | .labels |= map(if type == "string" then {name: .} else . end)'
+               | .labels |= map(if type == "string" then {name: .} else . end)
+               | .isCrossRepository = ((.headRepository // $repo) != $repo)'
   case "$sub" in
     list)
       [ -z "$n" ] || unsupported "fake gh pr list: unsupported argument $n"
       [ -n "$fields" ] || fail "fake gh pr list: needs --json"
       case "$state" in open|closed|merged|all) ;; *) fail "invalid argument \"$state\" for \"-s, --state\" flag" ;; esac
-      jq -c --arg state "$state" --arg head "$head" --argjson limit "$limit" \
+      jq -c --arg state "$state" --arg head "$head" --argjson limit "$limit" --arg repo "$REPO" \
             --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" "
         [ (.pulls // [])[]
           | select(\$state == \"all\" or (.state | ascii_downcase) == \$state)
@@ -506,7 +508,7 @@ pr() {
       [ -n "$fields" ] || fail "fake gh pr view: needs --json"
       [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any((.pulls // [])[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
         fail "GraphQL: Could not resolve to a PullRequest with the number of $n."
-      jq -c --argjson n "$n" --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" \
+      jq -c --argjson n "$n" --arg repo "$REPO" --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" \
         ".pulls[] | select(.number == \$n) | $shape | with_entries(select(.key | IN(\$f[])))" "$FAKE_GH_ISSUES" ;;
     create)
       [ -z "$n" ] || unsupported "fake gh pr create: unsupported argument $n"

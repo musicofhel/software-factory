@@ -279,8 +279,101 @@ case_never_delete_foreign_lock() {
   check "releasing an absent lock is exit 0 and sends nothing" eq "$rc:$(jq -r .result <<<"$out"):$(fakegh_calls 'index("DELETE")')" "0:absent:1"
 }
 
+# ---------------------------------------------------------------------------------------------
+# T25: an Issue whose ticket already has an open PR from this repository (or that carries the
+# `in-review` label) is not claimable; the PR is the claim once run.sh opens it.
+# Two ready light Issues: #1 (older, `Ticket: T1`) and #2 (newer, `Ticket: T2`).
+two_tickets() {
+  fakegh_issue 1 "$((T0 - 20 * H))" "ready,w:light" "older" "$(printf 'Some text.\n\nTicket: T1\n')"
+  fakegh_issue 2 "$((T0 - 10 * H))" "ready,w:light" "newer" "$(printf 'Ticket: T2\n')"
+}
+
+case_open_pr_skipped() {
+  fakegh_setup
+  export FACTORY_NOW=$T0
+  two_tickets
+  fakegh_pr 7 ticket/T1/node-a OPEN
+  local out
+  out="$("$BIN/claim.sh" --json)"
+  check "the PR list is read open only, with the fork flag" \
+    eq "$(fakegh_calls '.[0] == "pr" and .[1] == "list" and index("open") and index("number,headRefName,isCrossRepository")')" 1
+  check "#1 with an open ticket/T1/ PR is in review, PR named" eq "$(jq -c .in_review <<<"$out")" '[{"number":1,"pr":7}]'
+  check "only #2 is a candidate" eq "$(jq -c '[.candidates[].number]' <<<"$out")" '[2]'
+  check "#1 is not reported as locked" eq "$(jq -c .locked <<<"$out")" '[]'
+  out="$("$BIN/claim.sh")"
+  check "text mode has the in review line" grep -qxF '  in review  #1 (PR #7)' <<<"$out"
+  check "text mode would claim #2" eq "$(tail -n1 <<<"$out")" "would claim #2 (first unlocked; --apply to claim)"
+  out="$("$BIN/claim.sh" --apply --json --handle alpha --slots 1)"
+  check "--apply claims #2, never trying #1" eq "$(jq -c '[.claimed, [.attempts[].issue]]' <<<"$out")" '[2,[2]]'
+  check "no lock on #1" eq "$(fakegh_ref refs/locks/issue-1)" ""
+}
+
+case_fork_pr_not_skipped() {
+  fakegh_setup
+  export FACTORY_NOW=$T0
+  two_tickets
+  fakegh_pr 7 ticket/T1/node-a OPEN
+  jq '(.pulls[] | select(.number == 7)).headRepository = "mallory/repo"' "$FAKE_GH_ISSUES" >"$WORLD/i" && mv "$WORLD/i" "$FAKE_GH_ISSUES"
+  local out
+  out="$("$BIN/claim.sh" --json)"
+  check "a fork's ticket/T1/ PR does not put #1 in review" eq "$(jq -c .in_review <<<"$out")" '[]'
+  check "#1 stays first" eq "$(jq -c '[.candidates[].number]' <<<"$out")" '[1,2]'
+  out="$("$BIN/claim.sh")"
+  check "text mode has no in review line" eq "$(grep -c 'in review' <<<"$out" || true)" 0
+  out="$("$BIN/claim.sh" --apply --json --handle alpha --slots 1)"
+  check "--apply claims the older #1" eq "$(jq .claimed <<<"$out")" 1
+}
+
+case_in_review_label_skipped() {
+  fakegh_setup
+  export FACTORY_NOW=$T0
+  fakegh_issue 1 "$((T0 - 20 * H))" "ready,w:light,in-review" "labeled, no PR" "$(printf 'Ticket: T1\n')"
+  fakegh_issue 2 "$((T0 - 10 * H))" "ready,w:light" "no ticket line"
+  local out
+  out="$("$BIN/claim.sh" --json)"
+  check "the in-review label alone puts #1 in review, pr null" eq "$(jq -c .in_review <<<"$out")" '[{"number":1,"pr":null}]'
+  check "only #2 is a candidate" eq "$(jq -c '[.candidates[].number]' <<<"$out")" '[2]'
+  out="$("$BIN/claim.sh")"
+  check "text mode: in review line without a PR" grep -qxF '  in review  #1' <<<"$out"
+  out="$("$BIN/claim.sh" --apply --json --handle alpha --slots 1)"
+  check "--apply claims #2" eq "$(jq -c '[.claimed, [.attempts[].issue]]' <<<"$out")" '[2,[2]]'
+}
+
+case_closed_pr_not_skipped() {
+  fakegh_setup
+  export FACTORY_NOW=$T0
+  two_tickets
+  fakegh_pr 7 ticket/T1/node-a CLOSED
+  fakegh_pr 8 ticket/T1/node-b MERGED
+  local out
+  out="$("$BIN/claim.sh" --json)"
+  check "closed and merged ticket/T1/ PRs do not put #1 in review" eq "$(jq -c .in_review <<<"$out")" '[]'
+  check "#1 stays first" eq "$(jq -c '[.candidates[].number]' <<<"$out")" '[1,2]'
+  out="$("$BIN/claim.sh" --apply --json --handle alpha --slots 1)"
+  check "--apply claims the older #1" eq "$(jq .claimed <<<"$out")" 1
+}
+
+case_ticket_prefix_boundary() {
+  fakegh_setup
+  export FACTORY_NOW=$T0
+  two_tickets
+  fakegh_pr 7 ticket/T10/node-a OPEN
+  fakegh_pr 8 ticket/T1 OPEN
+  fakegh_pr 9 ticket/T1-x/node-a OPEN
+  local out
+  out="$("$BIN/claim.sh" --json)"
+  check "ticket/T10/, ticket/T1 and ticket/T1-x/ PRs do not match ticket T1" eq "$(jq -c .in_review <<<"$out")" '[]'
+  check "#1 stays first" eq "$(jq -c '[.candidates[].number]' <<<"$out")" '[1,2]'
+  fakegh_pr 10 ticket/T2/node-a OPEN
+  out="$("$BIN/claim.sh" --json)"
+  check "a ticket/T2/ PR puts only #2 in review" eq "$(jq -c .in_review <<<"$out")" '[{"number":2,"pr":10}]'
+  out="$("$BIN/claim.sh" --apply --json --handle alpha --slots 1)"
+  check "--apply claims #1" eq "$(jq .claimed <<<"$out")" 1
+}
+
 echo "test_claim"
-for c in fake-gh-semantics skips-locked cas-422-moves-on one-comment heartbeat-and-stale never-delete-foreign-lock; do
+for c in fake-gh-semantics skips-locked cas-422-moves-on one-comment heartbeat-and-stale never-delete-foreign-lock \
+         open-pr-skipped fork-pr-not-skipped in-review-label-skipped closed-pr-not-skipped ticket-prefix-boundary; do
   run_case "$c"
 done
 exit "$FAILED"
