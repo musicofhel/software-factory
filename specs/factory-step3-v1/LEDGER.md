@@ -3,7 +3,7 @@ STATUS: IN_PROGRESS
 # LEDGER — factory-step3-v1
 
 - [x] TB0: Register, tickets T20–T31, and the measurements the rows depend on — register re-measured, every line holds; (a) `native-queue: no` (docs: org-owned repos only; the repo is User-owned); (b) check runs are named by the bare job id, Actions app id 15368; (c) ubs's license rider excludes Anthropic → no bugscan; aislop 0.18.1 MIT, attest 1.0.0 MIT (linux binary), flaky-test-detective has no release, bomdrift 0.9.9 Apache-2.0; (d) GITHUB_TOKEN events start no workflow (dispatch excepted); 75 gap ids re-checked: 0 closed, 0 wrong; T20–T31 written with `--allow-unsigned` (manifest seq 26–37), chain edges, doctor ok, coldstart gaps empty, forecast exit 0 (12 serial waves), make test 16 PASS, lint 0, tickets 0 (records/TB0.md) — 4647230
-- [ ] TB1: `make sim`: the end-to-end pipeline simulation, today's stop points recorded (ticket T20)
+- [x] TB1: `make sim`: the end-to-end pipeline simulation, today's stop points recorded (ticket T20) — the walk (P then C) plus 15 failure scenarios, driver reads the workflow YAML; EXPECTED.md 86 stages = 21 pass + 65 red, each with a gap id; compare fails both ways (flip red proof); fake and real adlc 1.12.0 both exit 0; real forecast's `unscoped` sequencing measured (intake:I7); make test 17 PASS (2m37s), lint 0 (records/TB1.md) — 8a13587
 - [ ] TB2: Gate context and ticket identity (ticket T21)
 - [ ] TB3: The three diff gates: rails-proof, scope, tamper, one helper for node and CI (ticket T22)
 - [ ] TB4: One trailered commit per ticket and the commit check (ticket T23)
