@@ -1,5 +1,5 @@
 SHELL := /usr/bin/env bash
-.PHONY: test lint live tickets doctor
+.PHONY: test lint live sim tickets doctor
 
 # Every shell file the factory ships or tests with, including helpers and fakes that later rows add,
 # and the extension-less bwrap shim (ADR-0006).
@@ -14,6 +14,11 @@ live:
 	@fail=0; for t in tests/live/*.sh; do \
 	  if bash "$$t"; then echo "PASS $$t"; else echo "FAIL $$t"; fail=1; fi; \
 	done; exit $$fail
+
+# The offline end-to-end pipeline simulation (tests/sim/sim.sh; specs/factory-step3-v1 TB1): its stage
+# results against tests/sim/EXPECTED.md. tests/test_sim.sh also runs it inside `make test`.
+sim:
+	@bash tests/sim/sim.sh
 
 # shellcheck is required: a lint that skips itself is a false green. actionlint is best-effort
 # (system binary, else uvx actionlint-py) because hosted runners do not ship it.

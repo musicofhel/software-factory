@@ -37,6 +37,18 @@
 #                             then exits $FAKE_ADLC_FORECAST_EXIT (default 0; the real CLI exits 2
 #                             when a gate fails and still prints the forecast)
 #   FAKE_ADLC_FAIL            ERE; a call whose joined argv matches exits 1 with nothing on stdout
+#   FAKE_ADLC_GITSTORE=1      the store is the real layout in the cwd's repository (make sim): one
+#                             file per ticket in <toplevel>/.adlc/tickets/<lower id>--<hash>.json
+#                             (.store.json is skipped), ticketHash = sha256 of the sorted compact
+#                             ticket JSON. Adds the writes adlc 1.12.0 has (measured 2026-10-26 in a
+#                             scratch store, specs/factory-step3-v1/records/TB1.md): `ticket create
+#                             --input F --write [--allow-unsigned] [--json]` (an edge target must exist,
+#                             a frozen store needs --allow-unsigned), `ticket complete` (as above, on
+#                             the file), `gate-manifest record <gate> --ticket id --data json` (appends
+#                             {seq, gate, ticket, data}), and `merge-forecast --json` from the edges:
+#                             waves are Kahn levels over the open tickets (an edge {to: C} on P makes C
+#                             wait for P while P is open), mergeOrder the waves flattened. FAKE_ADLC_STORE
+#                             and FAKE_ADLC_TICKETS are ignored in this mode.
 # Anything else exits 2 so a script never relies on a verb the fake does not know.
 set -euo pipefail
 : "${FAKE_ADLC_LOG:?fake adlc needs FAKE_ADLC_LOG}"
@@ -52,6 +64,94 @@ not_found() {
   exit 2
 }
 MANIFEST=.adlc/manifest.jsonl
+
+if [ "${FAKE_ADLC_GITSTORE:-0}" = 1 ]; then
+  TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo '{"ok":false,"code":"STORE_NOT_FOUND"}' >&2; exit 2; }
+  SDIR="$TOP/.adlc/tickets"
+  [ -f "$SDIR/.store.json" ] || { echo '{"ok":false,"code":"STORE_NOT_FOUND"}' >&2; exit 2; }
+  gs_all() { local f; for f in "$SDIR"/*.json; do [ -e "$f" ] || continue; jq -cS . "$f"; done | jq -sc 'sort_by(.id)'; }
+  gs_hash() { jq -cS . | sha256sum | cut -d' ' -f1; }
+  gs_file() { local f; for f in "$SDIR"/*.json; do [ -e "$f" ] && [ "$(jq -r .id "$f")" = "$1" ] && { echo "$f"; return 0; }; done; return 1; }
+  gs_put() {  # gs_put <ticket-json>: replace the ticket's file
+    local old h lid; old="$(gs_file "$(jq -r .id <<<"$1")" || true)"
+    h="$(gs_hash <<<"$1")"; lid="$(jq -r '.id | ascii_downcase' <<<"$1")"
+    [ -z "$old" ] || rm -f "$old"
+    jq -S . <<<"$1" >"$SDIR/$lid--$h.json"
+  }
+  gs_append() {  # gs_append <entry-json>: seq is the next line number
+    local m="$TOP/.adlc/manifest.jsonl" n; n=0; [ -f "$m" ] && n="$(wc -l <"$m" | tr -d ' ')"
+    jq -c --argjson s "$((n + 1))" '{seq: $s} + .' <<<"$1" >>"$m"
+  }
+  gs_frozen() { jq -e 'any(.[]; (.rails | type) == "array" and (.rails | length) > 0)' <<<"$(gs_all)" >/dev/null; }
+  gs_unsigned() {  # a frozen store's write: refused without --allow-unsigned (exit 2), else warned
+    gs_frozen || return 0
+    has --allow-unsigned "$@" || { jq -cn '{ok: false, kind: "policy", code: "MANIFEST_KEY_REQUIRED"}' >&2; exit 2; }
+    echo "warning: --allow-unsigned with no ADLC_MANIFEST_KEY — this mutation of a frozen trust root will be recorded UNSIGNED." >&2
+  }
+  all="$(gs_all)"
+  case "${1:-} ${2:-}" in
+    "ticket list")
+      while IFS= read -r t; do jq -c --arg h "$(gs_hash <<<"$t")" '{id, title, ticketHash: $h}' <<<"$t"; done < <(jq -c '.[]' <<<"$all") | jq -sc . ;;
+    "ticket show")
+      id="${3:?fake adlc: ticket show needs an id}"
+      t="$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$all")"
+      [ -n "$t" ] || not_found "$id"
+      jq -c --arg h "$(gs_hash <<<"$t")" --arg s "$(gs_hash <<<"$all")" '{ticket: ., ticketHash: $h, storeHash: $s}' <<<"$t" ;;
+    "ticket create")
+      in="" prev=""; for a in "${@:3}"; do [ "$prev" = --input ] && in="$a"; prev="$a"; done
+      t="$(jq -cS . "${in:?fake adlc: ticket create needs --input}")" || exit 2
+      id="$(jq -r .id <<<"$t")"
+      jq -e --arg id "$id" 'any(.[]; .id == $id)' <<<"$all" >/dev/null && { echo '{"ok":false,"code":"TICKET_EXISTS"}' >&2; exit 2; }
+      missing="$(jq -r --argjson all "$all" '[.edges[]?.to] - [$all[].id] | .[0] // empty' <<<"$t")"
+      [ -z "$missing" ] || { jq -cn --arg m "$missing" '{ok: false, code: "EDGE_TARGET_NOT_FOUND", message: "edge target not found: \($m)"}' >&2; exit 2; }
+      jq -cn --arg id "$id" '{version: 1, operation: "create", ticketId: $id}'
+      if has --write "${@:3}"; then
+        gs_unsigned "${@:3}"
+        gs_put "$t"
+        gs_append "$(jq -cn --arg id "$id" --arg h "$(gs_hash <<<"$t")" '{gate: "ticket-mutation", ticket: $id, data: {operation: "create", action: "apply", ticketHash: $h}}')"
+      fi ;;
+    "ticket complete")
+      id="${3:?fake adlc: ticket complete needs an id}"
+      t="$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$all")"
+      [ -n "$t" ] || not_found "$id"
+      jq -cn --arg id "$id" '{version: 1, operation: "complete", ticketId: $id, changedFields: ["completed"]}'
+      if has --write "${@:4}"; then
+        has --authorize "${@:4}" || { echo "fake adlc: complete --write needs --authorize in this fake" >&2; exit 2; }
+        gs_unsigned "${@:4}"
+        t="$(jq -c '.completed = true' <<<"$t")"
+        gs_put "$t"
+        gs_append "$(jq -cn --arg id "$id" '{gate: "ticket-complete", ticket: $id, data: {operation: "complete", action: "apply", bypass: true}}')"
+        jq -cn --arg h "$(gs_hash <<<"$t")" '{applied: true, ticketHash: $h}'
+      fi ;;
+    "gate-manifest record")
+      gate="${3:?fake adlc: gate-manifest record needs a gate}" id="" data='{}'
+      set -- "${@:4}"
+      while [ $# -gt 0 ]; do
+        case "$1" in --ticket) id="$2"; shift ;; --data) data="$2"; shift ;; *) echo "fake adlc: record: unsupported $1" >&2; exit 2 ;; esac
+        shift
+      done
+      gs_append "$(jq -cn --arg g "$gate" --arg t "$id" --argjson d "$data" '{gate: $g, ticket: $t, data: $d}')"
+      echo "recorded: gate=$gate (unsigned)" ;;
+    "gate-manifest show")
+      want="" prev=""; for a in "${@:3}"; do [ "$prev" = --ticket ] && want="$a"; prev="$a"; done
+      { [ -f "$TOP/.adlc/manifest.jsonl" ] && command cat "$TOP/.adlc/manifest.jsonl"; true; } |
+        jq -sc --arg t "$want" '{entries: [.[] | select($t == "" or .ticket == $t) | . + {segment: "root"}], skipped: []}' ;;
+    "merge-forecast --json"|"merge-forecast "*)
+      jq -e 'any(.[]; .completed != true)' <<<"$all" >/dev/null || { echo "error: no active tickets found (all tickets are completed)" >&2; exit 1; }
+      jq -c '[.[] | select(.completed != true)] as $open
+        | ($open | map(.id)) as $ids
+        | (reduce $open[] as $p ({}; reduce ($p.edges // [])[] as $e (.; if ($e.to | IN($ids[])) then .[$e.to] += [$p.id] else . end))) as $deps
+        | {waves: [], done: []}
+        | until(([.done[]] | length) == ($ids | length);
+            .done as $d
+            | [ $ids[] as $i | select(($i | IN($d[])) | not) | select(all(($deps[$i] // [])[]; IN($d[]))) | $i ] as $w
+            | if ($w | length) == 0 then error("cycle") else .waves += [$w | sort] | .done += $w end)
+        | {pairs: [], waves, mergeOrder: [.waves[][]], firstWaveWidth: (.waves[0] | length),
+           certifiedWidth: (.waves[0] | length), warnings: [], gateFailures: []}' <<<"$all" ;;
+    *) echo "fake adlc: unsupported command: $*" >&2; exit 2 ;;
+  esac
+  exit 0
+fi
 
 case "${1:-} ${2:-}" in
   "ticket list")

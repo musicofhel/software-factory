@@ -46,7 +46,18 @@
 #        when the label exists unless --force).
 # pr:    list (--state open|closed|merged|all, default open; --head <branch>; --limit default 30;
 #        --json fields; newest first) on the "pulls" array of FAKE_GH_ISSUES: {number, headRefName,
-#        state: OPEN|CLOSED|MERGED, createdAt}.
+#        state: OPEN|CLOSED|MERGED, createdAt} plus, for PRs `pr create` opened, baseRefName, title,
+#        body, labels [{name}], reviews [{author: {login}, state}], author {login}, headRefOid.
+#        create (--repo, --base, --head, --title, --body | --body-file, --label repeatable; the head
+#        branch must exist on FAKE_GH_GIT; the number is max(issue, PR numbers) + 1, refs/pull/<n>/head
+#        is written as GitHub does; prints the PR URL; the author is @me),
+#        view <n> --json fields (the same fields).
+# api:   DELETE collaborators/<login> (204; the login is appended to .removed_collaborators of
+#        FAKE_GH_ISSUES, so a sim can see the revoke).
+# __forms: prints every form this fake models, one per line (`issue list`, `api GET git/ref/*`, …);
+#        tests/test_sim.sh holds the repo's call sites against it.
+# FAKE_GH_UNKNOWN: a file; every refused form (an unsupported command, subcommand, flag or api
+#        path) is appended to it before the failure, so a sim can fail on a form the fake lacks.
 set -euo pipefail
 
 REPO="${FAKE_GH_REPO:-test/repo}"
@@ -63,6 +74,11 @@ http_err() {  # http_err <code> <message>
   exit 1
 }
 fail() { printf '%s\n' "$*" >&2; exit 1; }
+unsupported() {  # a form this fake does not model: logged to FAKE_GH_UNKNOWN, then a failure
+  [ -z "${FAKE_GH_UNKNOWN:-}" ] || printf '%s\t%s\n' "$*" "$(printf '%q ' "${ARGV[@]}")" >>"$FAKE_GH_UNKNOWN"
+  fail "$@"
+}
+ARGV=("$@")
 
 if [ -n "${FAKE_GH_FAIL:-}" ] && [[ "$*" =~ $FAKE_GH_FAIL ]]; then http_err 500 "Server Error (injected)"; fi
 
@@ -104,7 +120,7 @@ api() {
       --input) input="$2"; shift ;;
       -H|--header) shift ;;
       --paginate|--silent) ;;
-      -*) fail "fake gh api: unsupported flag $1" ;;
+      -*) unsupported "fake gh api: unsupported flag $1" ;;
       *) [ -z "$path" ] || fail "fake gh api: two paths"; path="${1#/}" ;;
     esac
     shift
@@ -120,6 +136,11 @@ api() {
   case "$path" in "repos/$REPO/"*) path="${path#"repos/$REPO/"}" ;; *) http_err 404 "Not Found" ;; esac
   case "$path" in
     branches/*/protection|rulesets|rulesets/*) settings "$method" "$path" "$fields" "$jqx"; return ;;
+    collaborators/*)
+      [ "$method" = DELETE ] || unsupported "fake gh api: only DELETE collaborators/<login> is modeled"
+      : "${FAKE_GH_ISSUES:?fake gh api collaborators needs FAKE_GH_ISSUES}"
+      mutate '.removed_collaborators = ((.removed_collaborators // []) + [$u])' --arg u "${path#collaborators/}"
+      return 0 ;;
   esac
   : "${FAKE_GH_GIT:?fake gh api needs FAKE_GH_GIT}"
   f() { jq -r --arg k "$1" '.[$k] // empty' <<<"$fields"; }
@@ -180,7 +201,8 @@ api() {
       [ -n "$old" ] || http_err 422 "Reference does not exist"
       g update-ref -d "$ref" "$old" 2>/dev/null || http_err 422 "Reference cannot be deleted"
       return 0 ;;
-    *) http_err 404 "Not Found" ;;
+    *) [ -z "${FAKE_GH_UNKNOWN:-}" ] || printf 'api %s %s\t%s\n' "$method" "$path" "$(printf '%q ' "${ARGV[@]}")" >>"$FAKE_GH_UNKNOWN"
+       http_err 404 "Not Found" ;;
   esac
   if [ -n "$jqx" ]; then jq -r "$jqx" <<<"$out"; else printf '%s\n' "$out"; fi
 }
@@ -306,7 +328,7 @@ issue() {
       -F|--body-file) if [ "$2" = - ]; then body="$(command cat)"; else body="$(command cat "$2")"; fi; have_body=1; shift ;;
       -r|--reason) reason="$2"; shift ;;
       -c|--comment) comment="$2"; have_comment=1; shift ;;
-      -*) fail "fake gh issue $sub: unsupported flag $1" ;;
+      -*) unsupported "fake gh issue $sub: unsupported flag $1" ;;
       *) [ -z "$n" ] || fail "fake gh issue $sub: two positionals"; n="$1" ;;
     esac
     shift
@@ -376,7 +398,7 @@ issue() {
             --argjson n "$n" --arg me "$ME" --arg b "$body" --argjson at "$at"
           printf 'https://github.com/%s/issues/%s#issuecomment-%s\n' "$REPO" "$n" "$(jq --argjson n "$n" '.issues[] | select(.number == $n) | .comments | length' "$FAKE_GH_ISSUES")" ;;
       esac ;;
-    *) fail "fake gh issue: unsupported subcommand '$sub'" ;;
+    *) unsupported "fake gh issue: unsupported subcommand '$sub'" ;;
   esac
 }
 
@@ -391,7 +413,7 @@ label() {
       -L|--limit) limit="$2"; shift ;;
       -c|--color|-d|--description) shift ;;
       -f|--force) force=1 ;;
-      -*) fail "fake gh label $sub: unsupported flag $1" ;;
+      -*) unsupported "fake gh label $sub: unsupported flag $1" ;;
       *) [ -z "$name" ] || fail "fake gh label $sub: two positionals"; name="$1" ;;
     esac
     shift
@@ -410,37 +432,89 @@ label() {
         mutate '.labels += [$l]' --arg l "$name"
       fi
       printf '✓ Label "%s" created in %s\n' "$name" "$REPO" >&2 ;;
-    *) fail "fake gh label: unsupported subcommand '$sub'" ;;
+    *) unsupported "fake gh label: unsupported subcommand '$sub'" ;;
   esac
 }
 
 pr() {
   : "${FAKE_GH_ISSUES:?fake gh pr needs FAKE_GH_ISSUES}"
   local sub="${1:-}"; shift || true
-  local repo="" state=open limit=30 fields="" head=""
+  local repo="" state=open limit=30 fields="" head="" base="" title="" body="" have_body=0 labels='[]' n=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -R|--repo) repo="$2"; shift ;;
       -s|--state) state="$2"; shift ;;
       -L|--limit) limit="$2"; shift ;;
       -H|--head) head="$2"; shift ;;
+      -B|--base) base="$2"; shift ;;
+      -t|--title) title="$2"; shift ;;
+      -b|--body) body="$2"; have_body=1; shift ;;
+      -F|--body-file) if [ "$2" = - ]; then body="$(command cat)"; else body="$(command cat "$2")"; fi; have_body=1; shift ;;
+      -l|--label) labels="$(jq -c --arg v "$2" '. + ($v | split(","))' <<<"$labels")"; shift ;;
       --json) fields="$2"; shift ;;
-      *) fail "fake gh pr $sub: unsupported argument $1" ;;
+      -*) unsupported "fake gh pr $sub: unsupported argument $1" ;;
+      *) [ -z "$n" ] || unsupported "fake gh pr $sub: unsupported argument $1"; n="$1" ;;
     esac
     shift
   done
   [ -n "$repo" ] || fail "fake gh pr: --repo is required (tests never infer the repo from a remote)"
   [ "$repo" = "$REPO" ] || fail "GraphQL: Could not resolve to a Repository with the name '$repo'."
-  [ "$sub" = list ] || fail "fake gh pr: unsupported subcommand '$sub'"
-  [ -n "$fields" ] || fail "fake gh pr list: needs --json"
-  case "$state" in open|closed|merged|all) ;; *) fail "invalid argument \"$state\" for \"-s, --state\" flag" ;; esac
-  jq -c --arg state "$state" --arg head "$head" --argjson limit "$limit" \
-        --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" '
-    [ (.pulls // [])[]
-      | select($state == "all" or (.state | ascii_downcase) == $state)
-      | select($head == "" or .headRefName == $head) ]
-    | sort_by(.createdAt) | reverse | .[:$limit]
-    | map(with_entries(select(.key | IN($f[]))))' "$FAKE_GH_ISSUES"
+  local shape='{baseRefName: "main", title: "", body: "", labels: [], reviews: [], author: {login: "someone"}} + .
+               | .labels |= map(if type == "string" then {name: .} else . end)'
+  case "$sub" in
+    list)
+      [ -z "$n" ] || unsupported "fake gh pr list: unsupported argument $n"
+      [ -n "$fields" ] || fail "fake gh pr list: needs --json"
+      case "$state" in open|closed|merged|all) ;; *) fail "invalid argument \"$state\" for \"-s, --state\" flag" ;; esac
+      jq -c --arg state "$state" --arg head "$head" --argjson limit "$limit" \
+            --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" "
+        [ (.pulls // [])[]
+          | select(\$state == \"all\" or (.state | ascii_downcase) == \$state)
+          | select(\$head == \"\" or .headRefName == \$head) ]
+        | sort_by(.createdAt) | reverse | .[:\$limit]
+        | map($shape | with_entries(select(.key | IN(\$f[]))))" "$FAKE_GH_ISSUES" ;;
+    view)
+      [ -n "$fields" ] || fail "fake gh pr view: needs --json"
+      [[ "$n" =~ ^[0-9]+$ ]] && jq -e --argjson n "$n" 'any((.pulls // [])[]; .number == $n)' "$FAKE_GH_ISSUES" >/dev/null ||
+        fail "GraphQL: Could not resolve to a PullRequest with the number of $n."
+      jq -c --argjson n "$n" --argjson f "$(jq -cn --arg f "$fields" '$f | split(",")')" \
+        ".pulls[] | select(.number == \$n) | $shape | with_entries(select(.key | IN(\$f[])))" "$FAKE_GH_ISSUES" ;;
+    create)
+      [ -z "$n" ] || unsupported "fake gh pr create: unsupported argument $n"
+      [ -n "$title" ] && [ -n "$base" ] && [ -n "$head" ] || fail "fake gh pr create: needs --title, --base and --head (it would prompt)"
+      [ "$have_body" = 1 ] || fail "fake gh pr create: needs --body or --body-file (it would prompt)"
+      : "${FAKE_GH_GIT:?fake gh pr create needs FAKE_GH_GIT}"
+      local sha
+      sha="$(git -C "$FAKE_GH_GIT" rev-parse -q --verify "refs/heads/$head^{commit}")" ||
+        fail "pull request create failed: GraphQL: Head sha can't be blank, Head ref must be a branch (createPullRequest)"
+      git -C "$FAKE_GH_GIT" rev-parse -q --verify "refs/heads/$base" >/dev/null ||
+        fail "pull request create failed: GraphQL: Base ref must be a branch (createPullRequest)"
+      jq -e --arg h "$head" 'any((.pulls // [])[]; .headRefName == $h and .state == "OPEN")' "$FAKE_GH_ISSUES" >/dev/null &&
+        fail "a pull request for branch \"$head\" into branch \"$base\" already exists"
+      local missing
+      missing="$(jq -r --argjson l "$labels" '.labels as $known | $l[] | select(IN($known[]) | not)' "$FAKE_GH_ISSUES" | head -n1)"
+      [ -z "$missing" ] || fail "could not add label: '$missing' not found"
+      mutate '([.issues[].number, (.pulls // [])[].number] | max // 0) as $max
+              | .pulls = ((.pulls // []) + [{number: ($max + 1), headRefName: $h, baseRefName: $b, headRefOid: $sha,
+                  title: $t, body: $body, labels: ($l | unique | map({name: .})), reviews: [], state: "OPEN",
+                  createdAt: ($at | todate), author: {login: $me}}])' \
+        --arg h "$head" --arg b "$base" --arg sha "$sha" --arg t "$title" --arg body "$body" --argjson l "$labels" \
+        --argjson at "${FAKE_GH_NOW:-$(date -u +%s)}" --arg me "$ME"
+      n="$(jq '[.pulls[].number] | max' "$FAKE_GH_ISSUES")"
+      git -C "$FAKE_GH_GIT" update-ref "refs/pull/$n/head" "$sha"
+      printf 'https://github.com/%s/pull/%s\n' "$REPO" "$n" ;;
+    *) unsupported "fake gh pr: unsupported subcommand '$sub'" ;;
+  esac
+}
+
+# Every form modeled above, for tests/test_sim.sh.
+forms() {
+  printf '%s\n' "issue list" "issue create" "issue edit" "issue comment" "issue close" "issue reopen" \
+    "label list" "label create" "pr list" "pr create" "pr view" \
+    "api GET git/matching-refs/*" "api GET git/ref/*" "api GET git/commits/*" "api POST git/commits" \
+    "api POST git/refs" "api PATCH git/refs/*" "api DELETE git/refs/*" \
+    "api GET branches/*/protection" "api PUT branches/*/protection" "api DELETE branches/*/protection" \
+    "api GET rulesets" "api GET rulesets/*" "api POST rulesets" "api PUT rulesets/*" "api DELETE collaborators/*"
 }
 
 case "${1:-}" in
@@ -448,5 +522,6 @@ case "${1:-}" in
   issue) shift; issue "$@" ;;
   pr) shift; pr "$@" ;;
   label) shift; label "$@" ;;
-  *) fail "fake gh: unsupported command '${1:-}'" ;;
+  __forms) forms ;;
+  *) unsupported "fake gh: unsupported command '${1:-}'" ;;
 esac

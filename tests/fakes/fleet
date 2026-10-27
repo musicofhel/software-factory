@@ -29,6 +29,8 @@
 #     <reason>          a ticket reason (quota-paused, wall-clock, strikes-exhausted, flail,
 #                       review-unavailable, lock-held, ticket-blocked, mirror-fetch-failed): exit 2,
 #                       the worker branch is kept; any other word is a run-level reason: exit 1
+#   FAKE_FLEET_CHECK_CONFIG=1 adds fleet's config preflight: no .fleet.gate.build or .fleet.gate.test
+#   in the cwd's .adlc/config.json → exit 1, reason "preflight" (preflight.mjs:63-64).
 #   Every call (except garbage) leaves the worker branch fleet/<lowercased id> one commit ahead of
 #   where it was (cut from --base the first time) adding $FAKE_FLEET_FILE (default hello.sh) with
 #   $FAKE_FLEET_CONTENT, appends `.worktrees/` to the cwd's .gitignore as fleet does (a dirty tree),
@@ -113,6 +115,12 @@ if [ -n "$psa" ]; then
 fi
 [[ "$tickets" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || pre "this fake takes exactly one --tickets id"
 base_sha="$(git rev-parse -q --verify "$base^{commit}")" || pre "base '$base' is not a revision"
+# FAKE_FLEET_CHECK_CONFIG=1: fleet 1.12.0's own config preflight (preflight.mjs:63-64): the repo's
+# .adlc/config.json must carry a fleet block whose gate defines a build and/or a test command.
+if [ "${FAKE_FLEET_CHECK_CONFIG:-0}" = 1 ] &&
+   ! jq -e '(.fleet.gate.build // "") != "" or (.fleet.gate.test // "") != ""' .adlc/config.json >/dev/null 2>&1; then
+  pre "fleet.gate must define a build and/or test command in .adlc/config.json; an ungated fleet must not run"
+fi
 if [ "$git" = mirror ]; then  # git-mirror.mjs assertBareMirror, at worktree creation
   bad=""
   if [ ! -d "$mirror" ]; then bad="is not a git repository"

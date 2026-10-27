@@ -5,7 +5,9 @@
 #   [--range RANGE] [--json] [--no-color] [--fail-on tamper|review|never] [path]
 #                   RANGE must resolve in the cwd's repository (`git rev-list`), else an error and
 #                   exit 1. The verdict is $FAKE_TAMPERGUARD_VERDICT: ok (default), review, tamper,
-#                   or error (a traceback-like line on stderr, exit 1). --json prints
+#                   or error (a traceback-like line on stderr, exit 1), or diff: tamper when the
+#                   lines `git diff RANGE` adds carry a skip marker (.skip, @skip, mark.skip,
+#                   `skip(`), else ok (needs --range). --json prints
 #                   {verdict, score, findings: [{file, rule, severity, detail}]} pretty-printed as the
 #                   real one does; `detail` is $FAKE_TAMPERGUARD_DETAIL (the real one quotes the diff,
 #                   so a caller that forwards it leaks file text). Exit 2 when the verdict is at or
@@ -33,6 +35,10 @@ elif [ -n "$path" ]; then
   [ -f "$path" ] || { echo "tamperguard: no such file: $path" >&2; exit 1; }
 fi
 verdict="${FAKE_TAMPERGUARD_VERDICT:-ok}"
+if [ "$verdict" = diff ]; then
+  [ -n "$range" ] || { echo "fake tamperguard: FAKE_TAMPERGUARD_VERDICT=diff needs --range" >&2; exit 1; }
+  if git diff "$range" | grep -E '^\+[^+]' | grep -qE '\.skip|@skip|mark\.skip|skip\('; then verdict=tamper; else verdict=ok; fi
+fi
 detail="${FAKE_TAMPERGUARD_DETAIL:-assertions replaced with a vacuous body: assert True}"
 case "$verdict" in
   ok) score=0 findings='[]' ;;
