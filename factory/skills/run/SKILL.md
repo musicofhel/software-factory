@@ -61,10 +61,9 @@ or the slot stopped at a gate; 1 an operational error or a fleet failure that ne
 
 | fleet says | outcome | what the loop does |
 |---|---|---|
-| success (`exitCode 0`, `reason null`, `merged ≥ 1`) | `built` | tamperguard (under vetto) and `scope-check.sh` on the ticket's range; both pass → push `ticket/<id>/<handle>` ending in a record commit, open the PR, comment on the Issue. The lock stays until merge |
-| success, scope-check is still step 3's stub | `held`, reason `scope-check-not-built` | no push (no false green); the work stays on a **local** `ticket/<id>/<handle>` branch; release, comment; **the slot stops (exit 2)** |
-| success, tamperguard says tamper / a real scope failure | `desk`, reason `tamper` / `scope-fail` | label `needs-desk`, comment, release, nothing pushed |
-| success, tamperguard or scope-check fails to run | `released`, reason `tamperguard-error` / `scope-check-error` | release, comment, the slot stops (exit 1) |
+| success (`exitCode 0`, `reason null`, `merged ≥ 1`) | `built` | one trailered commit of fleet's tree on the merge-base with main; tamperguard (under vetto), `rails-proof.sh` and `scope-check.sh` on that range (the helper CI's gates call); all pass → the attest note, push `ticket/<id>/<handle>` and the note in one atomic push, open the PR, comment on the Issue, then hand the claim to the PR: the Issue goes `in-review` and the lock is released. A PR that cannot be opened keeps the lock for one retry, then goes to the desk (`pr-open-failed`) |
+| success, tamperguard says tamper / a rail edit / a scope failure | `desk`, reason `tamper` / `rails-fail` / `scope-fail` | label `needs-desk`, comment, release, nothing pushed |
+| success, tamperguard, rails-proof, scope-check or the attest note fails to run | `released`, reason `tamperguard-error` / `rails-proof-error` / `scope-check-error` / `attest-error` | release, comment, the slot stops (exit 1) |
 | `quota-paused`, `wall-clock` | `paused` | push the partial branch, heartbeat the lock, keep the worktree; the next iteration re-runs the identical fleet argv there (fleet resumes). Nap 10 min after quota, none after wall-clock. The 4th pause of one claim is handled as strikes-exhausted |
 | `strikes-exhausted`, `flail` | `desk` | push the branch, label `needs-desk`, comment, release |
 | `review-unavailable` | `released` | release, no comment, nap 30 min |

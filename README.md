@@ -71,8 +71,8 @@ else is long-lived.
 | # | Step | Status |
 |---|---|---|
 | 1 | Clock + janitor, claim protocol, kill switch | **built and pushed; Aaron's kit lines open** (`specs/factory-step1-v1`) |
-| 2 | Join wizard and run loop (vetto, Ralon, dcg, cux) | **built (T17–T19 local, not pushed); on the dev box the toy ticket is built, reviewed and merged in fleet's sandbox, passes tamperguard under vetto with the claim's rendered policy, and the loop holds it at `scope-check-not-built` (scope-check is step 3); every open ticket declares a rail; awaiting first join** (`specs/factory-step2-v1`, `specs/factory-step2-followups-v1`, `specs/factory-run-calls-v1`) |
-| 3 | CI gates and merge queue with the `Depends-on:` hold | queued |
+| 2 | Join wizard and run loop (vetto, Ralon, dcg, cux) | **built (T17–T19 local, not pushed); on the dev box the toy ticket is built, reviewed and merged in fleet's sandbox, passes tamperguard under vetto with the claim's rendered policy, and the loop held it at `scope-check-not-built` until step 3 built scope-check; every open ticket declares a rail; awaiting first join** (`specs/factory-step2-v1`, `specs/factory-step2-followups-v1`, `specs/factory-run-calls-v1`) |
+| 3 | CI gates and merge queue with the `Depends-on:` hold | **built (T20–T31 local, not pushed); `make sim` walks a ticket from the desk through the mirror, a node claim, a fleet build, the PR, every required gate on `pull_request` and on the first-party serial queue, the `Depends-on:` hold and tier order, the merge, to `completed` on main, plus 40 failure and class scenarios, each judged on the gate that should stop it; on the dev box the toy ticket reaches `pr-ready` on a local bare origin with its one trailered commit and attest note; Aaron's kit lines open (the App, branch protection, the runner, the first live run)** (`specs/factory-step3-v1`) |
 | 4 | Rail author charter, prosecution CLI, verifier wrapper, summoner, digest | queued |
 | 5 | Preview, behavior diff, release | queued |
 | 6 | Distill, calibration, observability page | queued |

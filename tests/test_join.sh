@@ -251,6 +251,9 @@ case_refuse_other() {
   jn --handle node-a --no-suite
   check "root: exit 2" eq "$RC" 2
   check "root: names it" has_err "running as root"
+  jn --handle node-a --json   # no --no-suite: the refusal keeps the suite from running, heavy_gates null
+  check "a refusal before the suite: exit 2, the suite not run" eq "$RC $(jq -r '.suite.reason // empty' <<<"$OUT")" "2 refused before the suite"
+  check "  the null heavy_gates adds no schema refusal of its own" eq "$(jq -c '[.refusals[] | select(test("heavy_gates"))]' <<<"$OUT")" "[]"
   unset FAKE_UID; rm "$WORLD/bin/id"
   echo "Linux version 4.4.0-19041-Microsoft (Microsoft@Microsoft.com)" >"$WORLD/root/proc/version"
   jn --handle node-a --no-suite

@@ -1,5 +1,6 @@
 # Ticket completion happens here, never on a node: .adlc is only written from main.
-# post-merge.sh completes every ticket a merged commit names in a `Ticket:` trailer, appends the
+# post-merge.sh completes, per merged PR, only the ticket its head branch ticket/<id>/<handle> names
+# (merge:G11, ticket T23; a `Ticket:` trailer naming another id is reported foreign), appends the
 # verified findings to factory/ledger/findings.jsonl and pushes one commit to main, the commit
 # trailers `Ticket: post-merge`, `Node: github-actions`, `Assisted-by: none`.
 # The push runs on the factory GitHub App's token (step-1 ruling Q6: the App is the ruleset bypass

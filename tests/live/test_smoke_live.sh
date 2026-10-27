@@ -4,10 +4,13 @@
 #
 #   1. origin  tests/fixtures/make-repo.sh builds a bare origin whose main is this repo's HEAD
 #              (`git archive`) plus three overlays: the toy ticket T-smoke, created in the fixture's
-#              own store by the real `adlc ticket create --write`; `fleet.gate` in .adlc/config.json
-#              (test: `bash tests/test_hello.sh`) with `fleet.allowedCommands` for the toy ticket,
-#              whose one rail is factory/policy/** (fleet's rails-guard refuses a ticket with none);
-#              budget weights.light.wallClockMinutes = 15. fleet's claude-code worker may run only
+#              own store by the real `adlc ticket create --write`; in main's own `fleet` block of
+#              .adlc/config.json (T24: prosecuteFailOn, timeoutMinutes kept; securityMode stays
+#              main's unsigned-fallback, which the attest note needs) `fleet.gate` becomes
+#              test: `bash tests/test_hello.sh` (main's `make lint` / `make test` cannot run in fleet
+#              1.12.0's repo-command plane, records/TB5.md) and `fleet.allowedCommands` the toy
+#              ticket's, whose one rail is factory/policy/** (fleet's rails-guard refuses a ticket
+#              with none); budget weights.light.wallClockMinutes = 15. fleet's claude-code worker may run only
 #              the gate commands, allowedCommands and read-only git (adapters/claude-code.mjs
 #              buildSettings), so without `chmod +x` it answers TICKET-BLOCKED (follow-ups TB5 records).
 #   2. HOME    a scratch HOME, because vetto 0.6.5 fails closed on this box's real one (~/.aws is a
@@ -34,7 +37,13 @@
 #
 # It then checks that the loop took the branch ADR-0005 specifies for the reason fleet gave (a
 # reason other than success passes when its branch is the specified one), that fleet's sandbox
-# was enforced, and that no ticket text left the node (I8). It prints the six recorded items
+# was enforced, and that no ticket text left the node (I8). On success the loop ends at pr-ready
+# (specs/factory-step3-v1 TB12, ticket T31): ONE trailered commit on the merge-base (T23), the real
+# tamperguard under the rendered policy, rails-proof and scope-check on it (T22), the attest note
+# (T30) pushed with it to the fixture origin in one atomic push, the PR opened on the fake gh
+# (its body written to the evidence dir) and the claim handed to it (in-review, lock released,
+# T25); then, in a fresh clone of the origin, CI's own commit-check, rails-proof, scope-check,
+# tamper-check and attest-verify recompute the pushed commit and agree. It prints the six recorded items
 # (governor line, claim ref, fleet reason, pushed branch, ledger line, token count) and the sandbox
 # evidence (fleet's policy echo, vetto audit) for the records: TB6 of specs/factory-step2-v1, TB5 of
 # specs/factory-step2-followups-v1.
@@ -74,19 +83,19 @@ keep() {
   [ -n "$k" ] || return 0
   rm -rf "$k"; mkdir -p "$k"
   command cp -a "$S/fh/run" "$k/run" 2>/dev/null || true
-  command cp -a "$S"/*.json "$S"/*.log "$S"/*.out "$S"/*.err "$k/" 2>/dev/null || true
+  command cp -a "$S"/*.json "$S"/*.log "$S"/*.out "$S"/*.err "$S"/*.md "$k/" 2>/dev/null || true
   git clone -q --mirror "$S/origin.git" "$k/origin.git" 2>/dev/null || true
 }
 trap 'keep; chmod -R u+w "$S" 2>/dev/null; rm -rf "$S"' EXIT
 O="$S/origin.git" C="$S/clone" FH="$S/fh" NH="$S/home"
 
 # ---- 1. the fixture origin ----------------------------------------------------------------------
-echo "  1. fixture origin: this repo's HEAD + T-smoke + fleet.gate + fleet.allowedCommands"
+echo "  1. fixture origin: this repo's HEAD + T-smoke + main's fleet block with the toy gate and allowedCommands"
 mkdir -p "$S/main"
 git -C "$REPO_ROOT" archive HEAD | tar -x -C "$S/main"
 # Each entry becomes a `Bash(<entry>)` rule in the worker's .claude/settings.local.json.
 ALLOWED='["chmod +x hello.sh", "chmod +x hello.sh tests/test_hello.sh", "./hello.sh", "bash tests/test_hello.sh:*"]'
-jq --argjson a "$ALLOWED" '.fleet = {gate: {test: "bash tests/test_hello.sh"}, allowedCommands: $a}' \
+jq --argjson a "$ALLOWED" '.fleet = ((.fleet // {}) + {gate: {test: "bash tests/test_hello.sh"}, allowedCommands: $a})' \
   "$S/main/.adlc/config.json" >"$S/cfg.tmp"
 mv "$S/cfg.tmp" "$S/main/.adlc/config.json"
 jq '.weights.light.wallClockMinutes = 15' "$S/main/factory/policy/budget.json" >"$S/budget.tmp"
@@ -126,7 +135,7 @@ gname="$(git config user.name || echo dev-box)" gmail="$(git config user.email |
 printf '[user]\n\tname = %s\n\temail = %s\n' "$gname" "$gmail" >"$NH/.gitconfig"
 printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$REPO_ROOT/tests/fakes/gh" >"$S/bin/gh"
 chmod +x "$S/bin/gh"
-printf '{"labels":["ready","needs-desk","in-progress","w:light","w:heavy"],"issues":[]}\n' >"$S/issues.json"
+printf '{"labels":["ready","needs-desk","in-progress","in-review","blocked","w:light","w:heavy"],"issues":[]}\n' >"$S/issues.json"
 : >"$S/gh.log"
 while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(CLAUDECODE|CLAUDE_CODE_|ANTHROPIC_|ADLC_|GH_|GITHUB_|XDG_|GIT_|FACTORY_|FAKE_)' || true)
 export HOME="$NH" FACTORY_HOME="$FH" FACTORY_REPO=fixture/smoke PATH="$S/bin:$PATH"
@@ -227,12 +236,36 @@ lock_now="$(git -C "$O" rev-parse -q --verify refs/locks/issue-1 || true)"
 labels="$(jq -r '.issues[0] | [.labels[].name] | sort | join(",")' "$S/issues.json")"
 ncomments="$(jq -r '.issues[0].comments | length' "$S/issues.json")"
 echo "  6. fleet reason '$(f '.fleet.reason // "none (success)"')' -> loop reason '${reason:-none}', outcome $outcome, exit $rc"
+pr="$(jq -c '[.pulls // [] | .[] | select(.headRefName == "ticket/T-smoke/dev-box")] | first // null' "$S/issues.json")"
+[ "$pr" = null ] || jq -r .body <<<"$pr" >"$S/pr-body.md"
+note="$( [ -z "$origin_branch" ] || git -C "$O" notes --ref=factory-attest show "$origin_branch" 2>/dev/null || true)"
+[ -z "$note" ] || printf '%s\n' "$note" >"$S/attest-note.json"
 case "$reason" in
-  scope-check-not-built)  # success, then step 3's scope-check stub: held locally, nothing pushed
+  "")  # success: pr-ready (T31)
     check "fleet merged the ticket into its integration branch" eq "$(f '"\(.fleet.exit_code) \(.fleet.merged >= 1)"')" "0 true"
-    check "tamperguard ran under vetto and passed" eq "$(f '.tamperguard.verdict | IN("ok", "review")')" true
-    check "held: exit 2, local ticket branch, nothing pushed, lock released" \
-      eq "$rc $outcome ${local_branch:+local} ${origin_branch:-none} ${lock_now:-released}" "2 held local none released" ;;
+    check "built: exit 0, the branch pushed, the lock released" \
+      eq "$rc $outcome ${origin_branch:+pushed} ${lock_now:-released}" "0 built pushed released"
+    check "tamperguard ran under vetto and passed, then rails-proof and scope-check passed" \
+      eq "$(f '"\(.tamperguard.verdict | IN("ok", "review")) \(.rails_proof) \(.scope_check)"')" "true pass pass"
+    check "the node gated exactly the commit it pushed: origin's tip is the ledger's gate_head" eq "$origin_branch" "$(f .gate_head)"
+    check "  ONE commit on gate_base, the merge-base with main (T23)" \
+      eq "$(git -C "$O" rev-list --parents -n1 "$origin_branch" | cut -d' ' -f2-) $(git -C "$O" merge-base main "$origin_branch")" \
+         "$(f .gate_base) $(f .gate_base)"
+    check "  its one trailer paragraph: Assisted-by, Ticket, Node, Signed-off-by" \
+      eq "$(git -C "$O" log -1 --format='%(trailers:only,unfold)' "$origin_branch" | sed -E '/^$/d; s/:.*//' | sort | tr '\n' ' ')" \
+         "$(printf '%s\n' Assisted-by Factory-Outcome Fleet-Run Fleet-Strikes Node Signed-off-by Ticket | sort | tr '\n' ' ')"
+    check "  it changes only the ticket's scope" eq "$(git -C "$O" diff --name-only "$(f .gate_base)" "$origin_branch" | sort | tr '\n' ' ')" "hello.sh tests/test_hello.sh "
+    check "the attest note is on origin, on the pushed commit (T30)" \
+      eq "$(jq -r '"\(.format) \(.ticket) \(.node) \(.head) \(.base)"' <<<"${note:-null}" 2>/dev/null)" \
+         "factory-attest/1 T-smoke dev-box $origin_branch $(f .gate_base)"
+    check "  its verdicts are the node's: rails-proof and scope pass, tamperguard's verdict" \
+      eq "$(jq -c '[.verdicts["rails-proof"], .verdicts.scope, .verdicts.tamperguard.verdict]' <<<"${note:-null}" 2>/dev/null)" \
+         "$(f -c '["pass", "pass", .tamperguard.verdict]')"
+    check "the PR is open on the fake gh: head ticket/T-smoke/dev-box at the pushed sha, base main, the ledger's number" \
+      eq "$(jq -r '"\(.state) \(.headRefOid) \(.baseRefName) \(.number)"' <<<"$pr")" "OPEN $origin_branch main $(f .pr)"
+    check "  its body names the ticket and the Issue (written to the evidence dir as pr-body.md)" \
+      eq "$(grep -cxE 'Ticket: T-smoke|Issue: #1' "$S/pr-body.md" 2>/dev/null || true)" 2
+    check "the claim went to the PR: Issue #1 in-review, ready and in-progress removed (T25)" eq "$labels" "in-review,w:light" ;;
   quota-paused|wall-clock)
     check "paused: exit 0, partial branch pushed, lock kept, slot state saved" \
       eq "$rc $outcome ${origin_branch:+pushed} ${lock_now:+held} $([ -f "$FH/run/slot-1.json" ] && echo saved)" "0 paused pushed held saved" ;;
@@ -250,7 +283,7 @@ case "$reason" in
     check "$reason: exit 1, released, slot stopped" eq "$rc $outcome ${lock_now:-released}" "1 released released" ;;
 esac
 if [ -n "$origin_branch" ]; then
-  check "the pushed tip is a record commit with the I6 trailers" \
+  check "the pushed tip carries the I6 trailers" \
     eq "$(git -C "$O" log -1 --format='%(trailers:key=Ticket,valueonly,separator=)|%(trailers:key=Node,valueonly,separator=)' "$origin_branch")" "T-smoke|dev-box"
 fi
 # Whenever the loop ran its tamperguard step, it ran under vetto + this claim's render of build.toml
@@ -263,8 +296,10 @@ fi
 RENDER="$FH/run/policy/$(f .run_id).build.toml"
 if [ "$(f '.actions | index("tamperguard") != null')" = true ]; then
   latest="$(vetto audit --latest --json 2>/dev/null || true)"
-  check "tamperguard ran under vetto: the latest session is factory-build, strict, tamperguard over the range" \
-    eq "$(jq -r '"\(.profile) \(.command | test("--profile strict --policy [^ ]+\\.build\\.toml ")) \(.command | test("tamperguard --range"))"' <<<"$latest" 2>/dev/null)" \
+  # The command is policy_tamperguard's `bash -c … tamperguard <out> <err> <rc> <argv>`, the argv
+  # dg_tamper_argv's on the gated range (I17).
+  check "tamperguard ran under vetto: the latest session is factory-build, strict, tamperguard over the gated range" \
+    eq "$(jq -r --arg r "--range $(f .gate_base)...$(f .gate_head) --json" '"\(.profile) \(.command | test("--profile strict --policy [^ ]+\\.build\\.toml ")) \(.command | endswith(" " + $r))"' <<<"$latest" 2>/dev/null)" \
     "factory-build true true"
   check "  that session ran under this claim's render (vetto's history: its policy_path)" \
     eq "$(vetto audit --query "$RENDER" --json 2>/dev/null | jq -r --arg p "$RENDER" '[.[] | select(.policy_path == $p) | .session_id] | last // "none"')" \
@@ -274,15 +309,37 @@ if [ "$(f '.actions | index("tamperguard") != null')" = true ]; then
   check "  tamperguard's stderr is kept in the run's logs" test -f "$FH/run/logs/$(f .run_id).tamperguard.err"
 fi
 
-# ---- 7. I8: no ticket text in anything that left the node ---------------------------------------------
+# ---- 7. CI's recompute: the gates CI runs, from a fresh clone of the origin ---------------------------
+# What gates.yml's jobs would say on this PR (I17): the base's scripts (the fixture main's factory/bin is
+# this repo's HEAD's) on the pushed commit, its attest note fetched as attest-verify does on CI.
+if [ "$reason" = "" ] && [ -n "$origin_branch" ]; then
+  echo "  7. CI's gates on the pushed commit, from a fresh clone of the origin"
+  CI="$S/ci"
+  git clone -q "$O" "$CI"
+  git -C "$CI" fetch -q origin "+refs/heads/ticket/T-smoke/dev-box:refs/heads/ticket/T-smoke/dev-box"
+  # A missing notes ref is attest-verify's to report (exit 2), not this fetch's.
+  git -C "$CI" fetch -q origin "+refs/notes/factory-attest:refs/notes/factory-attest" 2>/dev/null ||
+    info "origin has no refs/notes/factory-attest"
+  git -C "$CI" checkout -q --detach "$origin_branch"
+  cib="$(git -C "$CI" merge-base origin/main "$origin_branch")"
+  for g in commit-check rails-proof scope-check tamper-check attest-verify; do
+    rc=0
+    (cd "$CI" && "factory/bin/$g.sh" --ticket T-smoke --base "$cib" --head "$origin_branch") >"$S/ci.$g.out" 2>"$S/ci.$g.err" || rc=$?
+    info "CI $g: exit $rc; $(tail -n 2 "$S/ci.$g.err" | tr '\n' ' ')"
+    check "  CI's $g agrees: exit 0" eq "$rc" 0
+  done
+fi
+
+# ---- 8. I8: no ticket text in anything that left the node ---------------------------------------------
 outbound="$S/outbound.txt"
 {
   jq -r 'select(.[0] != "issue" or .[1] != "list") | .[]' "$S/gh.log"
-  jq -r '.issues[].comments[]?.body' "$S/issues.json"
+  jq -r '.issues[].comments[]?.body, (.pulls // [] | .[] | .title, .body)' "$S/issues.json"
   git -C "$O" log --format=%B --all
+  git -C "$O" notes --ref=factory-attest list 2>/dev/null | while read -r b _; do git -C "$O" cat-file -p "$b"; done
   command cat "$FH/run/ledger.jsonl" "$S/run.out"
 } >"$outbound"
-check "no ticket text in a gh call, comment, pushed commit or ledger line (I8)" eq "$(grep -cF "$MARK" "$outbound" || true)" 0
+check "no ticket text in a gh call, comment, PR, pushed commit, attest note or ledger line (I8)" eq "$(grep -cF "$MARK" "$outbound" || true)" 0
 
 # ---- the recorded items -------------------------------------------------------------------------------
 tokens="$({ find "$NH/.claude/projects" -name '*.jsonl' -print0 2>/dev/null || true; } | xargs -0 -r cat |
@@ -295,6 +352,9 @@ info "governor line: $(f -c .governor)"
 info "claim ref: refs/locks/issue-1 -> $lock_sha in the fixture ($(git -C "$O" cat-file commit "$lock_sha" 2>/dev/null | sed '1,/^$/d' | tail -n1)); now ${lock_now:-released}"
 info "fleet: $(f -c .fleet); doc reason $(doc '.reason // "null"'), ticket reasonCode $(doc '.tickets["T-smoke"].reasonCode // "null"'), review $(doc -c '.tickets["T-smoke"].review // .review // null')"
 info "pushed: origin ticket/T-smoke/dev-box ${origin_branch:-absent}; local ticket/T-smoke/dev-box ${local_branch:-absent}"
+info "PR: $(jq -c 'if . == null then "none" else {number, state, headRefName, headRefOid, baseRefName, title} end' <<<"$pr")"
+[ ! -s "$S/pr-body.md" ] || sed 's/^/    | pr body: /' "$S/pr-body.md"
+info "attest note: ${note:-none}" 
 [ -z "$origin_branch" ] || git -C "$O" log -1 --format='%B' "$origin_branch" | sed 's/^/    | /'
 info "ledger line: $L"
 info "tokens (node-local claude transcripts; fleet 1.12.0's result has no count, so the ledger says null): $tokens"

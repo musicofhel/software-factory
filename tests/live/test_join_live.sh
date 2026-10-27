@@ -65,13 +65,16 @@ LINT="$(jq -c '.probe.lint // {}' "$S/dry.json")"
 LINT_BLOCKED="$(jq -r '.needed == true and .in_plane != true' <<<"$LINT")"
 if [ "$LINT_BLOCKED" = true ]; then
   check "no in-plane shellcheck: the dry run exits 2" eq "$rc" 2
-  # A step-1 refusal skips the suite, so heavy_gates stays null and the manifest then fails its
-  # schema: that second refusal follows from the first and is the only other one allowed.
+  # The only other refusal allowed is the same gap for make lint's other tool, actionlint (T29). A
+  # step-1 refusal skips the suite, so heavy_gates stays null; join names no schema refusal for it,
+  # because the first refusal is the cause (T31).
   check "  the first refusal is the shellcheck one, with the install line" eq "$(jq -r '.refusals[0] |
     (startswith("shellcheck at") or startswith("fleet.gate runs make lint")) and endswith("Install: \(input.probe.lint.install_line)")' \
     "$S/dry.json" "$S/dry.json")" true
-  check "  any other refusal is only the manifest's heavy_gates, null because the suite never ran" \
-    eq "$(jq -c '[.refusals[1:][] | select(. != "the manifest fails factory/nodes/manifest.schema.json: manifest.heavy_gates: expected boolean, got null")]' "$S/dry.json")" "[]"
+  check "  any other refusal is the actionlint one, with its install line" \
+    eq "$(jq -c '[.refusals[1:][] | select((startswith("actionlint at") or startswith("fleet.gate runs make lint, which needs actionlint")) and test("Install: ") | not)]' "$S/dry.json")" "[]"
+  check "  no schema refusal for the null heavy_gates (the suite never ran)" \
+    eq "$(jq -c '[.refusals[] | select(test("heavy_gates"))]' "$S/dry.json")" "[]"
   check "  the dry run wrote nothing under ~/.factory, ~/.cargo/bin, ~/.local/bin" eq "$(snap "$HOME/.factory" "$HOME/.cargo/bin" "$HOME/.local/bin")" "$home_before"
   check "  the dry run wrote no ref, no git object and no file in the clone" eq "$(clone_state "$REPO_ROOT")" "$clone_before"
   echo "  SKIP part A's no-refusal checks: $(jq -r '.refusals[0]' "$S/dry.json") (kit: $(jq -r .install_line <<<"$LINT"))"

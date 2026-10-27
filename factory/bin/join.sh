@@ -498,7 +498,10 @@ mtmp="$(mktemp)"
 printf '%s\n' "$MANIFEST" >"$mtmp"
 MANIFEST_ERRORS="$(validate "$mtmp" | jq -Rsc 'split("\n") | map(select(. != ""))')" || { rm -f "$mtmp"; die "the validator failed"; }
 rm -f "$mtmp"
-while IFS= read -r e; do [ -n "$e" ] && refusal "the manifest fails factory/nodes/manifest.schema.json: $e"; done < <(jq -r '.[]' <<<"$MANIFEST_ERRORS")
+# heavy_gates is null only when an earlier refusal kept the suite from running: that refusal is the
+# cause, so the schema's heavy_gates error would only repeat it.
+while IFS= read -r e; do [ -n "$e" ] && refusal "the manifest fails factory/nodes/manifest.schema.json: $e"; done < <(
+  jq -r --argjson heavy "$HEAVY" '.[] | select($heavy != null or (startswith("manifest.heavy_gates:") | not))' <<<"$MANIFEST_ERRORS")
 [ "$json" = 1 ] || jq . <<<"$MANIFEST" | sed 's/^/  /'
 
 if [ "$(jq length <<<"$REFUSALS")" -gt 0 ]; then

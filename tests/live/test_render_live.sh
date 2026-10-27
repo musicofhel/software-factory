@@ -56,8 +56,8 @@ mkdir -p "$W/.factory-run"
 # step <name> <policy> [HOME]: the loop's step; prints "rc=<rc file or none> verdict=<JSON verdict or none>"
 step() {
   local h="${3:-$H}" rc v
-  HOME="$h" timeout 300 bash -c '. "$1"; policy_tamperguard "$2" "$3" "$4"' step \
-    "$REPO_ROOT/factory/bin/lib/policy-render.sh" "$W" "$2" "$B..$T" >"$S/vetto.$1.log" 2>&1 </dev/null || true
+  HOME="$h" timeout 300 bash -c '. "$1"; shift; policy_tamperguard "$@"' step \
+    "$REPO_ROOT/factory/bin/lib/policy-render.sh" "$W" "$2" --range "$B...$T" --json >"$S/vetto.$1.log" 2>&1 </dev/null || true
   rc="$(command cat "$W/.factory-run/tamperguard.rc" 2>/dev/null || echo none)"
   v="$(jq -r 'select(type == "object") | .verdict // "none"' "$W/.factory-run/tamperguard.json" 2>/dev/null | head -n1)"
   printf 'rc=%s verdict=%s\n' "$rc" "${v:-none}"
