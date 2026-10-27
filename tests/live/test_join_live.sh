@@ -4,7 +4,9 @@
 #
 #   A. `join.sh --handle dev-box --dry-run --json` in this clone. It must exit 0 with no refusal, a
 #      valid manifest and heavy_gates measured, and it must write nothing: the clone's refs, objects
-#      and status, ~/.factory, ~/.cargo/bin and ~/.local/bin are the same before and after.
+#      and status, ~/.factory, ~/.cargo/bin and ~/.local/bin are the same before and after. On a box
+#      whose only shellcheck fleet's sandbox cannot see (T24), it must instead exit 2 with exactly
+#      that refusal, and parts B and C then empty fleet.gate.build in their scratch clones.
 #   B. `join.sh --apply` in a scratch clone whose `fixture` remote is a local bare origin built by
 #      tests/fixtures/make-repo.sh (never GitHub, I1), with a scratch FACTORY_HOME and a PATH that
 #      hides dcg and cux. That runs the real release download and the pinned sha256 check, fleet's
@@ -56,6 +58,24 @@ home_before="$(snap "$HOME/.factory" "$HOME/.cargo/bin" "$HOME/.local/bin")"
 clone_before="$(clone_state "$REPO_ROOT")"
 rc=0
 (cd "$REPO_ROOT" && unset FACTORY_HOME && factory/bin/join.sh --handle dev-box --json) >"$S/dry.json" 2>"$S/dry.err" || rc=$?
+# T24: main's fleet.gate runs `make lint`, and fleet runs it in a sandbox that sees only the system
+# roots. A box whose only shellcheck is under $HOME is refused for exactly that (kit: the distro
+# package). Then part A asserts that refusal, and skips its no-refusal checks with the reason.
+LINT="$(jq -c '.probe.lint // {}' "$S/dry.json")"
+LINT_BLOCKED="$(jq -r '.needed == true and .in_plane != true' <<<"$LINT")"
+if [ "$LINT_BLOCKED" = true ]; then
+  check "no in-plane shellcheck: the dry run exits 2" eq "$rc" 2
+  # A step-1 refusal skips the suite, so heavy_gates stays null and the manifest then fails its
+  # schema: that second refusal follows from the first and is the only other one allowed.
+  check "  the first refusal is the shellcheck one, with the install line" eq "$(jq -r '.refusals[0] |
+    (startswith("shellcheck at") or startswith("fleet.gate runs make lint")) and endswith("Install: \(input.probe.lint.install_line)")' \
+    "$S/dry.json" "$S/dry.json")" true
+  check "  any other refusal is only the manifest's heavy_gates, null because the suite never ran" \
+    eq "$(jq -c '[.refusals[1:][] | select(. != "the manifest fails factory/nodes/manifest.schema.json: manifest.heavy_gates: expected boolean, got null")]' "$S/dry.json")" "[]"
+  check "  the dry run wrote nothing under ~/.factory, ~/.cargo/bin, ~/.local/bin" eq "$(snap "$HOME/.factory" "$HOME/.cargo/bin" "$HOME/.local/bin")" "$home_before"
+  check "  the dry run wrote no ref, no git object and no file in the clone" eq "$(clone_state "$REPO_ROOT")" "$clone_before"
+  echo "  SKIP part A's no-refusal checks: $(jq -r '.refusals[0]' "$S/dry.json") (kit: $(jq -r .install_line <<<"$LINT"))"
+else
 check "dry run exits 0" eq "$rc" 0
 check "no refusal" eq "$(jq -c .refusals "$S/dry.json")" "[]"
 check "mode is dry-run and the factory home is ~/.factory" eq "$(jq -r '"\(.mode) \(.factory_home)"' "$S/dry.json")" "dry-run $HOME/.factory"
@@ -77,6 +97,17 @@ info "slots $(jq -r .slots "$S/dry.json"), heavy_gates $(jq -r .heavy_gates "$S/
 info "plan: $(jq -r '[.plan[] | "\(.tool) \(.pin) \(.state)"] | join("; ")' "$S/dry.json")"
 info "nodes: $(jq -c .nodes "$S/dry.json")"
 jq -r '.warnings[]' "$S/dry.json" | while IFS= read -r w; do info "warning: $w"; done
+fi
+info "lint: $LINT"
+
+# lint_off <clone>: parts B and C measure the installs, not the gate. On a box part A refused for
+# want of shellcheck, their scratch clone commits a fleet.gate without `make lint` (said, never silent).
+lint_off() {
+  [ "$LINT_BLOCKED" = true ] || return 0
+  jq '.fleet.gate.build = ""' "$1/.adlc/config.json" >"$1/.adlc/config.json.n" && mv "$1/.adlc/config.json.n" "$1/.adlc/config.json"
+  git -C "$1" commit -qm "live: fleet.gate without make lint (part A covers the shellcheck refusal)" -- .adlc/config.json
+  echo "  NOTE $1: fleet.gate.build emptied in the scratch clone, because part A was refused for shellcheck"
+}
 
 # ---- B. --apply against a fixture origin --------------------------------------------------------
 echo "  part B: --apply against a fixture origin with a scratch FACTORY_HOME"
@@ -92,6 +123,7 @@ part_b() {
   echo "node alice 1761300000 active 2" | bash "$REPO_ROOT/tests/fixtures/make-repo.sh" "$O"
   git clone -q "$REPO_ROOT" "$C"
   git -C "$C" remote add fixture "$O"
+  lint_off "$C"
   tip0="$(git -C "$O" rev-parse refs/heads/nodes)"
 
   # Shadow every PATH dir that holds dcg or cux with symlinks to everything else in it.
@@ -172,6 +204,8 @@ part_c() {
   echo "node alice 1761300000 active 2" | bash "$REPO_ROOT/tests/fixtures/make-repo.sh" "$O"
   git clone -q "$REPO_ROOT" "$C"
   git -C "$C" remote add fixture "$O"
+  ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=live GIT_AUTHOR_EMAIL=live@fake \
+      GIT_COMMITTER_NAME=live GIT_COMMITTER_EMAIL=live@fake; lint_off "$C" )
   good="$(sed -n 's/^ADV_SHA512=//p' "$C/factory/bin/join.sh")"
   bad="${good%?}$(case "${good: -1}" in 0) echo 1 ;; *) echo 0 ;; esac)"
   sed -i "s/^ADV_SHA512=$good\$/ADV_SHA512=$bad/" "$C/factory/bin/join.sh"

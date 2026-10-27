@@ -244,8 +244,102 @@ case_fakes() {
     "$(jq -cn --arg c "$POLICY/dcg.toml" '["test","-c",$c,"--dialect","posix","--robot","git push origin x"]')"
 }
 
+# The `.fleet` block of .adlc/config.json against fleet 1.12.0's config reader
+# (@adlc/fleet, the npx cache of `npx @adlc/fleet@1.12.0`):
+#   repo keys: lib/config.mjs:209-219 and :245 resolveRunConfig reads gate, init, allowedCommands,
+#     concurrency, base, timeoutMinutes, prosecuteFailOn, reviewBin, reviewProvider,
+#     reviewMaxBytes (:203-207, a positive integer <= DEFAULTS.reviewMaxBytes 262144 :25, else
+#     warned and defaulted) and adapterStdin (:245, honoured only when === true).
+#   operator-local keys, warned and ignored from the repo file: lib/config.mjs:158-198,
+#     disposableContainer (:158), adapterCommand and adapterArgs (:164), adapter (:170), model
+#     (:176), modelAuthKey (:182), modelPlaneWritable (:189) and OPERATOR_LOCAL_EXTENSION_KEYS
+#     (:44-48, looped at :196-198).
+#   gate: lib/preflight.mjs:63-64 refuses a run with no gate or neither build nor test;
+#     lib/gates.mjs:36-38 runs only gate.build then gate.test, each as `/bin/sh -c` (:21), and
+#     lib/adapters/claude-code.mjs:108-113 turns init, gate.build, gate.test and every
+#     allowedCommands entry into a `Bash(<cmd>)` permission rule (:103).
+#   prosecuteFailOn: lib/prosecute.mjs:11 SEVERITY_ORDER low|medium|high|critical; an unknown
+#     value falls back to medium silently (:26), so this check is the only guard.
+#   timeoutMinutes: lib/live-deps.mjs:255 multiplies it by 60000, unvalidated. concurrency is the
+#     worker cap (lib/run.mjs:254), base a branch name (lib/config.mjs:214), init a `/bin/sh -c`
+#     string (lib/live-deps.mjs:384-386), reviewBin a command (lib/live-deps.mjs:230).
+FLEET_JQ='
+def nestr: type == "string" and length > 0;
+def posint: type == "number" and . == floor and . > 0;
+def repo_keys: "gate", "init", "allowedCommands", "concurrency", "base", "timeoutMinutes",
+  "prosecuteFailOn", "reviewBin", "reviewProvider", "reviewMaxBytes", "adapterStdin";
+def operator_keys: "disposableContainer", "adapterCommand", "adapterArgs", "adapter", "model",
+  "modelAuthKey", "modelPlaneWritable", "noPr", "noComplete", "deadEndFile", "maxStrikes",
+  "wallClockMinutes", "charterFile", "preStrikeArgv", "preStrikeEnv", "modelPlaneRead",
+  "modelPlaneReadOnly", "modelPlaneGit", "modelPlaneGitMirror", "modelPlaneEgress", "workerDeps";
+def chk(k; p; msg): if has(k) and (.[k] | p | not) then "\(k): \(msg)" else empty end;
+(keys - ["fleet"]) as $top
+| [ if $top != $head then "top-level keys besides fleet differ from HEAD: \($top | tojson)" else empty end ]
++ ( .fleet as $f
+  | if ($f | type) != "object" then ["no .fleet object"]
+    else $f | [
+      ( keys[] as $k
+        | if ($k | IN(repo_keys)) then empty
+          elif ($k | IN(operator_keys)) then "operator-local key \($k): CLI only"
+          else "unknown key \($k)" end ),
+      ( if has("gate") | not then "gate: missing (an ungated fleet does not run)"
+        elif (.gate | type) != "object" then "gate: not an object"
+        else .gate
+          | ( keys[] | select(IN("build", "test") | not) | "gate: unknown key \(.)" ),
+            ( to_entries[] | select((.key | IN("build", "test")) and (.value | nestr | not))
+              | "gate.\(.key): not a non-empty string" ),
+            ( if has("build") or has("test") then empty else "gate: needs build and/or test" end )
+        end ),
+      chk("init"; nestr; "not a non-empty string"),
+      chk("allowedCommands"; type == "array" and all(.[]; nestr); "not an array of non-empty strings"),
+      chk("concurrency"; posint; "not a positive integer"),
+      chk("base"; nestr; "not a non-empty string"),
+      chk("timeoutMinutes"; posint; "not a positive integer"),
+      chk("prosecuteFailOn"; IN("low", "medium", "high", "critical"); "not one of low|medium|high|critical"),
+      chk("reviewBin"; nestr; "not a non-empty string"),
+      chk("reviewProvider"; nestr; "not a non-empty string"),
+      chk("reviewMaxBytes"; posint and . <= 262144; "not a positive integer <= 262144"),
+      chk("adapterStdin"; type == "boolean"; "not a boolean") ]
+    end )
+| .[]'
+# fleet_errors <config.json> <head-keys-json>: one error per line, nothing when the file is valid.
+# <head-keys-json> is the sorted top-level keys of HEAD's committed config, less fleet.
+fleet_errors() { jq -r --argjson head "$2" "$FLEET_JQ" "$1"; }
+
+case_fleet_config() {
+  local main="$REPO_ROOT/.adlc/config.json" head mut want
+  head="$(git -C "$REPO_ROOT" show HEAD:.adlc/config.json | jq -c 'keys - ["fleet"]')"
+  pol_setup
+  check "main's .adlc/config.json: the .fleet block reads clean, nothing else added" \
+    eq "$(fleet_errors "$main" "$head")" ""
+  while IFS='|' read -r mut want; do
+    jq "$mut" "$main" >"$WORLD/c.json"
+    check "a bad fixture ($mut) is refused: $want" eq "$(fleet_errors "$WORLD/c.json" "$head")" "$want"
+  done <<'EOF_CASES'
+.fleet.foo = 1|unknown key foo
+.fleet.model = "claude-opus"|operator-local key model: CLI only
+.fleet.maxStrikes = 3|operator-local key maxStrikes: CLI only
+.fleet.gate = {}|gate: needs build and/or test
+.fleet.gate.test = ""|gate.test: not a non-empty string
+.fleet.gate.build = 3|gate.build: not a non-empty string
+.fleet.gate.lint = "make lint"|gate: unknown key lint
+del(.fleet.gate)|gate: missing (an ungated fleet does not run)
+.fleet.prosecuteFailOn = "severe"|prosecuteFailOn: not one of low|medium|high|critical
+.fleet.timeoutMinutes = 0|timeoutMinutes: not a positive integer
+.fleet.timeoutMinutes = "30"|timeoutMinutes: not a positive integer
+.fleet.allowedCommands = "make"|allowedCommands: not an array of non-empty strings
+.fleet.concurrency = 1.5|concurrency: not a positive integer
+.fleet.reviewMaxBytes = 262145|reviewMaxBytes: not a positive integer <= 262144
+del(.fleet)|no .fleet object
+.fleet = []|no .fleet object
+EOF_CASES
+  jq ".extra = 1" "$main" >"$WORLD/c.json"
+  check "a top-level key added beside .fleet is refused" eq "$(fleet_errors "$WORLD/c.json" "$head")" \
+    "top-level keys besides fleet differ from HEAD: $(jq -c ". + [\"extra\"] | sort" <<<"$head")"
+}
+
 echo "test_policy"
-for c in lock-render lock-apply adapters-schema vetto-policies vetto-net dcg-config fakes; do
+for c in lock-render lock-apply adapters-schema vetto-policies vetto-net dcg-config fakes fleet-config; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

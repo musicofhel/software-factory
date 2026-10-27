@@ -186,6 +186,20 @@ git -C "$SCN" add .adlc/config.json
 scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn-adlc T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
 judge S.ticket-adlc "$(scn_detail scope "$h")" check_fails_naming scope "$h" '\.adlc/config\.json'
 
+# I16 for build-test (TB5): the head rewrites fleet.gate to commands that cannot fail. build-test runs
+# the BASE's list (`make lint`, then `make test`, build-test.sh's trace lines), never the head's.
+base_gate_ran() {  # base_gate_ran <head>: build-test's trace is exactly the base's list, no head command
+  local log; log="$(job_log pull_request "$1" build-test)"
+  [ -n "$log" ] && [ "$(grep -E '^build-test: (build|test): ' "$log" | tr '\n' '|')" = \
+    "build-test: build: /bin/sh -c make lint|build-test: test: /bin/sh -c make test|" ] && ! grep -q head-gate "$log"
+}
+scn_start ticket/T-sim-s/scn-gate-config
+jq '.fleet.gate = {build: "echo head-gate", test: "echo head-gate"}' "$SCN/.adlc/config.json" >"$SCN/.adlc/config.json.n" &&
+  mv "$SCN/.adlc/config.json.n" "$SCN/.adlc/config.json"
+git -C "$SCN" add .adlc/config.json
+scn_commit T-sim-s; pr="$(scn_pr ticket/T-sim-s/scn-gate-config T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
+judge S.head-edits-gate-config "$(scn_detail build-test "$h")" base_gate_ran "$h"
+
 # A desk PR (only .adlc/**): a `desk` check runs the desk gates and passes.
 scn_start desk/scn-desk
 ticket_json T-sim-desk 0 sim/desk '[]' >"$SIM/ticket-T-sim-desk.json"

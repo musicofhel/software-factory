@@ -26,6 +26,13 @@
 #   vetto_masks   paths vetto 0.6.5 masks in $HOME (src/sandbox/linux/vfs_overlays.rs) that are
 #                 symlinks: vetto then fails closed with exit 125 (measured on ~/.aws, records/TB1.md)
 #   uid           the user id the wizard runs as (root is refused by the wizard)
+#   lint          the shellcheck `make lint` needs inside fleet's repo-command plane (ticket T24):
+#                 needed (the clone's .adlc/config.json fleet.gate.build, .test or fleet.init runs
+#                 `make lint`), shellcheck (the first on PATH whose directory and real path lie under
+#                 a root the plane binds, /usr /lib /lib64 through the bwrap shim, else the first on
+#                 PATH; null when none), version, in_plane (null on macOS: not measured), and the
+#                 distribution's install_line. fleet's plane has no $HOME, so a shellcheck under
+#                 ~/.local is invisible there (specs/factory-step3-v1 records/TB5.md).
 #
 # FACTORY_PROBE_ROOT (tests only) is prefixed to every /proc and /etc path read here, and to the
 # host paths the shim reads.
@@ -35,7 +42,7 @@ PROG=probe
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/common.sh"
 
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 json=0 clone=""
 while [ $# -gt 0 ]; do
@@ -172,11 +179,42 @@ for p in .ssh .aws .gnupg .env .npmrc .docker/config.json .config/gh/hosts.yml; 
   masks="$(jq -c --arg p "$HOME/$p" --arg k "$kind" '. + [{path: $p, target_kind: $k}]' <<<"$masks")"
 done
 
+# ---- shellcheck for `make lint` in fleet's plane -----------------------------------------------
+lint_needed="$(jq -r '[.fleet.gate.build?, .fleet.gate.test?, .fleet.init?] | map(strings)
+  | any(test("(^|[^A-Za-z0-9_-])make\\s+lint([^A-Za-z0-9_-]|$)"))' "$clone/.adlc/config.json" 2>/dev/null)" || lint_needed=false
+[ "$lint_needed" = true ] || lint_needed=false
+in_roots() { case "$1" in "$R"/usr/*|"$R"/lib/*|"$R"/lib64/*) return 0 ;; esac; return 1; }
+sc_first="" sc_plane=""
+IFS=: read -ra path_dirs <<<"${PATH:-}"
+for d in "${path_dirs[@]}"; do
+  [ -n "$d" ] && [ -f "$d/shellcheck" ] && [ -x "$d/shellcheck" ] || continue
+  [ -n "$sc_first" ] || sc_first="$d/shellcheck"
+  if in_roots "$(readlink -f "$d" 2>/dev/null)/" && in_roots "$(readlink -f "$d/shellcheck" 2>/dev/null)"; then
+    sc_plane="$d/shellcheck"; break
+  fi
+done
+sc="${sc_plane:-$sc_first}" sc_version="" sc_in_plane=false
+[ -z "$sc_plane" ] || sc_in_plane=true
+[ "$os" != macos ] || sc_in_plane=null
+[ -z "$sc" ] || sc_version="$("$sc" --version 2>/dev/null | sed -n 's/^version: //p' | semver_of)"
+case "$os $distro " in
+  macos*) sc_install="brew install shellcheck" ;;
+  *" debian "*|*" ubuntu "*) sc_install="sudo apt-get install shellcheck" ;;
+  *" fedora "*|*" rhel "*|*" centos "*) sc_install="sudo dnf install ShellCheck" ;;
+  *" arch "*) sc_install="sudo pacman -S shellcheck" ;;
+  *" suse "*|*" opensuse "*) sc_install="sudo zypper install ShellCheck" ;;
+  *" alpine "*) sc_install="sudo apk add shellcheck" ;;
+  *) sc_install="install shellcheck from your distribution's packages (it must land under /usr)" ;;
+esac
+lint="$(jq -cn --argjson n "$lint_needed" --arg sc "$sc" --arg v "$sc_version" --argjson p "$sc_in_plane" --arg i "$sc_install" \
+  '{needed: $n, shellcheck: (if $sc == "" then null else $sc end), version: (if $v == "" then null else $v end),
+    in_plane: (if $sc == "" then false else $p end), install_line: $i}')"
+
 out="$(jq -cn --arg os "$os" --arg note "$os_note" --arg kernel "$kernel" --arg arch "$arch" --arg distro "$distro" \
   --argjson cpu "$cpu" --argjson tk "$total_kb" --argjson fk "$free_kb" --argjson dk "$disk_kb" \
   --arg sbn "$sb_name" --argjson sbp "$sb_present" --argjson sbw "$sb_works" --arg sbv "$sb_version" \
   --arg sbi "$sb_install" --argjson sbs "$sb_shim" --argjson adapters "$adapters" --argjson skips "$skips" --argjson masks "$masks" \
-  --argjson uid "$(id -u)" --arg clone "$clone" '
+  --argjson lint "$lint" --argjson uid "$(id -u)" --arg clone "$clone" '
   def gb: . / 1048576 * 100 | round / 100;
   {os: (if $os == "" then null else $os end), os_note: (if $note == "" then null else $note end),
    kernel: $kernel, arch: $arch, distro: ($distro | ltrimstr(" ") | rtrimstr(" ")),
@@ -185,7 +223,7 @@ out="$(jq -cn --arg os "$os" --arg note "$os_note" --arg kernel "$kernel" --arg 
    sandbox: {backend: (if $sbn == "" then null else $sbn end), present: $sbp, works: $sbw,
              version: (if $sbv == "" then null else $sbv end), install_line: (if $sbi == "" then null else $sbi end),
              shim: $sbs},
-   adapters: $adapters, skip_permissions: $skips, vetto_masks: $masks, uid: $uid}')"
+   adapters: $adapters, skip_permissions: $skips, vetto_masks: $masks, uid: $uid, lint: $lint}')"
 
 if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
   jq -r '"os \(.os // "unsupported")\(if .os_note then " (\(.os_note))" else "" end), \(.kernel) \(.arch)",
@@ -194,5 +232,6 @@ if [ "$json" = 1 ]; then printf '%s\n' "$out"; else
          (.sandbox.shim // empty | "bwrap shim for fleet \(.fleet_pin) (ADR-0006): real bwrap \(.bwrap // "none"), ready \(.ready), merged usr \(.merged_usr); adds \([.paths[] | select(.insert) | if .insert == "symlink" then "\(.path)->\(.target)" else .path end] | join(" "))"),
          (.adapters[] | "adapter \(.name): \(if .installed then "\(.version // "?") authenticated \(.authenticated // "not measured")" else "absent" end)"),
          (.skip_permissions[] | "skip-permissions in \(.file) (\(.kind))"),
-         (.vetto_masks[] | "vetto masks \(.path), a symlink to a \(.target_kind)")' <<<"$out"
+         (.vetto_masks[] | "vetto masks \(.path), a symlink to a \(.target_kind)"),
+         (.lint | select(.needed) | "make lint (fleet.gate): shellcheck \(.shellcheck // "absent")\(if .version then " \(.version)" else "" end), in fleet'"'"'s plane \(if .in_plane == null then "not measured" else .in_plane end)")' <<<"$out"
 fi

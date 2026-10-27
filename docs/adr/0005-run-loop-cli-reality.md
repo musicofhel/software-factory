@@ -318,6 +318,42 @@ one tool pin and one range rule (I17). The measurements are in `specs/factory-st
    SPEC-v0.2 L644, node:G16), because fleet's review step needs it. The consequence above that names it
    as T11's still holds for providing a trusted one.
 
+## Amendment 2026-10-26: T24, main's fleet block and the build-test gate
+
+Ticket T24 (TB5 of specs/factory-step3-v1) gives main the one repo-wide `fleet` block that ruling Q3 of
+factory-step2-followups-v1 asked for. The measurements are in specs/factory-step3-v1/records/TB5.md.
+
+1. **The block.** `.adlc/config.json` `fleet` = `gate.build "make lint"`, `gate.test "make test"`, a
+   desk-written `allowedCommands`, `prosecuteFailOn "medium"`, `timeoutMinutes 30`. The adapter, the
+   model and the key stay CLI-only: fleet 1.12.0 warns about and ignores those keys in the repo file
+   (`lib/config.mjs` OPERATOR_LOCAL_EXTENSION_KEYS), and `tests/test_policy.sh` (case fleet-config)
+   fails on them and on any key fleet's reader does not know. It is a desk commit, because `.adlc/**`
+   is outside every ticket's scope.
+2. **One command list from the base.** `factory/bin/build-test.sh` runs `fleet.gate` exactly as fleet
+   does: `build`, then `test`, each skipped when empty, each as `/bin/sh -c <command>`, stopping at the
+   first failure (`lib/gates.mjs` runGates). It reads the config of the checkout it lives in. CI runs
+   the base's copy from `./.base` against the head's tree, so a PR that rewrites `fleet.gate` is gated
+   by the base's list (I16). fleet on the node reads the config of the base it builds on, origin/main,
+   so the node and CI run one list (I17). `make live` (test_fleet_config_live.sh) compares fleet's own
+   `runGates` argv with `build-test.sh --list`.
+3. **`make lint` is offline.** It is `gate.build`, and fleet runs it with no network, so the uvx
+   download fallbacks are gone. shellcheck is `$SHELLCHECK`, else PATH, and it is required. CI installs
+   shellcheck-py 0.11.0.1 and checks `version: 0.11.0` (`SHELLCHECK_PIN` in join.sh). actionlint stays
+   best-effort until T29 pins it in CI.
+4. **fleet's repo-command plane.** fleet 1.12.0 runs `fleet.gate` in its bwrap repo-command plane
+   (`lib/sandbox.mjs`, the BOUNDED read policy). Through the factory shim it binds the worktree, its
+   synthetic HOME and the system roots, and nothing else: no `/dev`, `/proc`, `/tmp` or `/etc` beyond
+   ssl, resolv.conf and hosts, no `$HOME`, and no network. So a shellcheck under `~/.local` is
+   invisible there. The probe reports `.lint` (needed, the shellcheck the plane would use, its version,
+   in_plane), and join refuses a node whose `fleet.gate` runs `make lint` when no shellcheck lies under
+   a system root. It prints the distribution's install line and never runs it, and it warns when the
+   version is not the pin.
+5. **`make test` cannot pass in that plane yet.** Every suite uses `/dev/null` and `mktemp`; with
+   `/dev`, `/proc` and `/tmp` added, 13 of 20 suites still fail, because awk resolves through
+   `/etc/alternatives`. The shim may add only read-only system roots (I12), so this row does not widen
+   it. The choice is Aaron's (HANDOFF Q1 of specs/factory-step3-v1). Until then a real ticket fails its
+   test gate on a node, and CI runs the same list on a runner, where it passes.
+
 ## Consequences
 
 - SPEC-v0.2's sketch is wrong in five spellings (ralon `--lock`, vetto `--profile`, `cux status --json`,

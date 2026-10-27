@@ -309,12 +309,12 @@ case_gates_yml_base_scripts() {
   # Every run: step that calls a factory/bin script calls the base's copy, ./.base/factory/bin/...
   bad="$(yq -r '.jobs[].steps[] | select(has("run")) | .run' "$wf" | grep -E 'factory/bin/' | grep -vE '(^|[ ;&|])\./\.base/factory/bin/' || true)"
   check "no gate step runs the head's factory/bin" eq "$bad" ""
-  check "context, rails-proof, scope, tamper, commit-check and attest-verify run a base script" \
+  check "context, rails-proof, scope, tamper, commit-check, attest-verify and build-test (T24) run a base script" \
     eq "$(yq -r '.jobs | to_entries[] | select([.value.steps[] | select(has("run")) | .run] | join(" ") | test("\\./\\.base/factory/bin/")) | .key' "$wf" | sort | tr '\n' ' ')" \
-       "attest-verify commit-check context rails-proof scope tamper "
+       "attest-verify build-test commit-check context rails-proof scope tamper "
   # Each such job: the head (full history) checked out first, then the base into .base.
   local j
-  for j in context rails-proof scope tamper commit-check attest-verify; do
+  for j in context rails-proof scope tamper commit-check attest-verify build-test; do
     check "$j: checkout head (fetch-depth 0), then base into .base" \
       eq "$(yq -o=json -I=0 ".jobs[\"$j\"].steps | map(select(.uses == \"actions/checkout@v4\") | .with)" "$wf")" \
          '[{"ref":"${{ env.GATE_HEAD }}","fetch-depth":0},{"ref":"${{ env.GATE_BASE }}","path":".base"}]'

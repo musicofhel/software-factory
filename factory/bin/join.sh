@@ -11,7 +11,9 @@
 #   1. probe     factory/bin/lib/probe.sh, then the refusals: root, unsupported OS, no sandbox
 #                backend (bwrap on Linux, sandbox-exec on macOS; the install line is printed),
 #                slots < 1, --dangerously-skip-permissions in a shell rc or Claude settings file,
-#                no authenticated adapter that factory/policy/adapters.json pins. A timed run of
+#                no authenticated adapter that factory/policy/adapters.json pins, a fleet.gate that
+#                runs `make lint` with no shellcheck under a system root (fleet's sandbox sees
+#                nothing else; the install line is printed, never run). A timed run of
 #                `make test` in the clone (timeout: budget.json weights.light.suiteMinutesMax)
 #                sets heavy_gates. Warnings: the bwrap shim (ADR-0006) cannot run (no real bwrap,
 #                no /usr), or the host is not merged usr (/bin a real directory: fleet 1.12.0's
@@ -44,7 +46,7 @@ PROG="join"
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 SCHEMA="$FACTORY_ROOT/factory/nodes/manifest.schema.json"
 PINS_FILE="$FACTORY_ROOT/factory/policy/adapters.json"
@@ -214,6 +216,19 @@ fi
 while IFS= read -r m; do
   [ -n "$m" ] && warning "vetto 0.6.5 masks $m and fails closed (exit 125) when it is a symlink, so the run loop's vetto steps will refuse on this HOME until it is a real directory or file"
 done < <(jq -r '.vetto_masks[] | "\(.path) (a symlink to a \(.target_kind))"' <<<"$PROBE")
+# The shellcheck `make lint` needs (ticket T24): when the clone's fleet.gate runs it, fleet runs it in its
+# repo-command plane, which sees only the system roots (records/TB5.md of specs/factory-step3-v1), so
+# a shellcheck there is required. The install line is printed, never run. SHELLCHECK_PIN is CI's
+# (gates.yml build-test installs shellcheck-py ${SHELLCHECK_PIN}.1); another version only warns.
+SHELLCHECK_PIN=0.11.0
+lint_refusal="$(jq -r '.lint // {} | if .needed != true then empty
+    elif .shellcheck == null then "fleet.gate runs make lint, which needs shellcheck, and none is on PATH. Install: \(.install_line)"
+    elif .in_plane == false then "shellcheck at \(.shellcheck) is not visible in fleet'"'"'s sandbox, which binds only the system roots (/usr, /lib, /lib64), so fleet.gate'"'"'s make lint fails on this node. Install: \(.install_line)"
+    else empty end' <<<"$PROBE")"
+[ -z "$lint_refusal" ] || refusal "$lint_refusal"
+lint_version="$(jq -r '.lint // {} | select(.needed == true and .shellcheck != null and .in_plane != false) | .version // "unknown"' <<<"$PROBE")"
+[ -z "$lint_version" ] || [ "$lint_version" = "$SHELLCHECK_PIN" ] ||
+  warning "shellcheck $lint_version is not the pin $SHELLCHECK_PIN (CI's, gates.yml build-test): make lint may report differently on this node and in CI"
 
 if [ "$suite" = 0 ]; then
   HEAVY=false SUITE='{"ran": false, "reason": "--no-suite"}'

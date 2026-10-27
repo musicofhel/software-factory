@@ -6,7 +6,8 @@
 # acceptance 6: the probe reports the bwrap shim's prerequisites (case shim-prereqs); the probe root
 # is a merged-usr host unless a case says otherwise. T15: the reviewer pinned by npm integrity and
 # failing closed (case review-pin, AC1), the manifest's review field (case review-field, AC2), the
-# printed cux line and no credential in any argv join hands a tool (case cux-line, AC3).
+# printed cux line and no credential in any argv join hands a tool (case cux-line, AC3). T24: a
+# fleet.gate running `make lint` needs a shellcheck under a system root (case lint-shellcheck).
 set -euo pipefail
 # shellcheck source=tests/fakes/lib.sh
 . "$(dirname "$0")/fakes/lib.sh"
@@ -492,6 +493,62 @@ case_shim_prereqs() {
   check "macOS: no shim" eq "$(jq -c '.probe.sandbox.shim' <<<"$OUT")" null
 }
 
+# T24: a clone whose fleet.gate runs `make lint` needs a shellcheck fleet's repo-command plane can
+# see, which binds only the system roots (records/TB5.md of specs/factory-step3-v1).
+case_lint_shellcheck() {
+  join_setup; all_installed
+  local cfg="$WORLD/clone/.adlc/config.json" usr="$WORLD/root/usr/bin" loc="$HOME/.local/bin" base="$JPATH"
+  jq -n '{fleet: {gate: {build: "make lint", test: "make test"}}}' >"$cfg"
+  sc() {  # sc <dir> <version>: a shellcheck there that reports the version
+    mkdir -p "$1"; printf '#!/usr/bin/env bash\nprintf "ShellCheck\\nversion: %s\\n"\n' "$2" >"$1/shellcheck"; chmod +x "$1/shellcheck"
+  }
+  jn --handle node-a --no-suite --json
+  check "make lint, no shellcheck: refused with the install line, never run" \
+    eq "$(jq -c '[.exit, .probe.lint.needed, .probe.lint.shellcheck, .probe.lint.in_plane]' <<<"$OUT")" '[2,true,null,false]'
+  check "  the refusal names it" eval 'jq -e ".refusals | any(. == \"fleet.gate runs make lint, which needs shellcheck, and none is on PATH. Install: sudo apt-get install shellcheck\")" <<<"$OUT" >/dev/null'
+  check "  join ran no install (no sudo, no apt-get)" eval '! grep -qE "sudo|apt-get" "$FAKE_JOIN_LOG"'
+
+  sc "$loc" 0.11.0; JPATH="$loc:$base"
+  jn --handle node-a --no-suite --json
+  check "only under ~/.local: refused, not visible in fleet's sandbox" \
+    eq "$(jq -c '[.exit, .probe.lint.shellcheck, .probe.lint.version, .probe.lint.in_plane]' <<<"$OUT")" "[2,\"$loc/shellcheck\",\"0.11.0\",false]"
+  check "  the refusal says why" eval 'jq -e ".refusals | any(startswith(\"shellcheck at $loc/shellcheck is not visible in fleet'"'"'s sandbox\") and endswith(\"Install: sudo apt-get install shellcheck\"))" <<<"$OUT" >/dev/null'
+
+  ln -s "$loc/shellcheck" "$WORLD/root/usr/bin/shellcheck"; JPATH="$usr:$base"
+  jn --handle node-a --no-suite --json
+  check "a link under /usr into ~/.local: still refused (its real path is outside the plane)" \
+    eq "$(jq -c '[.exit, .probe.lint.in_plane]' <<<"$OUT")" '[2,false]'
+  rm "$usr/shellcheck"
+
+  sc "$usr" 0.11.0; JPATH="$loc:$usr:$base"
+  jn --handle node-a --no-suite --json
+  check "$HOME/.local first, the pin under /usr too: ok, the plane's one is reported, no warning" \
+    eq "$(jq -c '[.exit, .probe.lint.shellcheck, .probe.lint.in_plane, .warnings]' <<<"$OUT")" "[0,\"$usr/shellcheck\",true,[]]"
+  jn --handle node-a --no-suite
+  check "  the report prints the lint line" grep -qF "make lint (fleet.gate): shellcheck $usr/shellcheck 0.11.0, in fleet's plane true" <<<"$OUT"
+
+  sc "$usr" 0.9.0
+  jn --handle node-a --no-suite --json
+  check "another version under /usr: ok, one warning names the pin" \
+    eq "$(jq -c '[.exit, .warnings]' <<<"$OUT")" '[0,["shellcheck 0.9.0 is not the pin 0.11.0 (CI'"'"'s, gates.yml build-test): make lint may report differently on this node and in CI"]]'
+  check "  the pin is the one gates.yml installs" \
+    grep -qF "shellcheck-py==$(sed -n 's/^SHELLCHECK_PIN=//p' "$JOIN").1" "$REPO_ROOT/.github/workflows/gates.yml"
+
+  rm -f "$usr/shellcheck" "$loc/shellcheck"; JPATH="$base"
+  jq -n '{fleet: {gate: {test: "bash tests/test_hello.sh"}}}' >"$cfg"
+  jn --handle node-a --no-suite --json
+  check "a gate without make lint: no shellcheck needed, no refusal" \
+    eq "$(jq -c '[.exit, .probe.lint.needed, .refusals]' <<<"$OUT")" '[0,false,[]]'
+  jq -n '{fleet: {gate: {test: "make test"}, init: "make lint"}}' >"$cfg"
+  printf 'NAME="Fedora"\nID=fedora\n' >"$WORLD/root/etc/os-release"
+  jn --handle node-a --no-suite --json
+  check "fleet.init runs make lint: needed; Fedora's install line" \
+    eq "$(jq -c '[.exit, .probe.lint.needed, .probe.lint.install_line]' <<<"$OUT")" '[2,true,"sudo dnf install ShellCheck"]'
+  jq -n '{fleet: {gate: {build: "make lint-docs"}}}' >"$cfg"
+  jn --handle node-a --no-suite --json
+  check "make lint-docs is not make lint" eq "$(jq -c '.probe.lint.needed' <<<"$OUT")" false
+}
+
 case_review_pin() {
   join_setup; all_installed
   local fh="$HOME/.factory" hex integ m cmd tip0
@@ -618,7 +675,7 @@ case_cux_line() {
 
 for c in dry-run-ok slots refuse-no-sandbox refuse-macos-sandbox refuse-skip-permissions-rc \
          refuse-skip-permissions-settings refuse-no-adapter refuse-schema refuse-other heavy-gates plan \
-         home-diff nodes-cas no-nodes-branch validator usage shim-prereqs review-pin review-field cux-line; do
+         home-diff nodes-cas no-nodes-branch validator usage shim-prereqs lint-shellcheck review-pin review-field cux-line; do
   run_case "$c"
 done
 [ "$FAILED" = 0 ]

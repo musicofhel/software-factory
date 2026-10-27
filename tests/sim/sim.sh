@@ -213,11 +213,9 @@ walk() {  # walk <X> <ticket> <scope-dir> [skip-ready]
   node_run dev-box FAKE_FLEET_CHECK_CONFIG=1 FAKE_FLEET_FILE="$dir/hello.sh"
   judge "$X.claim" "claim comments by dev-box-owner on #$n" \
     ghq -e --argjson n "$n" 'any(.issues[] | select(.number == $n) | .comments[]; .author.login == "dev-box-owner")'
-  if grep -q '"preflight"' <<<"$RUN_LAST"; then
-    stage "$X.fleet-preflight" red "fleet refused: no fleet block in main's .adlc/config.json"
-    standin "fleet without its config preflight (main's fleet block is TB5)"
-    node_run dev-box FAKE_FLEET_CHECK_CONFIG=0 FAKE_FLEET_FILE="$dir/hello.sh"
-  else stage "$X.fleet-preflight" pass ""; fi
+  # fleet's config preflight (preflight.mjs:63-64) on main's .adlc/config.json, seeded from the tree.
+  judge "$X.fleet-preflight" "$(jq -r 'if (.fleet.reason // .reason) == "preflight" then "fleet refused at preflight (fleet exit \(.fleet_exit))" else "fleet past preflight: \(.fleet.reason // .reason // .outcome)" end' <<<"$RUN_LAST")" \
+    jq -e '(.actions | index("fleet-run")) != null and .reason != "preflight" and .fleet.reason != "preflight"' <<<"$RUN_LAST"
   if [ "$(jq -r '.reason // .outcome // empty' <<<"$RUN_LAST")" = tamper ]; then stage "$X.node-tamper" red "$RUN_LAST"
   else stage "$X.node-tamper" pass "tamperguard ok"; fi
   # The node's diff gates on GATE_BASE...GATE_HEAD (run.sh on_success), from its ledger line.

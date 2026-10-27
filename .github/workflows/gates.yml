@@ -38,13 +38,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with: { ref: "${{ env.GATE_HEAD }}", fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { ref: "${{ env.GATE_BASE }}", path: .base }
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - name: factory test suite (offline)
-        run: make test
-      - name: shellcheck
-        run: make lint
+      # The shellcheck `make lint` runs (join.sh SHELLCHECK_PIN); the runner's own is older, so the
+      # step fails unless the pinned one is first on PATH.
+      - name: shellcheck 0.11.0 (shellcheck-py 0.11.0.1)
+        run: |
+          pipx install shellcheck-py==0.11.0.1
+          shellcheck --version | grep -qx 'version: 0.11.0'
+      - name: the base's fleet.gate commands, exactly as fleet runs them on the node (I16, I17)
+        run: ./.base/factory/bin/build-test.sh
   rails-proof:
     runs-on: ubuntu-latest
     steps:

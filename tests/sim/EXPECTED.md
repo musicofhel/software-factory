@@ -3,8 +3,8 @@
 Every stage judges the **desired** behavior of the pipeline (specs/factory-step3-v1/SPEC.md): `pass`
 means the pipeline did the right thing, `red: <gap id>` that it does not yet, with the gap of
 `specs/factory-step3-v1/records/sim/*.md` that explains it and the row that fixes it. After a red
-stage the sim plays a labeled stand-in (`stand-in:` in sim.log: the records TB7 will write, fleet
-without its config preflight, GitHub's queue, the merge) so the later stages stay observable. `tests/sim/lib/compare.sh` compares this table with the results in both
+stage the sim plays a labeled stand-in (`stand-in:` in sim.log: the records TB7 will write,
+GitHub's queue, the merge) so the later stages stay observable. `tests/sim/lib/compare.sh` compares this table with the results in both
 directions: a stage that goes green before its line here says `pass` fails the sim as much as a
 regression does. The row that fixes a gap flips its lines in the same commit. A stage only GitHub
 itself can prove is `red: kit: <line>` (TB12), never `pass`.
@@ -30,7 +30,7 @@ not model.
 | C.mirror-blocked | red: intake:I2 — a child waiting on its parent is `needs-desk`, not `blocked` (TB6) |
 | C.depends-link | red: intake:I12 — `Depends-on: <id>` with no `(#<issue>)` link (TB6) |
 | P.claim | pass |
-| P.fleet-preflight | red: node:G10 — main's .adlc/config.json has no fleet block (TB5) |
+| P.fleet-preflight | pass |
 | P.node-tamper | pass |
 | P.node-rails | pass |
 | P.node-scope | pass |
@@ -68,7 +68,7 @@ not model.
 | P.lock-released | red: merge:G8c — nothing releases the lock after the merge (TB6) |
 | C.mirror-ready | pass |
 | C.claim | pass |
-| C.fleet-preflight | red: node:G10 — main's .adlc/config.json has no fleet block (TB5) |
+| C.fleet-preflight | pass |
 | C.node-tamper | pass |
 | C.node-rails | pass |
 | C.node-scope | pass |
@@ -117,6 +117,7 @@ not model.
 | S.class-human | pass |
 | S.stranger-refused | pass |
 | S.ticket-adlc | pass |
+| S.head-edits-gate-config | pass |
 | S.desk-pr | red: intake:I6 — no `desk` job in gates.yml (TB7) |
 | S.class-desk | pass |
 | S.child-before-parent | red: merge:G3 — no `depends-on` job (TB8) |

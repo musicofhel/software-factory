@@ -20,16 +20,20 @@ live:
 sim:
 	@bash tests/sim/sim.sh
 
-# shellcheck is required: a lint that skips itself is a false green. actionlint is best-effort
-# (system binary, else uvx actionlint-py) because hosted runners do not ship it.
+# `make lint` is fleet.gate.build in .adlc/config.json (specs/factory-step3-v1 TB5, ticket T24), so it
+# downloads nothing and needs no /dev/null: fleet 1.12.0 runs it with no network, and its bwrap
+# repo-command plane binds only the worktree and the system roots (no /dev, /proc, /tmp or $HOME;
+# measured, records/TB5.md). shellcheck is $SHELLCHECK, else the one on PATH, and is required: a lint
+# that skips itself is a false green. On a node it must sit under a system root for fleet's sandbox to
+# see it (join.sh refuses otherwise); CI installs the pinned shellcheck-py (gates.yml build-test).
+# actionlint ($ACTIONLINT, else PATH) is best-effort until CI pins it (TB10).
 lint:
-	@set -e; if command -v shellcheck >/dev/null; then SC=shellcheck; \
-	elif command -v uvx >/dev/null; then SC="$$(uvx --from shellcheck-py python -c 'import os,sys;print(os.path.join(os.path.dirname(sys.executable),"shellcheck"))')"; \
-	else echo "lint: shellcheck not found (install it, or uv for uvx)" >&2; exit 1; fi; \
+	@set -e; SC="$${SHELLCHECK:-$$(command -v shellcheck || true)}"; \
+	[ -n "$$SC" ] || { echo "lint: shellcheck not found: install it (join.sh prints how), or set SHELLCHECK" >&2; exit 1; }; \
+	echo "lint: shellcheck $$("$$SC" --version | sed -n 's/^version: //p') at $$SC"; \
 	"$$SC" -S warning $(SH_FILES); \
-	if command -v actionlint >/dev/null; then actionlint -shellcheck "$$SC"; \
-	elif command -v uvx >/dev/null; then uvx --from actionlint-py actionlint -shellcheck "$$SC"; \
-	else echo "actionlint not installed; workflows not linted"; fi
+	AL="$${ACTIONLINT:-$$(command -v actionlint || true)}"; \
+	if [ -n "$$AL" ]; then "$$AL" -shellcheck "$$SC"; else echo "lint: actionlint not installed; workflows not linted"; fi
 
 # The store, then the desk's check on it (factory/bin/ticket-check.sh: exit 2 on an open ticket
 # without rails).

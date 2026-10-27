@@ -53,21 +53,27 @@ world_build() {
     "node node-b $((T0 - 600)) active 1 node-b-owner" | "$SIM_ROOT/tests/fixtures/make-repo.sh" "$ORIGIN"
   git -C "$ORIGIN" config uploadpack.allowAnySHA1InWant true
 
-  # The runner's shims: gh is the fake; pipx installs the fake tamperguard; make test/lint stubbed
-  # (the suite runs this sim, so a job running it would recurse; build-test's real command list is
-  # TB5's). `pipx install` links its app into $PIPX_BIN_DIR, which the driver makes per job and puts
-  # on the job's PATH (GitHub's runner: PIPX_BIN_DIR=/opt/pipx_bin, on PATH, a fresh VM per job), so
-  # only a job that installed tamperguard can call it.
+  # The runner's shims: gh is the fake; pipx installs the fake tamperguard and a shellcheck that
+  # reports the pin; make test/lint stubbed (the suite runs this sim, so a job running it would
+  # recurse). build-test runs the base's fleet.gate commands (build-test.sh, TB5), which are
+  # `make lint` and `make test`, so the stub sees exactly that list (sim.log). `pipx install` links
+  # its app into $PIPX_BIN_DIR, which the driver makes per job and puts on the job's PATH (GitHub's
+  # runner: PIPX_BIN_DIR=/opt/pipx_bin, on PATH, a fresh VM per job), so only a job that installed
+  # tamperguard can call it.
   mkdir -p "$SIM/runner-bin" "$SIM/runner-home" "$SIM/bin"
   ln -sf "$SIM_FAKES/gh" "$SIM/runner-bin/gh"
   ln -sf "$SIM_FAKES/curl" "$SIM/runner-bin/curl"
   printf '%s\n' '#!/usr/bin/env bash' \
+    '[ -n "${PIPX_BIN_DIR:-}" ] || { echo "sim pipx: no PIPX_BIN_DIR" >&2; exit 1; }' \
     'if [ "$*" = "install --python python3.14 tamperguard==0.2.0" ]; then' \
-    '  [ -n "${PIPX_BIN_DIR:-}" ] || { echo "sim pipx: no PIPX_BIN_DIR" >&2; exit 1; }' \
     '  mkdir -p "$PIPX_BIN_DIR" && ln -sf "'"$SIM_FAKES"'/tamperguard" "$PIPX_BIN_DIR/tamperguard"' \
     '  echo "  installed package tamperguard 0.2.0, installed using Python 3.14 (sim)"; exit 0' \
     'fi' \
-    'echo "sim pipx: only \`pipx install --python python3.14 tamperguard==0.2.0\` is simulated: $*" >&2; exit 127' >"$SIM/runner-bin/pipx"
+    'if [ "$*" = "install shellcheck-py==0.11.0.1" ]; then' \
+    '  mkdir -p "$PIPX_BIN_DIR" && printf "%s\\n" "#!/usr/bin/env bash" "printf \"ShellCheck (sim)\\\\nversion: 0.11.0\\\\n\"" >"$PIPX_BIN_DIR/shellcheck"' \
+    '  chmod +x "$PIPX_BIN_DIR/shellcheck"; echo "  installed package shellcheck-py 0.11.0.1 (sim)"; exit 0' \
+    'fi' \
+    'echo "sim pipx: only tamperguard==0.2.0 on python3.14 and shellcheck-py==0.11.0.1 are simulated: $*" >&2; exit 127' >"$SIM/runner-bin/pipx"
   printf '%s\n' '#!/usr/bin/env bash' \
     'case "$*" in test|lint) echo "sim make: \`make $*\` stubbed (the suite runs the sim itself)"; exit 0 ;; esac' \
     'exec /usr/bin/make "$@"' >"$SIM/runner-bin/make"
