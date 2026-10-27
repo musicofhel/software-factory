@@ -1,0 +1,28 @@
+{
+  "body": "weight: light\ntier: 1\ncharter: C8\n\nspecs/factory-step3-v1/SPEC.md row TB8. adlc lets a child complete while its parent is open, and GitHub orders nothing by label, so the hold and the tier order live in CI.\n\nCloses the pre-spec simulation gaps merge:G3, merge:G5, ci:G9, ci:G10, intake:I3, intake:I4, node:G8 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- `factory/bin/depends-check.sh` and a required `depends-on` job on pull_request and the queue path: the parents are the tickets in the base store with an edge to this ticket; pass only if every parent is completed in the base store; never read the PR body.\n- A `tier-order` job: a tier-n ticket PR waits (exit 1 with the blocking PR numbers) while any approved, green, open ticket PR of a lower tier exists; first-done-first within a tier by the PR's first green `gates` time.\n- A trusted labeler (a workflow on push to main and on schedule, never pull_request_target running head code) applies `tier:<n>` to open ticket PRs from the base store and writes the PR body's display lines (`Depends-on:`, tier, prosecuting adapter, `Assisted-by`). GITHUB_TOKEN events start no other workflow (GitHub docs, quoted in specs/factory-step3-v1/records/TB0.md), so re-evaluation of held PRs runs on push to main and on a schedule, with the App token when it exists.\n\nAcceptance criteria:\n1. A child before its parent is held, and released after the parent completes. Verify: `bash tests/test_depends_check.sh`.\n2. A tier-1 PR waits for a tier-0 one; ties break by first green. Verify: `bash tests/test_tier_order.sh`.\n3. The labeler applies tier labels and display lines from the base store only. Verify: `bash tests/test_labeler.sh`.\n4. The child-before-parent and tier-jump scenarios are green. Verify: `make sim`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/depends-check.sh`, `factory/bin/tier-order.sh`, `factory/bin/labeler.sh`, `.github/workflows/labeler.yml`, `tests/test_depends_check.sh`, `tests/test_tier_order.sh`, `tests/test_labeler.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T28"
+    }
+  ],
+  "id": "T27",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "factory/bin/depends-check.sh",
+    "factory/bin/tier-order.sh",
+    "factory/bin/labeler.sh",
+    "factory/bin/lib/gate-context.sh",
+    ".github/workflows/gates.yml",
+    ".github/workflows/labeler.yml",
+    "tests/test_depends_check.sh",
+    "tests/test_tier_order.sh",
+    "tests/test_labeler.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "title": "Add the Depends-on hold and tier order as required CI jobs, with a trusted labeler"
+}

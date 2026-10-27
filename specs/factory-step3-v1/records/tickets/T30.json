@@ -1,0 +1,33 @@
+{
+  "id": "T30",
+  "title": "Add the remaining CI gates: the attest note and its verifier, the quarantine expiry, and skills-scan's status",
+  "body": "weight: light\ntier: 1\ncharter: C6\n\nspecs/factory-step3-v1/SPEC.md row TB11, by what specs/factory-step3-v1/records/TB0.md \u00a7(c) measured: corvidlabs/attest 1.0.0 ships a linux binary (MIT); ubs's license rider excludes Anthropic and anyone acting for it, so no bugscan job is added; flaky-test-detective has no pinned release, so its classifier is step 4.\n\nCloses the pre-spec simulation gaps ci:G6 (attest-verify stub), ci:G14, ci:G15, ci:G16, node:G6, merge:G18 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- The node writes the gate manifest (tests run, result hashes, adapter, verdicts) as a git note under `refs/notes/factory-attest` on the ticket commit and pushes it with the branch, unsigned under the store's `unsigned-fallback`; `attest-verify.sh` recomputes what it can (rails, scope, tamper verdicts, gate command list) and fails on a mismatch or a missing note. Use the pinned attest CLI if it fits the note format, citing it; otherwise ADR-0007 documents the first-party format.\n- No `bugscan` job (ubs is not license-compatible; the spec's HANDOFF carries the question).\n- A `flaky` job fails on an expired entry in `factory/policy/quarantine.json` (a desk file; this ticket writes the reader and a desk note).\n- skills-scan: a real body with merge_group and required, or left unrequired with the reason; never a required stub.\n- No w:heavy job is required until a self-hosted factory-node runner exists; the gates.yml header comment says so.\n\nAcceptance criteria:\n1. A missing or mismatched attest note fails attest-verify and a matching one passes. Verify: `bash tests/test_attest.sh`.\n2. An expired quarantine entry fails the flaky job. Verify: `bash tests/test_flaky_check.sh`.\n3. The node writes and pushes the note with the branch. Verify: `bash tests/test_run.sh` and `make sim`.\n4. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n5. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/lib/attest.sh`, `factory/bin/flaky-check.sh`, `tests/test_attest.sh`, `tests/test_flaky_check.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "scope": [
+    "factory/bin/attest-verify.sh",
+    "factory/bin/lib/attest.sh",
+    "factory/bin/flaky-check.sh",
+    "factory/bin/skills-scan.sh",
+    "factory/bin/run.sh",
+    "factory/bin/lib/run.sh",
+    "factory/bin/join.sh",
+    ".github/workflows/gates.yml",
+    ".github/workflows/skills-janitor.yml",
+    "docs/adr/0007-merge-queue.md",
+    "tests/test_attest.sh",
+    "tests/test_flaky_check.sh",
+    "tests/test_run.sh",
+    "tests/test_join.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "rails": [
+    "factory/policy/**"
+  ],
+  "edges": [
+    {
+      "to": "T31"
+    }
+  ]
+}

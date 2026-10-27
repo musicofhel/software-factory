@@ -1,0 +1,33 @@
+{
+  "body": "weight: light\ntier: 1\ncharter: C2\n\nspecs/factory-step3-v1/SPEC.md row TB6. A kept lock is never heartbeated, so a PR held more than 24 h is rebuilt by a second node, and the kept lock eats a slot so the janitor kills the node's next claim.\n\nCloses the pre-spec simulation gaps node:G3, node:G12, node:G13, node:G14, merge:G8a, merge:G8b, merge:G8c, merge:G9, intake:I2, intake:I12 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- When run.sh opens the PR it releases the claim lock (the PR is now the claim) and labels the Issue `in-review`.\n- mirror.sh never labels `ready` while an open PR exists for the branch prefix `ticket/<id>/`; claim.sh skips such a ticket; the janitor leaves locks whose PR is open out of both the TTL and the slot count, and releases any lock whose Issue is closed.\n- A new owned label `blocked` replaces `needs-desk` when the only reasons are dependency order (wave > 1 or an open parent); the digest and summoner ignore `blocked`. `Depends-on:` lines in the Issue body carry the link, `Depends-on: T21 (#2)`.\n- run.sh checks it still owns the lock (heartbeat.sh dry run) before it pushes, else `lock-lost`; a `pr-open-failed` is retried on the next iteration from a state file, then released to the desk; the per-ticket `budget` from `adlc ticket show` overrides the weights.\n- Ruling recorded: the forecast's serial order stands; the merge-queue hold is defense in depth, because adlc lets a child complete before its parent.\n\nAcceptance criteria:\n1. A PR held past 24 h is not rebuilt, and a held PR does not cause an over-slots release. Verify: `bash tests/test_janitor.sh` and `make sim`.\n2. A dependency-only wait is `blocked`, any other reason is `needs-desk`, and the Issue body links the parent. Verify: `bash tests/test_mirror.sh`.\n3. claim.sh skips a ticket with an open PR. Verify: `bash tests/test_claim.sh`.\n4. lock-lost, pr-open retry and the budget override behave as described. Verify: `bash tests/test_run.sh`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T26"
+    }
+  ],
+  "id": "T25",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "factory/bin/run.sh",
+    "factory/bin/lib/run.sh",
+    "factory/bin/mirror.sh",
+    "factory/bin/claim.sh",
+    "factory/bin/janitor.sh",
+    "factory/bin/heartbeat.sh",
+    "factory/bin/summon.sh",
+    "factory/bin/lib/lock.sh",
+    "docs/adr/0005-run-loop-cli-reality.md",
+    "tests/test_run.sh",
+    "tests/test_mirror.sh",
+    "tests/test_claim.sh",
+    "tests/test_janitor.sh",
+    "tests/test_summon.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "title": "Release the claim when the PR opens, keep held PRs from being rebuilt, and add the blocked label"
+}

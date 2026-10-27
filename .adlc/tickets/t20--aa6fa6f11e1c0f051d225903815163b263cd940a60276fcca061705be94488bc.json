@@ -1,0 +1,22 @@
+{
+  "body": "weight: light\ntier: 0\ncharter: C6\n\nspecs/factory-step3-v1/SPEC.md row TB1. Build the harness every later step-3 row proves itself in: one ticket walks from a desk write to `completed` on main without GitHub (I19).\n\nDeliverables:\n- `tests/sim/` holds an offline harness run by `make sim` and by `make test` (through `tests/test_sim.sh`).\n- It builds a scratch world: a local bare origin seeded from the working tree, a desk clone, two node homes (`dev-box`, `node-b`), the real repo scripts, and a stateful fake `gh` whose state is one JSON file (Issues, labels, PRs with head/base/body/labels/reviews/state, check runs, the queue, merged commits).\n- The fake answers every `gh` form the repo's scripts and workflows already use (listed from `grep -rn 'gh '` across factory/ and .github/), and a test fails when a script calls a form the fake does not know.\n- A fake fleet builds deterministic commits shaped exactly as fleet 1.12.0 shapes them (`feat(<id>): fleet worker build` with `:!.adlc :!.claude` excluded, then a `--no-ff` merge). adlc is the real 1.12.0 when present, the existing fake otherwise (I4).\n- A workflow driver runs, for each `.github/workflows/*.yml` event it simulates (pull_request, merge_group, push to main, schedule), that job's `run:` steps from the base checkout with the event JSON and env a real runner gives (`GITHUB_EVENT_PATH`, `GITHUB_BASE_REF`, `GITHUB_HEAD_REF`, `GITHUB_SHA`), and records each job's exit as a check run. It reads the jobs from the YAML with a pinned parser, never a hard-coded copy.\n- The T-sim scenario: T-sim-parent (tier 0) and T-sim-child (tier 1, depends on the parent), both railed and scoped; mirror; claim on dev-box; build; node gates; push; PR; every gate on pull_request; the hold; tier order; queue; merge_group gates; merge; post-merge complete; mirror closes the Issue; the child becomes ready and repeats the path.\n- The failure scenarios: out-of-scope file; tamper (a new `.skip`); rail-path edit; commit without trailers; a head that edits `scope-check.sh` to `exit 0` (I16); a foreign `Ticket:` trailer; child merged before parent; a lower-tier PR jumping a tier-0 one; queue ejection on conflict; a PR held past 24 h; a HALT add with zero approvals and a HALT removal with one; a desk PR to `.adlc/**`; a ticket PR touching `.adlc/**`.\n- `tests/sim/EXPECTED.md`: one line per stage, `pass` or `red: <gap id>`; `make sim` fails when any stage differs from it in either direction.\n\nAcceptance criteria:\n1. `make sim` runs offline and its stage results equal tests/sim/EXPECTED.md exactly. Verify: `make sim`.\n2. A stage that turns green before EXPECTED.md says so fails `make sim` (proved by flipping one EXPECTED line in a scratch copy). Verify: `bash tests/test_sim.sh`.\n3. The fake gh refuses a `gh` form it does not model, and every form used in factory/ and .github/ is modeled. Verify: `bash tests/test_sim.sh`.\n4. The driver's job list equals the job ids parsed from .github/workflows/*.yml. Verify: `bash tests/test_sim.sh`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `tests/sim/`, `tests/test_sim.sh`.\n\nOut of scope: Fixing any gap the simulation records (later rows flip EXPECTED.md lines). any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "test",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T21"
+    }
+  ],
+  "id": "T20",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "tests/sim/**",
+    "tests/test_sim.sh",
+    "tests/fakes/**",
+    "Makefile",
+    "factory/test.sh"
+  ],
+  "title": "Add make sim: an offline end-to-end pipeline simulation with a stateful fake gh, recording today's stop points"
+}

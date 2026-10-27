@@ -1,0 +1,28 @@
+{
+  "id": "T21",
+  "title": "Resolve gate context and ticket identity for every CI gate, and run gate scripts from the base checkout",
+  "body": "weight: light\ntier: 0\ncharter: C6\n\nspecs/factory-step3-v1/SPEC.md row TB2. Every gate needs the same facts (base, head, PR, ticket, PR class) and must read its scripts and data from the base commit, never the PR head (I16).\n\nCloses the pre-spec simulation gaps ci:G4, ci:G5, ci:G7, merge:G10, node:G4 (identity half) (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- `factory/bin/lib/gate-context.sh` resolves BASE and HEAD (from `pull_request.base.sha/head.sha`, or `merge_group.base_sha/head_sha`, or on the node the merge-base with origin/main and the tip), the PR number (on merge_group from `gh-readonly-queue/main/pr-<N>-<sha>`), the ticket id (from the head ref `ticket/<id>/<handle>`; on merge_group from PR N's head ref read with the read-only token) and the PR class: `ticket`, `desk` (touches only `.adlc/**` and desk docs), `halt` (adds or removes `factory/HALT` only) or `human`.\n- `common.sh`'s id validator refuses `/` in an id.\n- gates.yml checks out the base into `./.base` and runs every gate script from there, with the PR head as the working tree it inspects.\n- Ticket gates refuse a `ticket` PR whose body `Ticket:` line or commit trailers name another id.\n\nAcceptance criteria:\n1. Each event shape resolves correctly, from fixtures of real event JSON copied from GitHub's webhook docs (the source cited in the fixture). Verify: `bash tests/test_gate_context.sh`.\n2. Each PR class is classified correctly, and the merge_group ref parse gives the PR number. Verify: `bash tests/test_gate_context.sh`.\n3. A head that edits `scope-check.sh` to `exit 0` still fails, because the base copy runs. Verify: `make sim` (the I16 scenario).\n4. An id containing `/` is refused. Verify: `bash tests/test_gate_context.sh`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/lib/gate-context.sh`, `tests/test_gate_context.sh`, `tests/fixtures/events/`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 1,
+  "scope": [
+    "factory/bin/lib/gate-context.sh",
+    "factory/bin/lib/common.sh",
+    "factory/bin/rails-proof.sh",
+    "factory/bin/scope-check.sh",
+    "factory/bin/commit-check.sh",
+    "factory/bin/attest-verify.sh",
+    ".github/workflows/gates.yml",
+    "tests/test_gate_context.sh",
+    "tests/fixtures/events/**",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "rails": [
+    "factory/policy/**"
+  ],
+  "edges": [
+    {
+      "to": "T22"
+    }
+  ]
+}

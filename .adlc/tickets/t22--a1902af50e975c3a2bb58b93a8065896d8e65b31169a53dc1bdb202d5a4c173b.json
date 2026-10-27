@@ -1,0 +1,30 @@
+{
+  "body": "weight: light\ntier: 0\ncharter: C6\n\nspecs/factory-step3-v1/SPEC.md row TB3. The node and CI must call the same matcher with the same argv, the same tool pin and the same diff range rule, three-dot from the merge-base with the base (I17).\n\nCloses the pre-spec simulation gaps ci:G2, ci:G6 (three of four stubs), node:G1, node:G4, node:G5, node:G16 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- `factory/bin/lib/diff-gates.sh`, sourced by run.sh and by the three CI scripts.\n- rails-proof.sh: rails from the base store; `git diff --quiet BASE...HEAD -- ':(glob)<rail>'`; a non-empty diff exits 2 with the paths.\n- scope-check.sh: scope from the base store; every path in BASE...HEAD matches a scope glob with fleet's own glob semantics (fleet's matcher measured in @adlc/cli 1.12.0 and cited file:line); a ticket PR touching `.adlc/**` fails; interface `--ticket <id> --base <sha> --head <sha>` for both callers.\n- tamper-check.sh: tamperguard 0.2.0 with `--range BASE...HEAD --json`; the verdict is parsed from the JSON; rc 2 with a parsed `tamper` verdict fails; any other non-zero is `tamper-error`, also a fail. Node and CI use the same Python minor (measured from the node's uv tool).\n- run.sh refuses to start when `adversarial-review` is not on PATH, starts the gate range at the merge-base with origin/main (not a lapsed tip), and replaces its `scope-check-not-built` hold with the real call; ADR-0005 gains an amendment.\n\nAcceptance criteria:\n1. Each gate passes, fails and errors on fixture repos, including a glob that would cross `/` without `:(glob)`. Verify: `bash tests/test_diff_gates.sh`.\n2. A lapsed-branch resume gates the range from the merge-base with origin/main. Verify: `bash tests/test_run.sh`.\n3. The node and CI call sites pass the same argv to the helper. Verify: `bash tests/test_diff_gates.sh`.\n4. The diff-gate stages and their failure scenarios are green. Verify: `make sim`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/lib/diff-gates.sh`, `factory/bin/tamper-check.sh`, `tests/test_diff_gates.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T23"
+    }
+  ],
+  "id": "T22",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "factory/bin/lib/diff-gates.sh",
+    "factory/bin/rails-proof.sh",
+    "factory/bin/scope-check.sh",
+    "factory/bin/tamper-check.sh",
+    "factory/bin/run.sh",
+    "factory/bin/lib/run.sh",
+    "factory/bin/lib/policy-render.sh",
+    ".github/workflows/gates.yml",
+    "docs/adr/0005-run-loop-cli-reality.md",
+    "tests/test_diff_gates.sh",
+    "tests/test_run.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "title": "Build the three diff gates (rails-proof, scope, tamper) as one helper shared by the node and CI"
+}

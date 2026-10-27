@@ -1,0 +1,32 @@
+{
+  "id": "T29",
+  "title": "Make branch protection code-checked: bare job-id contexts, owner approvals, the halt-guard, and the App's reach",
+  "body": "weight: light\ntier: 1\ncharter: C6\n\nspecs/factory-step3-v1/SPEC.md row TB10. The required contexts `gates / <job>` never match a check run, which is named by its job id, and the kill switch cannot land through the queue. `factory/policy/branch-protection.json` is a desk file (I15): its new contents are written as a desk note in the spec's HANDOFF, and this ticket's code and tests read whatever main holds.\n\nCloses the pre-spec simulation gaps ci:G1, ci:G11, ci:G12, ci:G13, ci:G17, ci:G18, ci:G20, ci:G22, merge:G2, merge:G6, merge:G15 (code half), merge:G17, node:G7, node:G9 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- The required checks are the bare job ids with `integration_id` 15368 (GitHub Actions); a test asserts the required set equals the gates.yml job ids that report on both paths (I18); tests/test_halt_rules.sh:94 is fixed. Merge-queue settings only when `native-queue: yes`; otherwise the first-party queue's check is required and only the App may merge directly.\n- 0 required approvals globally, code-owner review required, and a first-party `owners` job requiring two distinct CODEOWNERS approvals on PRs touching `factory/**`, `.adlc/**`, `.github/**`, `.claude/**`, with `require_last_push_approval`.\n- A `halt-guard` job and `halt.yml` per ADR-0004 option C: adding `factory/HALT` needs zero approvals (a dispatch or label the App commits directly, never through the queue) and sets `factory:halt`; removing it needs two approvals; HALT PRs are the `halt` class and skip ticket gates.\n- The App's private key lives in a GitHub environment restricted to `main`; the post-merge, mirror, janitor, enqueue, revoke and halt workflows say `environment:`.\n- janitor.sh treats a missing `nodes` branch as empty; apply-branch-protection.sh gains `--bootstrap` (creates `nodes` and `flaky-history`).\n- join.sh asks for Contents, Issues and Pull requests write plus Metadata, and the node env exports `GH_TOKEN` from the stored token.\n- Actions pinned by commit sha with the tag in a comment; CI installs a pinned actionlint so `make lint` never silently skips it.\n\nAcceptance criteria:\n1. The required-check set equals the job ids that run on both paths. Verify: `bash tests/test_halt_rules.sh`.\n2. A HALT add passes with zero approvals and a HALT removal fails with one. Verify: `bash tests/test_halt_guard.sh` and `make sim`.\n3. owners-check counts distinct CODEOWNERS approvals after the last push. Verify: `bash tests/test_owners_check.sh`.\n4. janitor exits 0 with a missing nodes branch; join exports GH_TOKEN. Verify: `bash tests/test_janitor.sh` and `bash tests/test_join.sh`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/halt-guard.sh`, `factory/bin/owners-check.sh`, `.github/workflows/halt.yml`, `tests/test_halt_guard.sh`, `tests/test_owners_check.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "scope": [
+    "factory/bin/apply-branch-protection.sh",
+    "factory/bin/halt-guard.sh",
+    "factory/bin/owners-check.sh",
+    "factory/bin/janitor.sh",
+    "factory/bin/join.sh",
+    ".github/workflows/**",
+    "Makefile",
+    "docs/adr/0004-halt-two-person-rule.md",
+    "tests/test_halt_rules.sh",
+    "tests/test_halt_guard.sh",
+    "tests/test_owners_check.sh",
+    "tests/test_janitor.sh",
+    "tests/test_join.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "rails": [
+    "factory/policy/**"
+  ],
+  "edges": [
+    {
+      "to": "T30"
+    }
+  ]
+}

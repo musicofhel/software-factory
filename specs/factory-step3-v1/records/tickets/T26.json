@@ -1,0 +1,29 @@
+{
+  "id": "T26",
+  "title": "Build the desk gates: write the ready records, lint ticket contracts, and check the manifest chain on desk PRs",
+  "body": "weight: light\ntier: 1\ncharter: C6\n\nspecs/factory-step3-v1/SPEC.md row TB7. Nothing writes the `spec-lint`, `coldstart` or per-ticket `merge-forecast` records mirror.sh requires, so no Issue has ever been `ready`.\n\nCloses the pre-spec simulation gaps intake:I1, intake:I5, intake:I6, intake:I7, intake:I10, intake:I11, intake:I14, merge:G14, merge:G20 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- `factory/bin/desk-gates.sh` writes the spec-lint and coldstart records for every open ticket whose record is missing or stale, with adlc 1.12.0's own record commands (measured and cited).\n- mirror.sh drops the per-ticket merge-forecast record requirement in favor of the live forecast it already runs, unless adlc 1.12.0 has a forecast record command (cited either way).\n- ticket-check.sh gains: the ADR-0002 header present; every scope glob resolves to at least one path or a declared new path; every edge target exists; no tier inversion (a tier-n ticket whose parent is tier > n); any forecast warning naming the ticket fails.\n- A `desk` job in gates.yml runs on PRs touching `.adlc/**`: `make tickets`, `adlc ticket doctor`, and the manifest chain check with 0 skipped.\n- A desk runbook in factory/RULES.md: write a child and its parent's edge in one PR and re-run the parent's coldstart. ADR-0002 is amended: ids are `T<n>`, not ULIDs; completed means merged to main (I20).\n\nAcceptance criteria:\n1. desk-gates.sh writes the records and the mirror then labels the ticket `ready` with no record injected by hand. Verify: `bash tests/test_desk_gates.sh` and `make sim`.\n2. Each new ticket-check rule fails its bad case and passes main's store. Verify: `bash tests/test_ticket_check.sh` and `make tickets`.\n3. Two desk PRs that break the manifest hash chain fail the desk job. Verify: `make sim`.\n4. The ADR and runbook amendments are written. Verify: `grep -n 'T<n>' docs/adr/0002-adlc-sharded-ticket-store.md` and `grep -n coldstart factory/RULES.md`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/desk-gates.sh`, `tests/test_desk_gates.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "scope": [
+    "factory/bin/desk-gates.sh",
+    "factory/bin/ticket-check.sh",
+    "factory/bin/mirror.sh",
+    ".github/workflows/gates.yml",
+    "factory/RULES.md",
+    "docs/adr/0002-adlc-sharded-ticket-store.md",
+    "Makefile",
+    "tests/test_desk_gates.sh",
+    "tests/test_ticket_check.sh",
+    "tests/test_mirror.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "rails": [
+    "factory/policy/**"
+  ],
+  "edges": [
+    {
+      "to": "T27"
+    }
+  ]
+}

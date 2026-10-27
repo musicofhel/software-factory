@@ -1,0 +1,29 @@
+{
+  "body": "weight: heavy\ntier: 0\ncharter: C5\n\nspecs/factory-step3-v1/SPEC.md row TB5 (ruling Q3 of specs/factory-step2-followups-v1/RULINGS.md). main's `.adlc/config.json` has no `fleet` block, so fleet refuses every real ticket at preflight. The block itself is desk-written (`.adlc/**` is outside every ticket's scope, row TB3): the step-3 loop writes it as a desk commit, and this ticket makes CI and the node run exactly its commands.\n\nCloses the pre-spec simulation gaps node:G10, merge:G19 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- main's `.adlc/config.json` carries one repo-wide `fleet` block (gate.test, gate.build, desk-written allowedCommands, prosecuteFailOn, timeoutMinutes; adapter, model and key stay CLI-only), every key checked against fleet 1.12.0's config reader (cited file:line).\n- `factory/bin/build-test.sh` reads the gate commands from the base config and runs exactly those; gates.yml's build-test job calls it instead of a hard-coded `make test`.\n- `make lint`'s shellcheck download fallback is replaced or pinned so `gate.build` runs under the build profile's no-network rule; if a node needs shellcheck installed, join.sh's probe requires it.\n\nAcceptance criteria:\n1. main's config parses for fleet: a schema check of every key against fleet 1.12.0's reader. Verify: `bash tests/test_policy.sh`.\n2. CI and the node run the same command list, read from the base config. Verify: `bash tests/test_build_test.sh`.\n3. The join probe requires shellcheck when gate.build needs it. Verify: `bash tests/test_join.sh`.\n4. The toy ticket passes fleet's preflight on a scratch copy of main's config. Verify: `make live` (tests/live/test_smoke_live.sh).\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/build-test.sh`, `tests/test_build_test.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T25"
+    }
+  ],
+  "id": "T24",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "factory/bin/build-test.sh",
+    ".github/workflows/gates.yml",
+    "Makefile",
+    "factory/bin/join.sh",
+    "factory/bin/lib/probe.sh",
+    "docs/adr/0005-run-loop-cli-reality.md",
+    "tests/test_build_test.sh",
+    "tests/test_policy.sh",
+    "tests/test_join.sh",
+    "tests/live/**",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "title": "Make CI's build-test run main's fleet gate commands from the base config, with a lint that runs offline"
+}

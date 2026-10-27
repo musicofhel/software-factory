@@ -1,0 +1,32 @@
+{
+  "body": "weight: light\ntier: 1\ncharter: C8\n\nspecs/factory-step3-v1/SPEC.md row TB9. GitHub's merge queue is available only to organization-owned repos (docs quoted in specs/factory-step3-v1/records/TB0.md, `native-queue: no`), and nothing enqueues or handles an ejection.\n\nCloses the pre-spec simulation gaps merge:G1 (as far as code can), merge:G4, merge:G7, merge:G13, ci:G19, ci:G21 (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- `factory/bin/enqueue.sh` (run by a workflow on push to main, on check completion and on schedule, with the App token) takes the ordered list of mergeable ticket PRs (every required check green, the hold and tier jobs green, approvals per row TB10) and, by `native-queue`: yes → enqueues the head of the list through GraphQL `enqueuePullRequest`; no or unknown → runs the first-party serial queue: for the head of the list only, builds the merge onto current main in `factory-queue/pr-<N>`, runs the same gates there as the queue path, and if green fast-forwards main to it with the App (the only bypass actor), then closes the PR as merged.\n- Ejection: a conflict or a red queue run labels the PR `autorebase`, appends an ejection record to `factory/ledger/ejections.jsonl`, and returns the ticket to `ready` with a `rebase-strike` flag; on the next claim run.sh cuts a fresh branch from main and cherry-picks the one ticket commit, and the rebase strike does not count toward `--max-strikes`.\n- ADR-0007 records the queue design and the `native-queue` fallback.\n\nAcceptance criteria:\n1. Both queue modes merge the head of the ordered list and only it. Verify: `bash tests/test_enqueue.sh` and `make sim`.\n2. A conflict ejects with the label, the record and the flag. Verify: `bash tests/test_eject.sh`.\n3. The rebase strike cherry-picks the ticket commit and leaves the strike budget untouched. Verify: `bash tests/test_run.sh`.\n4. ADR-0007 exists and names both modes. Verify: `grep -n native-queue docs/adr/0007-merge-queue.md`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `factory/bin/enqueue.sh`, `factory/bin/eject.sh`, `.github/workflows/enqueue.yml`, `docs/adr/0007-merge-queue.md`, `tests/test_enqueue.sh`, `tests/test_eject.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 2,
+  "edges": [
+    {
+      "to": "T29"
+    }
+  ],
+  "id": "T28",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "factory/bin/enqueue.sh",
+    "factory/bin/eject.sh",
+    ".github/workflows/enqueue.yml",
+    ".github/workflows/gates.yml",
+    "factory/bin/run.sh",
+    "factory/bin/lib/run.sh",
+    "factory/bin/mirror.sh",
+    "factory/ledger/README.md",
+    "docs/adr/0007-merge-queue.md",
+    "tests/test_enqueue.sh",
+    "tests/test_eject.sh",
+    "tests/test_run.sh",
+    "tests/test_mirror.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "title": "Build the queue: native merge queue when available, else a first-party serial queue, with ejection and rebase strikes"
+}

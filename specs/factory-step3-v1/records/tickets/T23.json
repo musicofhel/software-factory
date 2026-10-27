@@ -1,0 +1,27 @@
+{
+  "id": "T23",
+  "title": "Push one trailered commit per ticket and build the commit check; post-merge completes only the branch's ticket",
+  "body": "weight: light\ntier: 0\ncharter: C6\n\nspecs/factory-step3-v1/SPEC.md row TB4. fleet's worker and merge commits carry no trailers, so the node pushes one commit that does, and CI checks every commit.\n\nCloses the pre-spec simulation gaps node:G2, node:G15, ci:G8, merge:G11, ci:G6 (commit-check stub) (ids are `<segment>:<id>` rows of specs/factory-step3-v1/records/sim/<segment>.md, re-checked in specs/factory-step3-v1/records/TB0.md).\n\nDeliverables:\n- After every node gate passes, run.sh writes one commit whose tree is fleet's final tree and whose parent is the merge-base with origin/main, carrying one trailer paragraph (`Assisted-by:`, `Ticket: <id>`, `Node: <handle>`, `Signed-off-by:` via `-s`); that commit is pushed, fleet's own commits stay local.\n- commit-check.sh: every commit in BASE...HEAD (skipping GitHub's own queue merge commit, identified by its author and parent shape) has `Signed-off-by` and `Assisted-by`; on a `ticket` PR every `Ticket:` trailer equals the branch's id; `desk`, `halt` and `human` classes need the DCO only; the post-merge exemption in factory/RULES.md is honored exactly.\n- post-merge.sh completes only the ticket named by the merged PR's head branch and records, without completing, a trailer naming another id.\n\nAcceptance criteria:\n1. A built ticket's pushed branch holds exactly one commit over the merge-base, with all four trailers. Verify: `bash tests/test_run.sh`.\n2. commit-check passes the node's commit and fails an untrailered commit, a foreign `Ticket:`, and a fake post-merge shape. Verify: `bash tests/test_commit_check.sh`.\n3. post-merge refuses a foreign trailer and completes the branch's ticket. Verify: `bash tests/test_post_merge.sh`.\n4. The commit-check stages are green. Verify: `make sim`.\n5. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n6. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nNew paths (created by this ticket, so they match nothing yet): `tests/test_commit_check.sh`.\n\nOut of scope: any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "feature",
+  "duration": 1,
+  "scope": [
+    "factory/bin/run.sh",
+    "factory/bin/lib/run.sh",
+    "factory/bin/commit-check.sh",
+    "factory/bin/post-merge.sh",
+    ".github/workflows/gates.yml",
+    "tests/test_run.sh",
+    "tests/test_commit_check.sh",
+    "tests/test_post_merge.sh",
+    "tests/fakes/**",
+    "tests/sim/**"
+  ],
+  "rails": [
+    "factory/policy/**"
+  ],
+  "edges": [
+    {
+      "to": "T24"
+    }
+  ]
+}

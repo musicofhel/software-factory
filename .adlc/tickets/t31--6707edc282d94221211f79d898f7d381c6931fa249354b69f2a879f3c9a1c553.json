@@ -1,0 +1,17 @@
+{
+  "body": "weight: heavy\ntier: 2\ncharter: C8\n\nspecs/factory-step3-v1/SPEC.md row TB12. The close-out: every stage of the simulated walk passes, and the real tools carry the toy ticket on the dev box to a pushed branch on a local bare origin.\n\nDeliverables:\n- tests/sim/EXPECTED.md is `pass` on every stage of the T-sim scenario, and every failure scenario fails for its own reason (each red line names the gate that stopped it); a stage that needs GitHub itself is `kit: <line>` with the reason, never `pass`.\n- `FACTORY_SMOKE_KEEP=$HOME/.cache/factory-smoke-evidence make live`: the toy ticket runs through fleet, tamperguard under the rendered policy, the real scope-check and rails-proof, the one trailered commit and the attest note, and ends at `pr-ready`, pushed to a local bare origin with the PR body written to the evidence dir.\n- README build-order row 3 updated.\n\nAcceptance criteria:\n1. Every T-sim stage passes and every failure scenario names its gate. Verify: `make sim`.\n2. The live smoke ends at pr-ready with each verdict recorded. Verify: `FACTORY_SMOKE_KEEP=$HOME/.cache/factory-smoke-evidence make live`.\n3. README's build-order row 3 is marked built. Verify: `grep -n '^| 3' README.md`.\n4. Every new or changed script is shellcheck -S warning clean and every workflow passes actionlint. Verify: `make lint`.\n5. The whole offline suite passes, including the simulation. Verify: `make test` and `make sim`.\n\nOut of scope: Pushing to GitHub or opening a real PR (the first live run is Aaron's kit). any write to GitHub (no push, PR, label, ruleset or secret; I1); editing anything under factory/policy/ (I15: a change there is a desk note in the spec's HANDOFF); editing other tickets.",
+  "category": "test",
+  "duration": 1,
+  "edges": [],
+  "id": "T31",
+  "rails": [
+    "factory/policy/**"
+  ],
+  "scope": [
+    "tests/sim/**",
+    "tests/live/**",
+    "tests/fixtures/make-repo.sh",
+    "README.md"
+  ],
+  "title": "Turn the whole simulated walk green, run the live smoke to pr-ready, and close out factory-step3-v1"
+}
