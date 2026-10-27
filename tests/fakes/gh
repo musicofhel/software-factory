@@ -59,7 +59,9 @@
 #        base branch's tip, repo.full_name}, labels). author_association is the entry's own, else
 #        OWNER for the repo's owner, COLLABORATOR for a login in .collaborators of FAKE_GH_ISSUES and
 #        not in .removed_collaborators, else NONE; head.repo is the entry's headRepository (a fork),
-#        else the repo. 404 for an unknown number.
+#        else the repo. merge_commit_sha is the sha of the entry's {pr: <n>, sha} in the state's
+#        .merged list (the commit the PR landed as), else the entry's own mergeCommitOid, else null;
+#        merged is state == MERGED. 404 for an unknown number.
 # __forms: prints every form this fake models, one per line (`issue list`, `api GET git/ref/*`, …);
 #        tests/test_sim.sh holds the repo's call sites against it.
 # FAKE_GH_UNKNOWN: a file; every refused form (an unsupported command, subcommand, flag or api
@@ -156,8 +158,10 @@ api() {
         "refs/heads/$(jq -r --argjson n "$n" '.pulls[] | select(.number == $n) | .baseRefName // "main"' "$FAKE_GH_ISSUES")" || true)"
       out="$(jq -c --argjson n "$n" --arg repo "$REPO" --arg bs "$base_sha" '
         (.collaborators // []) as $c | (.removed_collaborators // []) as $gone
+        | ([(.merged // [])[] | select(.pr == $n) | .sha] | last) as $landed
         | .pulls[] | select(.number == $n) | (.author.login // "someone") as $who
         | {number, state: (.state | if . == "OPEN" then "open" else "closed" end), merged: (.state == "MERGED"),
+           merge_commit_sha: ($landed // .mergeCommitOid // null),
            title: (.title // ""), body: (.body // ""), user: {login: $who},
            author_association: (.author_association // if $who == ($repo | split("/")[0]) then "OWNER"
                                  elif ($who | IN($c[])) and (($who | IN($gone[])) | not) then "COLLABORATOR" else "NONE" end),

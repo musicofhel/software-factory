@@ -18,8 +18,8 @@ SCN="$SIM/scn"
 clone_of "$SCN"
 git -C "$SCN" config user.name dev-box-owner; git -C "$SCN" config user.email dev-box-owner@sim.invalid
 
-trailers() {  # trailers <ticket>: the one trailer paragraph a node commit carries (RULES.md)
-  printf 'Assisted-by: claude-code\nTicket: %s\nNode: dev-box\nSigned-off-by: dev-box-owner <dev-box-owner@sim.invalid>\n' "$1"
+trailers() {  # trailers <ticket> <handle>: the one trailer paragraph a node commit carries (RULES.md)
+  printf 'Assisted-by: claude-code\nTicket: %s\nNode: %s\nSigned-off-by: dev-box-owner <dev-box-owner@sim.invalid>\n' "$1" "$2"
 }
 scn_start() {  # scn_start <branch>: a fresh branch from origin/main in the scratch clone
   git -C "$SCN" fetch -q origin
@@ -28,9 +28,12 @@ scn_start() {  # scn_start <branch>: a fresh branch from origin/main in the scra
 scn_put() {  # scn_put <path> <content>
   mkdir -p "$SCN/$(dirname "$1")"; printf '%s\n' "$2" >"$SCN/$1"; git -C "$SCN" add -A -- "$1"
 }
-scn_commit() {  # scn_commit <ticket|-> [subject]: commit the index; `-` = no trailers at all
-  local msg="${2:-sim: scenario change}"
-  [ "$1" = - ] || msg="$(printf '%s\n\n%s' "$msg" "$(trailers "$1")")"
+scn_commit() {  # scn_commit <ticket|-> [subject]: commit the index; `-` = no trailers at all. `Node:` is
+               # the branch's handle (ticket/<id>/<handle>), as commit-check requires, so a scenario
+               # commit carries only the defect its scenario names
+  local msg="${2:-sim: scenario change}" br
+  br="$(git -C "$SCN" symbolic-ref --short HEAD)"
+  [ "$1" = - ] || msg="$(printf '%s\n\n%s' "$msg" "$(trailers "$1" "${br##*/}")")"
   git -C "$SCN" commit -qm "$msg"
 }
 scn_pr() {  # scn_pr <branch> <ticket|-> [author]: push the branch, open its PR; prints the PR number
@@ -115,7 +118,7 @@ judge S.rail-edit "$(scn_detail rails-proof "$h")" check_fails_naming rails-proo
 scn_start ticket/T-sim-s/scn-trailer
 scn_put sim/s/hello.sh 'echo hello'
 scn_commit -; pr="$(scn_pr ticket/T-sim-s/scn-trailer T-sim-s)"; pr_event "$pr"; h="$(pr_field "$pr" .headRefOid)"
-judge S.no-trailer "$(scn_detail commit-check "$h")" check_fails_naming commit-check "$h" 'Signed-off-by'
+judge S.no-trailer "$(scn_detail commit-check "$h")" check_fails_naming commit-check "$h" 'FAIL: [0-9a-f]{12} .*no Signed-off-by trailer'
 
 # I16: the head rewrites the scope gate to `exit 0` and adds an out-of-scope file. The base's gate
 # runs, so scope still fails, and names the file.
@@ -220,7 +223,8 @@ judge S.queue-conflict "#$PR_B labels: $(pr_field "$PR_B" '[.labels[].name] | jo
   eval 'ghq -e --argjson n "$PR_B" "any(.pulls[] | select(.number == \$n) | .labels[]; .name == \"autorebase\")" >/dev/null &&
         git -C "$ORIGIN" cat-file -e "$(main_sha):factory/ledger/ejections.jsonl" 2>/dev/null'
 
-# A T-sim-t1 PR whose second commit names T-sim-victim. Merged: post-merge completes T-sim-t1 only.
+# A T-sim-t1 PR whose second commit names T-sim-victim. Merged: post-merge completes T-sim-t1 (its
+# head branch's ticket) and reports T-sim-victim `foreign`, never completing it (merge:G11).
 scn_start ticket/T-sim-t1/scn-foreign
 scn_put sim/t1/foreign.sh 'echo one'; scn_commit T-sim-t1
 scn_put sim/t1/foreign2.sh 'echo two'; scn_commit T-sim-victim
@@ -229,8 +233,15 @@ pr="$(scn_pr ticket/T-sim-t1/scn-foreign T-sim-t1)"; approve "$pr"; pr_event "$p
 judge S.foreign-trailer-refused "$(scn_detail context "$h"); $(scn_detail commit-check "$h")" \
   eval 'check_fails_naming context "$h" "trailer .Ticket: T-sim-victim" && check_fails_naming commit-check "$h" "trailer .Ticket: T-sim-victim"'
 queue_and_merge "$pr"
-judge S.foreign-trailer "T-sim-victim completed: $(adlc_desk ticket show T-sim-victim --json | jq -r .ticket.completed)" \
-  test "$(adlc_desk ticket show T-sim-victim --json | jq -r .ticket.completed)" != true
+pm_line() {  # pm_line <merge-sha> <ticket>: post-merge's JSON line for <ticket> on the push of <merge-sha>
+  local log; log="$(jq -r --arg h "$1" 'select(.event == "push" and .head_sha == $h and .job == "complete") | .log' "$SIM/jobs.jsonl" | tail -n1)"
+  [ -z "$log" ] || { grep -h '^{"mode":' "$log" || true; } | jq -c --arg t "$2" 'select(.ticket == $t)' | tail -n1
+}
+done_of() { adlc_desk ticket show "$1" --json | jq -r '.ticket.completed // false'; }
+m="$(ghq --argjson n "$pr" '[.merged[] | select(.pr == $n)] | last | .sha')"; pm="$(pm_line "$m" T-sim-victim)"
+judge S.foreign-trailer "T-sim-victim completed: $(done_of T-sim-victim), post-merge: ${pm:-no line}; T-sim-t1 completed: $(done_of T-sim-t1)" \
+  eval 'test "$(done_of T-sim-victim)" != true && test "$(done_of T-sim-t1)" = true &&
+        jq -e --argjson n "$pr" ".result == \"foreign\" and .pr == \$n" <<<"$pm" >/dev/null'
 
 # ------------------------------------------------------------------ the janitor sweeps
 # T-sim-p2 was built 25 h ago and its PR is held open (by its child's order or the queue). After the

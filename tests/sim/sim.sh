@@ -160,8 +160,9 @@ queue_standin() {  # build gh-readonly-queue/main/pr-<n>-<base> as GitHub's queu
   local n="$1" base head tree sha ref
   base="$(main_sha)"; head="$(pr_field "$n" .headRefOid)"
   tree="$(git -C "$ORIGIN" merge-tree --write-tree "$base" "$head")" || return 1
+  # Authored by the human who enqueued (the repo owner here), committed by GitHub (records/TB4.md §1).
   sha="$(printf 'Merge pull request #%s from %s\n\n%s\n' "$n" "$(pr_field "$n" .headRefName)" "$(pr_field "$n" .title)" |
-         GIT_AUTHOR_NAME=GitHub GIT_AUTHOR_EMAIL=noreply@github.com GIT_COMMITTER_NAME=GitHub GIT_COMMITTER_EMAIL=noreply@github.com \
+         GIT_AUTHOR_NAME=sim-owner GIT_AUTHOR_EMAIL=sim-owner@sim.invalid GIT_COMMITTER_NAME=GitHub GIT_COMMITTER_EMAIL=noreply@github.com \
          git -C "$ORIGIN" commit-tree "$tree" -p "$base" -p "$head")"
   ref="refs/heads/gh-readonly-queue/main/pr-$n-$base"
   git -C "$ORIGIN" update-ref "$ref" "$sha"

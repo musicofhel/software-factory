@@ -48,19 +48,31 @@ run_ticket_hash_of_issue() {
 # run_signoff: "Name <email>" of whoever commits on this node (git's own resolution: env, then config).
 run_signoff() { git -C "$CLONE" var GIT_COMMITTER_IDENT | sed -E 's/ [0-9]+ [-+][0-9]{4}$//'; }
 
-# run_record_commit <parent-sha> <subject> <Key: value>...: an empty commit on top of <parent>
-# whose message is the subject and ONE trailer paragraph (I6): the given trailers, Assisted-by,
-# Ticket, Node, Signed-off-by. Prints its sha. Every branch the loop pushes ends in one, so the
-# pushed tip names the reason, the strikes and the node without any transcript.
-run_record_commit() {
-  local parent="$1" subject="$2" msg t
-  shift 2
+# run_commit_tree <tree-ish> <parent-sha> <subject> <Key: value>...: a commit of <tree-ish>'s tree
+# on <parent> whose message is the subject and ONE trailer paragraph (I6): the given trailers,
+# Assisted-by, Ticket, Node, Signed-off-by (the node owner's DCO, as `git commit -s` writes it).
+# Prints its sha.
+run_commit_tree() {
+  local tree="$1" parent="$2" subject="$3" msg t
+  shift 3
   msg="$subject"$'\n\n'
   for t in "$@"; do msg+="$t"$'\n'; done
   msg+="Assisted-by: $ADAPTER@$ADAPTER_VERSION"$'\n'"Ticket: $TICKET"$'\n'"Node: $HANDLE"$'\n'
   msg+="Signed-off-by: $(run_signoff)"
-  printf '%s\n' "$msg" | git -C "$CLONE" commit-tree "$parent^{tree}" -p "$parent"
+  printf '%s\n' "$msg" | git -C "$CLONE" commit-tree "$tree^{tree}" -p "$parent"
 }
+
+# run_record_commit <parent-sha> <subject> <Key: value>...: an empty commit on top of <parent>
+# carrying the trailer paragraph. Every partial branch the loop pushes ends in one, so the pushed tip
+# names the reason, the strikes and the node without any transcript.
+run_record_commit() { run_commit_tree "$1" "$@"; }
+
+# run_ticket_commit <merge-base> <tip> <subject> <Key: value>...: the ONE commit a built ticket pushes
+# (ticket T23, node:G2): <tip>'s tree, fleet's final tree, with the merge-base with origin/main as its
+# only parent and the trailer paragraph. fleet's own commits (its worker commit and its --no-ff
+# merge, no trailers) stay in the local log for the transcript record and are never pushed; a lapsed
+# branch's commits are dropped the same way (node:G5), its work kept in the tree.
+run_ticket_commit() { run_commit_tree "$2" "$1" "${@:3}"; }
 
 # run_push <sha>: push <sha> to ticket/<id>/<handle> on origin with a lease on what the last fetch
 # saw (the branch is this node's own name; a lapsed branch of another node is never overwritten).

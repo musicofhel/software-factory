@@ -14,12 +14,17 @@
 # which differs from the template only by existing absolute allow_read roots (I14; cases
 # policy-render, policy-render-lib), a missing interpreter fails closed before the step (case
 # policy-missing-root), and tamperguard's stderr is kept in the claim's log base (case tamper).
-# T22: the real diff gates on the record commit the node pushes, GATE_BASE...GATE_HEAD from the
+# T22: the real diff gates on the commit the node pushes, GATE_BASE...GATE_HEAD from the
 # merge-base with origin/main, the ticket's scope and rails read from main's store (run_setup puts
 # T-run there): tamperguard, rails-proof, scope-check all pass and the gated sha is pushed (success,
 # argv); a rail edit or a path outside the scope → desk, nothing pushed (rails-fail, scope-fail,
 # desk-marker); a lapsed-branch resume gates from main, not the lapsed tip (lapsed-range, acceptance
 # 2); no adversarial-review on PATH → the loop does not start (no-adversarial-review).
+# T23 acceptance 1 (node:G2): a built ticket pushes ONE commit over the merge-base with origin/main,
+# fleet's final tree with all four trailers (Ticket, Node, Assisted-by, Signed-off-by); fleet's own
+# commits never reach the origin but stay in the node's clone (success); a resumed pause and a
+# lapsed branch are squashed the same way, their work kept in the tree (resume-in-place,
+# lapsed-range).
 # tamperguard is laid out as a uv tool (fake_uv): its own install dir, and a python reached through a
 # version link, as on a real node.
 set -euo pipefail
@@ -39,7 +44,7 @@ run_setup() {
   rm -rf "$FAKE_GH_GIT"
   # T-run in main's ticket store (adlc's file name): the diff gates read its scope and rails from the base
   printf '%s\n' 'main-file factory/policy/adapters.json {"claude-code": "2.1.280", "codex": null}' \
-    "main-file .adlc/tickets/t-run--$(printf %s T-run | sha256sum | cut -d' ' -f1).json"' {"id": "T-run", "title": "add hello.sh", "scope": ["hello.sh"], "rails": ["tests/rail/**"]}' \
+    "main-file .adlc/tickets/t-run--$(printf %s T-run | sha256sum | cut -d' ' -f1).json"' {"id": "T-run", "title": "add hello.sh", "scope": ["hello.sh", "half.txt"], "rails": ["tests/rail/**"]}' \
     "node dev-box $((T0 - 7200)) active 2 dev-box" | tests/fixtures/make-repo.sh "$FAKE_GH_GIT"
   git clone -q "$FAKE_GH_GIT" "$WORLD/clone"
   export FACTORY_NOW="$T0" FAKE_GH_NOW="$T0" FACTORY_HOME="$WORLD/fh" FACTORY_MANIFEST="$WORLD/manifest.json"
@@ -126,6 +131,15 @@ last_comment() { jq -r '.issues[] | select(.number == 1) | .comments[-1].body' "
 labels() { jq -r '.issues[] | select(.number == 1) | [.labels[].name] | sort | join(",")' "$FAKE_GH_ISSUES"; }
 trailer() { git -C "$FAKE_GH_GIT" log -1 --format="%(trailers:key=$2,valueonly)" "$1" | sed '/^$/d'; }
 fleet_calls() { wc -l <"$FAKE_FLEET_LOG" | tr -d ' '; }
+# clone_commit <subject>: the commit objects with that subject in the node's clone, reachable or not
+# (run.sh deletes fleet's local branches and keeps the run's tip under refs/factory/fleet/<run id>)
+clone_commit() {
+  local c
+  git -C "$WORLD/clone" cat-file --batch-all-objects --batch-check='%(objecttype) %(objectname)' | sed -n 's/^commit //p' |
+    while IFS= read -r c; do [ "$(git -C "$WORLD/clone" log -1 --format=%s "$c")" != "$1" ] || printf '%s\n' "$c"; done
+}
+on_origin() { git -C "$FAKE_GH_GIT" cat-file -e "$1^{commit}" 2>/dev/null; }
+over_main() { git -C "$FAKE_GH_GIT" rev-list "$(git -C "$FAKE_GH_GIT" rev-parse main)..$1" | wc -l | tr -d ' '; }
 no_mark() { ! grep -rqF "$MARK" "$@"; }
 marker() { desk_marker_read "$(last_comment)"; }   # the needs-desk marker of the result comment
 want_marker() { jq -cn --arg r "$1" --arg h "${2:-hash-T-run}" '{ticket: "T-run", hash: $h, reason: $r, node: "dev-box"}'; }
@@ -137,8 +151,27 @@ case_success() {
   check "  outcome built" eq "$(field .outcome)" built
   check "  pushed ticket/T-run/dev-box" eq "$(field .pushed.branch)" ticket/T-run/dev-box
   check "  the pushed tip is on the origin" eq "$(pushed)" "$(field .pushed.sha)"
-  check "  the tip is a record commit on top of fleet's integration merge" \
-    eq "$(git -C "$FAKE_GH_GIT" log -1 --format=%s "$(pushed)^")" "Merge branch 'fleet/t-run' into fleet/run-fake-1"
+  local main fmerge fwork
+  main="$(git -C "$FAKE_GH_GIT" rev-parse main)"
+  fmerge="$(clone_commit "Merge branch 'fleet/t-run' into fleet/run-$(field .fleet.run)")"
+  fwork="$(clone_commit "feat(T-run): fleet worker build")"
+  check "  exactly one commit over the merge-base with origin main (T23 acceptance 1)" eq "$(over_main "$(pushed)")" 1
+  check "  its only parent is that merge-base, main" eq "$(git -C "$FAKE_GH_GIT" rev-list --parents -n1 "$(pushed)")" "$(pushed) $main"
+  check "  its tree is fleet's final tree (the integration tip's)" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^{tree}")" "$(git -C "$WORLD/clone" rev-parse "$fmerge^{tree}")"
+  check "  its subject names the ticket, the outcome and the node" \
+    eq "$(git -C "$FAKE_GH_GIT" log -1 --format=%s "$(pushed)")" "factory: T-run built on dev-box"
+  check "  one trailer paragraph: Factory-Outcome, Fleet-Run, Fleet-Strikes, Assisted-by, Ticket, Node, Signed-off-by" \
+    eq "$(git -C "$FAKE_GH_GIT" log -1 --format=%B "$(pushed)" | git interpret-trailers --parse | cut -d: -f1 | tr '\n' ' ')" \
+       "Factory-Outcome Fleet-Run Fleet-Strikes Assisted-by Ticket Node Signed-off-by "
+  check "  trailers: Fleet-Run, Fleet-Strikes" \
+    eq "$(trailer "$(pushed)" Fleet-Run) $(trailer "$(pushed)" Fleet-Strikes)" "$(field .fleet.run) 1"
+  check "  fleet's worker commit and merge stay in the node's clone (one each, the merge of the worker)" \
+    eq "$(wc -w <<<"$fmerge $fwork" | tr -d ' ') $(git -C "$WORLD/clone" rev-parse "$fmerge^2")" "2 $fwork"
+  check "  and stay reachable in the node's log: refs/factory/fleet/<run id> is fleet's merge (never pushed)" \
+    eq "$(git -C "$WORLD/clone" rev-parse -q --verify "refs/factory/fleet/$(field .run_id)") $(git -C "$FAKE_GH_GIT" for-each-ref refs/factory)" "$fmerge "
+  check "  and never reach the origin (not reachable from the pushed ref, not even as objects)" \
+    eq "$(on_origin "$fmerge" && echo merge)$(on_origin "$fwork" && echo worker)" ""
   check "  trailers: Ticket" eq "$(trailer "$(pushed)" Ticket)" T-run
   check "  trailers: Node" eq "$(trailer "$(pushed)" Node)" dev-box
   check "  trailers: Assisted-by" eq "$(trailer "$(pushed)" Assisted-by)" claude-code@2.1.280
@@ -155,7 +188,7 @@ case_success() {
   check "  fleet's local branches are gone" eq "$(git -C "$WORLD/clone" for-each-ref --format=x refs/heads/fleet | wc -l | tr -d ' ')" 0
   check "  no slot state left" test ! -e "$FACTORY_HOME/run/slot-1.json"
   check "  the ledger has the same line" eq "$(tail -n1 "$FACTORY_HOME/run/ledger.jsonl")" "$LAST"
-  check "  the gates ran on the record commit, from main: .gate_base is origin main" \
+  check "  the gates ran on the pushed commit, from main: .gate_base is origin main" \
     eq "$(field .gate_base)" "$(git -C "$FAKE_GH_GIT" rev-parse main)"
   check "  the pushed sha is the gated one (.gate_head)" eq "$(pushed)" "$(field .gate_head)"
   check "  tamperguard ok, rails-proof pass, scope-check pass" \
@@ -186,7 +219,7 @@ case_scope_fail() {
   run_setup
   export FAKE_FLEET_FILE=outside.sh
   loop --once
-  check "fleet built outside.sh, the ticket's scope is [hello.sh]: scope-check fails" eq "$(field .scope_check)" fail
+  check "fleet built outside.sh, the ticket's scope is [hello.sh, half.txt]: scope-check fails" eq "$(field .scope_check)" fail
   check "  rails-proof passed first" eq "$(field .rails_proof)" pass
   check "  scope-check named the path" grep -qxF '  outside.sh' "$FACTORY_HOME/run/logs/$(field .run_id).scope.err"
   gate_desk scope-fail
@@ -355,9 +388,10 @@ case_resume_in_place() {
   run_setup
   export FAKE_FLEET_REASONS="quota-paused success"
   loop --once
-  local first lock0
+  local first lock0 partial
   first="$(jq -c '.argv' "$FAKE_FLEET_LOG")"
   lock0="$(lock)"
+  partial="$(pushed)"
   FACTORY_NOW=$((T0 + 3700)) FAKE_GH_NOW=$((T0 + 3700)); under_cap
   loop --once
   check "a paused claim resumes: exit 0, built" eq "$RC $(field .outcome)" "0 built"
@@ -368,8 +402,14 @@ case_resume_in_place() {
   check "  fleet got the identical argv" eq "$(jq -sc '.[1].argv' "$FAKE_FLEET_LOG")" "$first"
   check "  in the same worktree" eq "$(jq -sr '.[1].cwd == .[0].cwd' "$FAKE_FLEET_LOG")" true
   check "  fleet's strikes carried over (resume reconciliation)" eq "$(field .fleet.strikes)" 2
-  check "  the push is a fast-forward of the partial branch" \
-    git -C "$FAKE_GH_GIT" merge-base --is-ancestor "$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^^2^")" "$(pushed)"
+  local fmerge; fmerge="$(clone_commit "Merge branch 'fleet/t-run' into fleet/run-$(field .fleet.run)")"
+  check "  fleet resumed on the partial work (the partial's worker commit is under fleet's merge, in the clone)" \
+    eq "$(git -C "$WORLD/clone" merge-base --is-ancestor "$partial^" "$fmerge" && echo yes)" yes
+  check "  the push replaces the partial branch with ONE commit on main, fleet's final tree" \
+    eval '[ "$(over_main "$(pushed)")" = 1 ] && [ "$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^")" = "$(git -C "$FAKE_GH_GIT" rev-parse main)" ] &&
+          [ "$(git -C "$FAKE_GH_GIT" rev-parse "$(pushed)^{tree}")" = "$(git -C "$WORLD/clone" rev-parse "$fmerge^{tree}")" ]'
+  check "  the partial's commits are not in the pushed range" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-list "main..$(pushed)" | grep -cxF -e "$partial" -e "$(git -C "$FAKE_GH_GIT" rev-parse "$partial^")" || true)" 0
 }
 
 case_resume_cap() {
@@ -584,14 +624,18 @@ case_lapsed_range() {
   run_setup
   local work rec main
   main="$(git -C "$FAKE_GH_GIT" rev-parse main)"
-  lapsed_branch hello.sh   # the lapsed work is in scope
+  lapsed_branch half.txt   # the lapsed work is in scope
   loop --once
   check "a lapsed branch whose work is in scope: built" eq "$RC $(field '"\(.outcome) \(.base.kind) \(.base.sha == "'"$rec"'")"')" "0 built lapsed true"
   check "  .gate_base is main's sha (the merge-base with origin/main), not the lapsed tip" eq "$(field .gate_base)" "$main"
   check "  tamperguard's range starts at main and ends at the pushed sha" \
     eq "$(jq -c '.' "$FAKE_TAMPERGUARD_LOG")" "$(jq -cn --arg r "$main...$(pushed)" '["--range", $r, "--json"]')"
-  check "  so the lapsed commits are inside the gated range" \
-    eq "$(git -C "$FAKE_GH_GIT" rev-list "$main..$(pushed)" | grep -cxE "$work|$rec")" 2
+  check "  the pushed branch is ONE commit whose parent is main (T23: the lapsed commits are squashed)" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-list --parents "$main..$(pushed)")" "$(pushed) $main"
+  check "  the lapsed commits are not in the pushed range" \
+    eq "$(git -C "$FAKE_GH_GIT" rev-list "$main..$(pushed)" | grep -cxE "$work|$rec" || true)" 0
+  check "  the lapsed work is kept in the pushed tree, so it is gated with the rest" \
+    eq "$(git -C "$FAKE_GH_GIT" show "$(pushed):half.txt") $(git -C "$FAKE_GH_GIT" diff --name-only "$main" "$(pushed)" | tr '\n' ' ')" "half done half.txt hello.sh "
   check "  rails-proof and scope-check passed on it" eq "$(field '"\(.rails_proof) \(.scope_check)"')" "pass pass"
   check "  the pushed sha is the gated one" eq "$(pushed)" "$(field .gate_head)"
   # the lapsed branch's own commits are gated with the rest: its out-of-scope file fails the claim

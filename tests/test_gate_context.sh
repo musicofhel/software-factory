@@ -6,8 +6,9 @@
 #   - each PR class (ticket, desk, halt, human) and every refusal (a malformed ticket ref, a fork's
 #     ticket ref, a stranger's PR, a body or trailer naming another ticket);
 #   - common.sh's id validator refuses `/`;
-#   - the two remaining gate stubs (commit-check, attest-verify) resolve the context first, and keep
-#     run.sh's `not built` contract (rails-proof and scope-check are built: tests/test_diff_gates.sh);
+#   - the remaining gate stub (attest-verify) resolves the context first, and keeps run.sh's `not
+#     built` contract (rails-proof and scope-check are built: tests/test_diff_gates.sh; commit-check:
+#     tests/test_commit_check.sh);
 #   - gates.yml runs every factory/bin script from the base checkout ./.base (I16).
 # Offline; every repo is a temp dir, gh is the fake.
 set -euo pipefail
@@ -286,7 +287,8 @@ case_gate_stubs() {
   setup
   local h s
   h="$(change ticket/T20/dev-box "$(printf 'work\n\nTicket: T20')" +sim/t20/a.sh)"
-  for s in commit-check attest-verify; do
+  # shellcheck disable=SC2043  # attest-verify is the last stub (TB11 builds it)
+  for s in attest-verify; do
     pr_event pull_request-opened.json "$h" ticket/T20/dev-box 'Ticket: T20'
     RC=0; (cd "$R" && "$BIN/$s.sh") >/dev/null 2>"$WORLD/err" || RC=$?
     check "$s: exit 2, the context first, then 'not built'" \

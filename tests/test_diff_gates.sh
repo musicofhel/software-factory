@@ -262,7 +262,7 @@ case_run_call_sites() {
     grep -qF '"$FACTORY_ROOT/factory/bin/scope-check.sh" --ticket "$TICKET" --base "$GATE_BASE" --head "$GATE_HEAD"' "$run"
   check "run.sh feeds tamperguard dg_tamper_argv's argv and judges with dg_tamper_judge" \
     eq "$(grep -cE 'dg_tamper_argv "\$GATE_BASE" "\$GATE_HEAD"|dg_tamper_judge ' "$run")" 2
-  check "the gate base is the merge-base with origin/main" grep -qF 'GATE_BASE="$(git -C "$WT" merge-base refs/remotes/origin/main "$GATE_HEAD")"' "$run"
+  check "the gate base is the merge-base with origin/main (of fleet's tip; GATE_HEAD is built on it, T23)" grep -qF 'GATE_BASE="$(git -C "$WT" merge-base refs/remotes/origin/main "$tip")"' "$run"
   check "run.sh has no scope-check seam and no not-built hold" eq "$(grep -cE 'FACTORY_SCOPE_CHECK|scope-check-not-built' "$run" || true)" 0
   check "run.sh refuses to start without adversarial-review" grep -qE '^need adversarial-review' "$run"
 }

@@ -11,10 +11,17 @@
 #             factory/ledger/post-merge.json names (all of history when the file is absent), walked
 #             along main's first parent. A merge commit brings the commits of the side it merged
 #             (its PR, numbered from "Merge pull request #N"); any other commit brings itself.
-#   tickets   every id named by a `Ticket:` trailer (git's own trailer parser) in those commits, in
-#             merge order. An id the store does not hold (`Ticket: scaffold`) and a ticket already
-#             complete are reported and skipped. `Ticket: post-merge` names this job's own
-#             commit, not a ticket: it is passed over without a line.
+#   tickets   per merged PR, only the ticket its head branch names (merge:G11, ticket T23): the PR
+#             numbered by the subject ("Merge pull request #N", "… (#N)") is read with `gh api
+#             repos/<repo>/pulls/<N>` (GH_TOKEN; <repo> is GITHUB_REPOSITORY, FACTORY_REPO or the
+#             origin remote) and counts only when it is merged, its merge_commit_sha is this
+#             first-parent commit and its head is ticket/<id>/<handle> on <repo>. Then <id> is
+#             completed, in merge order. Every `Ticket:` trailer (git's own trailer parser) the
+#             commit brings that names another id, and every trailer of a commit no such PR
+#             merged, is reported `foreign` and never completed: a commit cannot complete a
+#             ticket by naming it. An id the store does not hold and a ticket already complete are
+#             reported and skipped. `Ticket: post-merge` names this job's own commit, not a ticket:
+#             it is passed over without a line.
 #   complete  `adlc ticket complete <id> --write --authorize --allow-unsigned` for each. Once any
 #             ticket declares a rail the store is a frozen trust root (adlc 1.12.0) and a write
 #             without ADLC_MANIFEST_KEY refuses (MANIFEST_KEY_REQUIRED) unless it is passed; no key
@@ -28,8 +35,9 @@
 #   land      factory/ledger/post-merge.json becomes {"through": HEAD} and .adlc/ plus
 #             factory/ledger/ are committed once and pushed to <remote> main as a fast-forward. The
 #             commit's one trailer paragraph is `Through: <head>`, `Assisted-by: none`, `Ticket:
-#             post-merge`, `Node: github-actions` (no Signed-off-by: no human wrote it; step 3's
-#             commit-check exempts this identity, factory/RULES.md). With
+#             post-merge`, `Node: github-actions` (no Signed-off-by: no human wrote it), authored
+#             and committed as github-actions[bot] whatever the environment says, the one
+#             identity commit-check.sh exempts in this shape (factory/RULES.md). With
 #             nothing completed there is no commit; the next run rescans the same range, which is
 #             safe because a completed ticket is skipped. After a failed completion the commit keeps
 #             the old marker, so the next run retries the rest.
@@ -37,18 +45,19 @@
 # Every read happens before the first write. --dry-run (the default) changes nothing: no adlc
 # write, no file, no commit, no push. Both modes print one JSON line per ticket:
 #   {"mode", "action": "complete", "ticket", "commit", "pr", "findings",
-#    "result": planned|done|failed|unknown|already|invalid}
+#    "result": planned|done|failed|unknown|already|invalid|foreign}
 # and, in apply mode, one {"action": "land", "commit", "through", "result"} line.
 # --apply refuses (exit 2) unless RUNNER_ENVIRONMENT=github-hosted.
 # Exit 0 done or planned; 1 a read, a completion or the push failed; 2 refused.
 #
-# Environment: FACTORY_ADLC (default `npx -y @adlc/cli@1.12.0`); FACTORY_NOW.
+# Environment: FACTORY_ADLC (default `npx -y @adlc/cli@1.12.0`); FACTORY_NOW; GH_TOKEN and
+# GITHUB_REPOSITORY (or FACTORY_REPO) for the PR reads.
 set -euo pipefail
 PROG=post-merge
 # shellcheck source=factory/bin/lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
-usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 apply=0 remote=origin
 while [ $# -gt 0 ]; do
@@ -73,8 +82,10 @@ if [ "$apply" = 1 ] && [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
 fi
 cd "$(git rev-parse --show-toplevel)"
 read -r -a ADLC <<<"${FACTORY_ADLC:-npx -y @adlc/cli@1.12.0}"
-export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-factory-post-merge}" GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-post-merge@factory.invalid}"
-export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$GIT_AUTHOR_NAME}" GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
+# One identity on every path, the runner's (commit-check.sh CC_PM_IDENT exempts exactly it): the env
+# and git config cannot change it, so the exemption keys on one fixed author and committer.
+export GIT_AUTHOR_NAME='github-actions[bot]' GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 MARK=factory/ledger/post-merge.json
 LEDGER=factory/ledger/findings.jsonl
 NOW_ISO="$(epoch_to_iso "$(now_epoch)")"
@@ -101,21 +112,40 @@ fi
 range=(HEAD); [ -z "$through" ] || range=("$through..HEAD")
 merged="$(git rev-list --first-parent --reverse "${range[@]}")" || die "git rev-list ${range[*]} failed"
 
-# One "<ticket>\t<first-parent commit>\t<pr|''>" line per trailer, in merge order.
+# pr_ticket <pr> <commit>: the ticket id of merged PR <pr> when GitHub says it landed as <commit> from a
+# ticket/<id>/<handle> branch of this repo; nothing otherwise.
+REPO=""
+pr_ticket() {
+  local pull ref
+  [ -n "$REPO" ] || REPO="$(resolve_repo "${GITHUB_REPOSITORY:-}")"
+  pull="$(gh api "repos/$REPO/pulls/$1")" || die "cannot read PR #$1 of $REPO (GH_TOKEN with pull-requests: read)"
+  jq -e --argjson n "$1" --arg c "$2" --arg r "$REPO" \
+    '.number == $n and .merged == true and .merge_commit_sha == $c and .head.repo.full_name == $r' <<<"$pull" >/dev/null || return 0
+  ref="$(jq -r '.head.ref // empty' <<<"$pull")"
+  [[ "$ref" =~ ^ticket/([^/]+)/([^/]+)$ ]] || return 0
+  ref="${BASH_REMATCH[1]}"; valid_handle "${BASH_REMATCH[2]}" && valid_ticket_id "$ref" && printf '%s\n' "$ref"
+  return 0
+}
+
+# One "<ticket>\t<first-parent commit>\t<branch|foreign>\t<pr|''>" line per id (pr last: tab is IFS
+# whitespace, so an empty middle field would collapse), in merge order: the merged
+# PR's branch ticket, then each other id a `Ticket:` trailer of that commit's range names.
 : >"$WORK/named"
 while IFS= read -r c; do
   [ -n "$c" ] || continue
   read -r -a parents <<<"$(git rev-list --parents -n1 "$c")"
   if [ "${#parents[@]}" -gt 2 ]; then brought=("$c^1..$c"); else brought=(-1 "$c"); fi
-  subject="$(git log -1 --format=%s "$c")"; pr=""
+  subject="$(git log -1 --format=%s "$c")"; pr="" owner=""
   if [[ "$subject" =~ ^Merge\ pull\ request\ \#([0-9]+)([^0-9]|$) ]] || [[ "$subject" =~ \(\#([0-9]+)\)$ ]]; then
     pr="${BASH_REMATCH[1]}"
   fi
+  [ -z "$pr" ] || owner="$(pr_ticket "$pr" "$c")"
+  [ -z "$owner" ] || printf '%s\t%s\tbranch\t%s\n' "$owner" "$c" "$pr" >>"$WORK/named"
   git log --reverse --format='%(trailers:key=Ticket,valueonly,unfold,separator=%x1f)' "${brought[@]}" |
     tr '\037' '\n' | while IFS= read -r t; do
       t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
-      [ -z "$t" ] || [ "$t" = post-merge ] || printf '%s\t%s\t%s\n' "$t" "$c" "$pr"
-    done >>"$WORK/named"
+      [ -z "$t" ] || [ "$t" = post-merge ] || [ "$t" = "$owner" ] || printf '%s\t%s\tforeign\t%s\n' "$t" "$c" "$pr"
+    done | awk '!seen[$0]++' >>"$WORK/named"
 done <<<"$merged"
 
 # ------------------------------------------------------------------------------------- plan (reads)
@@ -137,13 +167,18 @@ FINDINGS_JQ='
            fix_ticket: ($f.fix_ticket // null), verified_at: ($e.ts // null), completed_at: $now})'
 : >"$WORK/plan"
 seen=" "
-while IFS=$'\t' read -r id commit pr; do
+while IFS=$'\t' read -r id commit kind pr; do
   [ -n "$id" ] || continue
-  case "$seen" in *" $id "*) continue ;; esac
-  seen="$seen$id "
   line="$(jq -cn --arg t "$id" --arg c "$commit" --arg pr "$pr" \
     '{action: "complete", ticket: $t, commit: $c, pr: (if $pr == "" then null else ($pr | tonumber) end)}')"
   skip() { jq -c --arg r "$1" --arg d "$2" '. + {skip: $r, detail: $d}' <<<"$line" >>"$WORK/plan"; }
+  if [ "$kind" = foreign ]; then
+    if [ -n "$pr" ]; then skip foreign "a Ticket: trailer of the commits PR #$pr merged; the PR's head branch does not name it (never completed)"
+    else skip foreign "a Ticket: trailer of a commit no merged ticket PR landed (never completed)"; fi
+    continue
+  fi
+  case "$seen" in *" $id "*) continue ;; esac
+  seen="$seen$id "
   if ! valid_ticket_id "$id"; then skip invalid "not a ticket id"; continue; fi
   rc=0
   "${ADLC[@]}" ticket show "$id" --json >"$WORK/show.json" 2>"$WORK/show.err" || rc=$?

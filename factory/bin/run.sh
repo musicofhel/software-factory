@@ -29,10 +29,12 @@
 #                (a link to lib/bwrap-shim, which adds fleet's missing system roots read-only) and
 #                `fleet-pin`. Only fleet's PATH changes, never the loop's or ralon's (ADR-0006, #1266)
 #   case on fleet's reason (success = exitCode 0, reason null, a fleet/run-* branch, merged >= 1):
-#     success                       the node gates exactly the commit it pushes: the record commit
-#                                   (trailers) is built first, then the three diff gates run on
-#                                   GATE_BASE...GATE_HEAD, GATE_HEAD = that commit and GATE_BASE = its
-#                                   merge-base with origin/main (never a lapsed tip, node:G5), through
+#     success                       the node gates exactly the commit it pushes: GATE_BASE = the
+#                                   merge-base of fleet's tip with origin/main (never a lapsed tip,
+#                                   node:G5) and GATE_HEAD = ONE commit of fleet's final tree on
+#                                   GATE_BASE carrying the trailer paragraph (Assisted-by, Ticket,
+#                                   Node, Signed-off-by; T23: fleet's untrailered commits stay local);
+#                                   the three diff gates run on GATE_BASE...GATE_HEAD, through
 #                                   lib/diff-gates.sh, the helper CI's gates call (I17, T22):
 #                                   tamperguard (dg_tamper_argv, under vetto + the claim's render of
 #                                   build.toml, $FACTORY_HOME/run/policy/<run id>.build.toml,
@@ -87,7 +89,7 @@ PROG=run
 # shellcheck source=factory/bin/lib/diff-gates.sh
 . "$(dirname "$0")/lib/diff-gates.sh"
 
-usage() { sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
 slot="" apply=0 once=0 max=0 json=0
 while [ $# -gt 0 ]; do
@@ -369,13 +371,18 @@ on_success() {
   local tip tg_out tg verdict score findings rc a
   tip="$(git -C "$CLONE" rev-parse -q --verify "$(jq -r .integrationBranch <<<"$DOC")^{commit}" || true)"
   [ -n "$tip" ] || { REASON=integration-branch-missing; outcome released; finish_release 1 0 1; return; }
-  # The node gates exactly the commit it pushes (I17): the record commit first, then every gate on
-  # GATE_BASE...GATE_HEAD from the merge-base with origin/main, never a lapsed tip (node:G5): a lapsed
-  # branch's own commits are gated with the rest.
-  GATE_HEAD="$(record_commit "$tip" built "Fleet-Run: $FLEET_RUN" "Fleet-Strikes: $STRIKES")" ||
-    { REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
-  GATE_BASE="$(git -C "$WT" merge-base refs/remotes/origin/main "$GATE_HEAD")" ||
+  # The node gates exactly the commit it pushes (I17): GATE_BASE is the merge-base of fleet's tip with
+  # origin/main, never a lapsed tip (node:G5), and GATE_HEAD the ONE trailered commit of fleet's final
+  # tree on GATE_BASE (T23, node:G2); every gate runs on GATE_BASE...GATE_HEAD, so a lapsed branch's
+  # work is gated with the rest. fleet's own commits stay local.
+  GATE_BASE="$(git -C "$WT" merge-base refs/remotes/origin/main "$tip")" ||
     { REASON=gate-base-missing; outcome released; finish_release 1 0 1; return; }
+  GATE_HEAD="$(run_ticket_commit "$GATE_BASE" "$tip" "factory: $TICKET built on $HANDLE" \
+                 "Factory-Outcome: built" "Fleet-Run: $FLEET_RUN" "Fleet-Strikes: $STRIKES")" ||
+    { act record-commit-failed; REASON=push-failed; outcome released; finish_release 1 "$UNKNOWN_S"; return; }
+  # fleet's own commits stay in the node's log for the transcript record (wt_remove deletes fleet's
+  # branches): one local ref per run, refs/factory/fleet/<run id>, never pushed.
+  git -C "$CLONE" update-ref "refs/factory/fleet/$RUN_ID" "$tip" 2>>"$LOGBASE.git.err" || act fleet-ref-failed
   rec --arg b "$GATE_BASE" --arg h "$GATE_HEAD" '.gate_base = $b | .gate_head = $h'
   # tamperguard over the whole ticket diff, under vetto and this claim's render of build.toml
   # (ADR-0005 decision 8 as amended by T17; lib/policy-render.sh). A root that cannot be derived

@@ -34,7 +34,7 @@ not model.
 | P.node-tamper | pass |
 | P.node-rails | pass |
 | P.node-scope | pass |
-| P.commit-shape | red: node:G2 — fleet's worker + merge commits, no trailers (TB4) |
+| P.commit-shape | pass |
 | P.pr-open | pass |
 | P.claim-released | red: node:G3 — the lock is kept across the PR and the Issue stays `ready` (TB6) |
 | P.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
@@ -46,8 +46,8 @@ not model.
 | P.pr.scope | pass |
 | P.pr.tamper | pass |
 | P.pr.dependencies | pass |
-| P.pr.commit-check | red: ci:G6 — commit-check.sh is a stub (TB4) |
-| P.pr.attest-verify | red: ci:G6 — skipped behind the red commit-check (TB4); attest-verify.sh is a stub (TB11) |
+| P.pr.commit-check | pass |
+| P.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | P.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | P.hold | red: merge:G3 — no `depends-on` job (TB8) |
 | P.tier-order | red: merge:G5 — no `tier-order` job (TB8) |
@@ -59,8 +59,8 @@ not model.
 | P.mg.scope | pass |
 | P.mg.tamper | pass |
 | P.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
-| P.mg.commit-check | red: ci:G6 — commit-check.sh is a stub (TB4) |
-| P.mg.attest-verify | red: ci:G6 — skipped behind the red commit-check (TB4); attest-verify.sh is a stub (TB11) |
+| P.mg.commit-check | pass |
+| P.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | P.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | P.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
 | P.complete | pass |
@@ -72,7 +72,7 @@ not model.
 | C.node-tamper | pass |
 | C.node-rails | pass |
 | C.node-scope | pass |
-| C.commit-shape | red: node:G2 — fleet's worker + merge commits, no trailers (TB4) |
+| C.commit-shape | pass |
 | C.pr-open | pass |
 | C.claim-released | red: node:G3 — the lock is kept across the PR and the Issue stays `ready` (TB6) |
 | C.tier-label | red: intake:I3 — the PR carries no tier label (TB8) |
@@ -84,8 +84,8 @@ not model.
 | C.pr.scope | pass |
 | C.pr.tamper | pass |
 | C.pr.dependencies | pass |
-| C.pr.commit-check | red: ci:G6 — commit-check.sh is a stub (TB4) |
-| C.pr.attest-verify | red: ci:G6 — skipped behind the red commit-check (TB4); attest-verify.sh is a stub (TB11) |
+| C.pr.commit-check | pass |
+| C.pr.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | C.pr.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | C.hold | red: merge:G3 — no `depends-on` job (TB8) |
 | C.tier-order | red: merge:G5 — no `tier-order` job (TB8) |
@@ -97,8 +97,8 @@ not model.
 | C.mg.scope | pass |
 | C.mg.tamper | pass |
 | C.mg.dependencies | red: ci:G1 — `if: pull_request` skips it on merge_group, so a required check never runs on the queue path (I18, TB10) |
-| C.mg.commit-check | red: ci:G6 — commit-check.sh is a stub (TB4) |
-| C.mg.attest-verify | red: ci:G6 — skipped behind the red commit-check (TB4); attest-verify.sh is a stub (TB11) |
+| C.mg.commit-check | pass |
+| C.mg.attest-verify | red: ci:G6 — attest-verify.sh is a stub, `attest-verify: not built` (TB11) |
 | C.mg.required-checks | red: ci:G1 — the policy requires `gates / <job>`; check runs are named by the bare job id (TB10) |
 | C.merge | red: merge:G1 — no native queue on a user-owned repo, no first-party queue (TB9) |
 | C.complete | pass |
@@ -107,7 +107,7 @@ not model.
 | S.out-of-scope | pass |
 | S.tamper-skip | pass |
 | S.rail-edit | pass |
-| S.no-trailer | red: ci:G6 — commit-check.sh is a stub (TB4) |
+| S.no-trailer | pass |
 | S.head-edits-gate | pass |
 | S.base-script | pass |
 | S.head-plants-base | pass |
@@ -122,7 +122,7 @@ not model.
 | S.child-before-parent | red: merge:G3 — no `depends-on` job (TB8) |
 | S.tier-jump | red: merge:G5 — no `tier-order` job (TB8) |
 | S.queue-conflict | red: merge:G7 — no ejection: no `autorebase` label, no ejections.jsonl (TB9) |
-| S.foreign-trailer | red: merge:G11 — post-merge completes every `Ticket:` trailer, so T-sim-victim completes (TB4) |
+| S.foreign-trailer | pass |
 | S.foreign-trailer-refused | pass |
 | S.held-24h | red: merge:G8a — the janitor releases the 25 h lock and the Issue stays `ready` for a second build (TB6) |
 | S.built-plus-claim | red: merge:G8b — the built PR's lock counts toward the slot; the new claim is cut `over-slots` (TB6) |
