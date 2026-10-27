@@ -5,5 +5,19 @@
     "claude-code": {
       "railEnforcement": "auto"
     }
+  },
+  "fleet": {
+    "gate": {
+      "build": "make lint",
+      "test": "make test"
+    },
+    "allowedCommands": [
+      "bash tests/:*",
+      "make sim",
+      "./factory/test.sh",
+      "chmod +x:*"
+    ],
+    "prosecuteFailOn": "medium",
+    "timeoutMinutes": 30
   }
 }
